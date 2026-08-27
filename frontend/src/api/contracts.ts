@@ -1,0 +1,309 @@
+/**
+ * Mirrors the backend Pydantic models and WebSocket event contracts.
+ *
+ * Hand-written rather than generated: the WebSocket protocol is not described
+ * by OpenAPI, and splitting the types across a generator and a hand-written
+ * union would make drift harder to spot, not easier. Union types are used
+ * instead of TypeScript enums so every file here stays erasable syntax, which
+ * is what lets Node run and test this logic with no build step.
+ */
+
+// ---------------------------------------------------------------- documents
+
+export const KNOWLEDGE_TYPES = [
+  "RESUME",
+  "PERSONAL",
+  "EXPERIENCE",
+  "PROJECT",
+  "BEHAVIORAL_STORY",
+  "TECHNICAL",
+  "REFERENCE",
+] as const;
+export type KnowledgeType = (typeof KNOWLEDGE_TYPES)[number];
+
+/** Knowledge types describing things the user actually did. Mirrors
+ * PERSONAL_KNOWLEDGE_TYPES in the backend. */
+export const PERSONAL_KNOWLEDGE_TYPES: readonly KnowledgeType[] = [
+  "RESUME",
+  "PERSONAL",
+  "EXPERIENCE",
+  "PROJECT",
+  "BEHAVIORAL_STORY",
+];
+
+export type FileType = "PDF" | "DOCX" | "MARKDOWN" | "TXT";
+export type DocumentStatus = "UPLOADED" | "PROCESSING" | "READY" | "FAILED";
+
+export interface DocumentRecord {
+  document_id: string;
+  filename: string;
+  file_type: FileType;
+  knowledge_type: KnowledgeType;
+  title: string;
+  source: string;
+  created_at: string;
+  ingested_at: string | null;
+  status: DocumentStatus;
+  error: string | null;
+  chunk_count: number;
+}
+
+export interface UploadResponse {
+  document_id: string;
+  filename: string;
+  status: DocumentStatus;
+}
+
+export interface IngestResponse {
+  document_id: string;
+  status: DocumentStatus;
+  chunk_count: number;
+  error: string | null;
+}
+
+export interface DeleteResponse {
+  document_id: string;
+  deleted: boolean;
+  chunks_removed: number;
+  vectors_removed: number;
+}
+
+// ----------------------------------------------------------------- answers
+
+export interface Complexity {
+  time: string;
+  space: string;
+}
+
+export interface Answer {
+  summary: string;
+  key_points: string[];
+  detailed_answer: string;
+  approach: string[] | null;
+  code: string | null;
+  complexity: Complexity | null;
+  edge_cases: string[] | null;
+  warnings: string[];
+}
+
+export type Category =
+  | "PERSONAL_EXPERIENCE"
+  | "RESUME"
+  | "PROJECT"
+  | "BEHAVIORAL"
+  | "TECHNICAL_KNOWLEDGE"
+  | "SYSTEM_DESIGN"
+  | "SCENARIO"
+  | "CODING"
+  | "SQL"
+  | "DEBUGGING"
+  | "ARCHITECTURE"
+  | "FOLLOW_UP"
+  | "UNKNOWN";
+
+export interface Classification {
+  is_question: boolean;
+  category: Category;
+  domain: string;
+  requires_personal_context: boolean;
+  requires_rag: boolean;
+  requires_reasoning: boolean;
+  requires_code: boolean;
+  confidence: number;
+}
+
+export interface RetrievalHitView {
+  chunk_id: string;
+  document_id: string;
+  score: number;
+  title: string;
+}
+
+// ---------------------------------------------------------------- sessions
+
+export type SessionStatus = "ACTIVE" | "ENDED";
+export type TurnStatus = "PENDING" | "ANSWERED" | "CANCELLED" | "FAILED";
+export type TranscriptSource = "MIC" | "LOOPBACK" | "MANUAL";
+
+export interface SessionListItem {
+  session_id: string;
+  started_at: string;
+  ended_at: string | null;
+  status: SessionStatus;
+  title: string;
+  turn_count: number;
+}
+
+export interface StoredTurn {
+  turn_id: number | null;
+  session_id: string;
+  seq: number;
+  question: string;
+  category: string;
+  domain: string;
+  confidence: number;
+  answer: Answer | null;
+  context_found: boolean;
+  status: TurnStatus;
+  latency_ms: number | null;
+  created_at: string;
+}
+
+export interface StoredTranscript {
+  id: number | null;
+  session_id: string;
+  turn_id: number | null;
+  source: TranscriptSource;
+  is_final: boolean;
+  text: string;
+  started_at: string | null;
+  ended_at: string | null;
+}
+
+export interface SessionDetail {
+  session: {
+    session_id: string;
+    started_at: string;
+    ended_at: string | null;
+    status: SessionStatus;
+    title: string;
+    config: Record<string, unknown>;
+  };
+  turns: StoredTurn[];
+  transcript: StoredTranscript[];
+  summary: {
+    session_id: string;
+    summary: string;
+    topics: string[];
+    covered_through_seq: number;
+    updated_at: string;
+  } | null;
+}
+
+// ---------------------------------------------------------------- settings
+
+export interface SettingsView {
+  gemini_key_configured: boolean;
+  gemini_model: string;
+  embedding_model: string;
+  stt_model: string;
+  stt_device: string;
+  stt_compute_type: string;
+  chunk_size: number;
+  chunk_overlap: number;
+  rag_top_k: number;
+  rag_min_similarity: number;
+  data_dir: string;
+  audio_capture_mic: boolean;
+  audio_capture_loopback: boolean;
+  audio_available: boolean;
+}
+
+export interface SettingsUpdate {
+  gemini_api_key?: string;
+  gemini_model?: string;
+  stt_model?: string;
+  stt_device?: string;
+  rag_top_k?: number;
+  rag_min_similarity?: number;
+  audio_capture_mic?: boolean;
+  audio_capture_loopback?: boolean;
+}
+
+export interface AudioDevice {
+  index: number;
+  name: string;
+  channel: "MIC" | "LOOPBACK";
+  sample_rate: number;
+  is_default: boolean;
+}
+
+export interface ModelStatus {
+  name: string;
+  kind: string;
+  downloaded: boolean;
+  path: string;
+}
+
+// ------------------------------------------------------------ ws: server->client
+
+export const SERVER_EVENTS = [
+  "session.started",
+  "session.status",
+  "session.ended",
+  "transcript.partial",
+  "transcript.final",
+  "question.detected",
+  "question.rejected",
+  "answer.started",
+  "answer.retrieving",
+  "answer.delta",
+  "answer.completed",
+  "answer.cancelled",
+  "answer.error",
+  "error",
+  "pong",
+] as const;
+export type ServerEventType = (typeof SERVER_EVENTS)[number];
+
+export type RejectionReason = "not_a_question" | "too_short" | "low_confidence";
+export type CancelReason = "superseded" | "user_stop" | "session_ended";
+
+/**
+ * Every frame the server sends. `seq` is monotonic per session and drives
+ * reconnect replay; `turn_id` identifies which question an event belongs to,
+ * so events from a superseded turn can be discarded.
+ */
+export interface ServerEvent {
+  type: ServerEventType;
+  seq: number;
+  ts: string;
+  turn_id: number | null;
+  data: Record<string, unknown>;
+}
+
+// ------------------------------------------------------------ ws: client->server
+
+export type ClientMessage =
+  | { type: "question.manual"; data: { text: string } }
+  | { type: "answer.cancel" }
+  | { type: "audio.start" }
+  | { type: "audio.stop" }
+  | { type: "session.stop" }
+  | { type: "ping" };
+
+// ------------------------------------------------------------------ helpers
+
+/** Narrow an unknown JSON frame to a ServerEvent, or null if it isn't one.
+ * The socket is local, but a malformed frame must not crash the UI. */
+export function parseServerEvent(raw: unknown): ServerEvent | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const candidate = raw as Partial<ServerEvent>;
+  if (typeof candidate.type !== "string") return null;
+  if (!(SERVER_EVENTS as readonly string[]).includes(candidate.type)) return null;
+  return {
+    type: candidate.type as ServerEventType,
+    seq: typeof candidate.seq === "number" ? candidate.seq : 0,
+    ts: typeof candidate.ts === "string" ? candidate.ts : "",
+    turn_id: typeof candidate.turn_id === "number" ? candidate.turn_id : null,
+    data:
+      typeof candidate.data === "object" && candidate.data !== null
+        ? (candidate.data as Record<string, unknown>)
+        : {},
+  };
+}
+
+export function str(data: Record<string, unknown>, key: string, fallback = ""): string {
+  const value = data[key];
+  return typeof value === "string" ? value : fallback;
+}
+
+export function num(data: Record<string, unknown>, key: string, fallback = 0): number {
+  const value = data[key];
+  return typeof value === "number" ? value : fallback;
+}
+
+export function bool(data: Record<string, unknown>, key: string, fallback = false): boolean {
+  const value = data[key];
+  return typeof value === "boolean" ? value : fallback;
+}

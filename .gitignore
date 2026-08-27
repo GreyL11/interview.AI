@@ -40,3 +40,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Frontend build output and deps
+frontend/node_modules/
+frontend/dist/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/

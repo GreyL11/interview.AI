@@ -154,6 +154,14 @@ class LiveSession:
                 )
             )
             self._current_turn_id = turn.turn_id
+            # Emitted before generation starts so the UI can show what was heard
+            # and how it was understood, even if the answer later fails.
+            await self.emit(event(
+                EventType.QUESTION_DETECTED,
+                turn_id=turn.turn_id,
+                question=question,
+                classification=classification.model_dump(mode="json"),
+            ))
             self._task = asyncio.create_task(self._answer(turn.turn_id, question, classification))
             return turn.turn_id
 

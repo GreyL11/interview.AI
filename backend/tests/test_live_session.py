@@ -74,6 +74,40 @@ async def test_manual_question_produces_a_completed_answer(sessions, session_id,
     assert completed.data["latency_ms"] >= 0
 
 
+async def test_question_detected_precedes_the_answer(sessions, session_id, retriever):
+    """The UI shows what was heard and how it was classified before any answer
+    exists, so this must be emitted even if generation later fails."""
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.ask("How would you handle duplicate records in a pipeline?")
+    await drain(live)
+
+    types = collector.types()
+    assert EventType.QUESTION_DETECTED in types
+    assert types.index(EventType.QUESTION_DETECTED) < types.index(EventType.ANSWER_STARTED)
+
+    detected = collector.of(EventType.QUESTION_DETECTED)[0]
+    assert detected.turn_id is not None
+    assert detected.data["question"]
+    assert detected.data["classification"]["category"]
+
+
+async def test_question_detected_emitted_even_when_the_answer_fails(
+    sessions, session_id, retriever
+):
+    live = build(sessions, session_id, retriever, BrokenLLM())
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.ask("What is a database index?")
+    await drain(live)
+
+    assert EventType.QUESTION_DETECTED in collector.types()
+    assert EventType.ANSWER_ERROR in collector.types()
+
+
 async def test_events_carry_monotonic_seq(sessions, session_id, retriever):
     live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
     collector = Collector()
