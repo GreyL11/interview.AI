@@ -97,50 +97,121 @@ class Segmenter:
 
 
 class SileroVad(SpeechDetector):
-    """Silero VAD, loaded from the ONNX asset bundled inside faster-whisper.
-
-    No separate download and no torch: the model ships with the package, so VAD
-    works offline on first run.
-    """
+    """Silero VAD loaded from the ONNX asset bundled with faster-whisper."""
 
     def __init__(self) -> None:
         self._session = None
+        self._mode = None
         self._state = None
+        self._h = None
+        self._c = None
+        self._input_samples = None
 
     def _ensure_loaded(self):
         if self._session is not None:
             return self._session
+
         try:
+            import os
+
             import onnxruntime as ort
             from faster_whisper.vad import get_assets_path
         except ImportError as exc:
             raise RuntimeError(f"Silero VAD is unavailable: {exc}") from exc
 
-        import os
-
         path = os.path.join(get_assets_path(), "silero_vad_v6.onnx")
+
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1
-        self._session = ort.InferenceSession(path, options, providers=["CPUExecutionProvider"])
+
+        self._session = ort.InferenceSession(
+            path,
+            options,
+            providers=["CPUExecutionProvider"],
+        )
+
+        input_names = {item.name for item in self._session.get_inputs()}
+
+        input_meta = next(
+            item
+            for item in self._session.get_inputs()
+            if item.name == "input"
+        )
+
+        self._input_samples = int(input_meta.shape[-1])
+
+        if {"input", "state", "sr"}.issubset(input_names):
+            self._mode = "state"
+        elif {"input", "h", "c"}.issubset(input_names):
+            self._mode = "lstm"
+        else:
+            raise RuntimeError(
+                f"Unsupported Silero VAD model inputs: {sorted(input_names)}"
+            )
+
         self.reset()
+
+        logger.info(
+            "silero_vad_loaded mode=%s input_samples=%d inputs=%s",
+            self._mode,
+            self._input_samples,
+            sorted(input_names),
+        )
+
         return self._session
 
     def reset(self) -> None:
-        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        if self._mode == "lstm":
+            self._h = np.zeros((1, 1, 128), dtype=np.float32)
+            self._c = np.zeros((1, 1, 128), dtype=np.float32)
+            self._state = None
+        else:
+            self._state = np.zeros((2, 1, 128), dtype=np.float32)
+            self._h = None
+            self._c = None
 
     def probability(self, frame: np.ndarray) -> float:
         session = self._ensure_loaded()
-        audio = frame.reshape(1, -1).astype(np.float32)
-        out, self._state = session.run(
-            None,
-            {
-                "input": audio,
-                "state": self._state,
-                "sr": np.array(SAMPLE_RATE, dtype=np.int64),
-            },
-        )
-        return float(np.asarray(out).ravel()[0])
 
+        audio = np.asarray(frame, dtype=np.float32).reshape(-1)
+
+        if self._input_samples is None:
+            raise RuntimeError("Silero VAD input size was not initialized")
+
+        if audio.size < self._input_samples:
+            audio = np.pad(
+                audio,
+                (0, self._input_samples - audio.size),
+                mode="constant",
+            )
+        elif audio.size > self._input_samples:
+            audio = audio[:self._input_samples]
+
+        audio = audio.reshape(1, -1)
+
+        if self._mode == "lstm":
+            outputs = session.run(
+                None,
+                {
+                    "input": audio,
+                    "h": self._h,
+                    "c": self._c,
+                },
+            )
+            probability, self._h, self._c = outputs
+
+        else:
+            outputs = session.run(
+                None,
+                {
+                    "input": audio,
+                    "state": self._state,
+                    "sr": np.array(SAMPLE_RATE, dtype=np.int64),
+                },
+            )
+            probability, self._state = outputs
+
+        return float(np.asarray(probability).ravel()[0])
 
 class EnergyVad(SpeechDetector):
     """RMS-energy fallback.

@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 
 from app.audio.base import AudioChannel, AudioError, AudioSource
 from app.audio.device_source import DeviceAudioSource
@@ -7,7 +8,7 @@ from app.core.logging import get_logger
 from app.realtime.session import LiveSession
 from app.stt.base import SttEngine
 from app.stt.pipeline import AudioPipeline, TranscriptionWorker
-from app.stt.vad import build_speech_detector
+from app.stt.vad import SpeechDetector, build_speech_detector
 
 logger = get_logger(__name__)
 
@@ -17,6 +18,7 @@ def build_pipeline(
     engine: SttEngine,
     sources: list[AudioSource] | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
+    detector_factory: Callable[[], SpeechDetector] = build_speech_detector,
 ) -> AudioPipeline:
     """Attach capture to a live session.
 
@@ -30,7 +32,7 @@ def build_pipeline(
     workers = [
         TranscriptionWorker(
             source=source,
-            detector=build_speech_detector(),
+            detector=detector_factory(),
             engine=engine,
             loop=loop,
             on_transcript=live.on_transcript,

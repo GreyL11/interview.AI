@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     # Speech to text
     stt_model: str = "distil-small.en"
-    stt_device: str = "auto"          # auto -> cuda when usable, else cpu
+    stt_device: str = "cpu"
     stt_compute_type: str = "int8"
     stt_beam_size: int = 5
     stt_language: str = "en"

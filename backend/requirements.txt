@@ -25,6 +25,7 @@ huggingface-hub>=0.26
 # as a direct dependency of the embedding backend rather than assumed transitive.
 faster-whisper>=1.1
 sounddevice>=0.5
+PyAudioWPatch>=0.2.12.7; sys_platform == "win32"
 
 pytest>=8.3
 pytest-asyncio>=0.24

@@ -56,6 +56,13 @@ class FasterWhisperEngine(SttEngine):
                     download_root=self._download_root,
                 )
             except Exception as exc:
+                if device == "cuda":
+                    raise SttError(
+                        "CUDA STT was explicitly selected but could not start. "
+                        "Install a compatible NVIDIA CUDA runtime with cuBLAS/cuDNN "
+                        "libraries, or set STT_DEVICE=cpu and STT_COMPUTE_TYPE=int8. "
+                        f"Cause: {exc}"
+                    ) from exc
                 raise SttError(
                     f"Could not load STT model '{self._model_name}'. First run needs "
                     f"network access to download it. Cause: {exc}"
@@ -68,18 +75,33 @@ class FasterWhisperEngine(SttEngine):
             return self._model
 
     def _resolve_device(self) -> tuple[str, str]:
-        """CUDA needs cuDNN/cuBLAS DLLs we deliberately do not ship. Probe rather
-        than assume, and fall back to CPU instead of failing the session."""
+        """Validate an explicit CUDA request; CPU is the safe default."""
+        if self._device == "cpu":
+            return "cpu", self._compute_type
+        if self._device == "cuda":
+            try:
+                import ctranslate2
+
+                if ctranslate2.get_cuda_device_count() > 0:
+                    return "cuda", self._compute_type
+            except Exception as exc:
+                raise SttError(
+                    "CUDA STT was explicitly selected but CUDA/cuBLAS libraries "
+                    "are unavailable. Install a compatible NVIDIA CUDA runtime, or "
+                    "set STT_DEVICE=cpu and STT_COMPUTE_TYPE=int8."
+                ) from exc
+            raise SttError(
+                "CUDA STT was explicitly selected but no usable CUDA device was found. "
+                "Install the NVIDIA CUDA/cuBLAS runtime, or set STT_DEVICE=cpu and "
+                "STT_COMPUTE_TYPE=int8."
+            )
+
         if self._device != "auto":
             return self._device, self._compute_type
-        try:
-            import ctranslate2
 
-            if ctranslate2.get_cuda_device_count() > 0:
-                return "cuda", "float16"
-        except Exception:
-            pass
-        return "cpu", "int8"
+        # Preserve compatibility with legacy STT_DEVICE=auto deployments, but
+        # never opt into CUDA implicitly; use STT_DEVICE=cuda to request it.
+        return "cpu", self._compute_type
 
     def warmup(self) -> None:
         self._ensure_loaded()

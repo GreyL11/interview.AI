@@ -18,7 +18,7 @@ from app.realtime.events import EventType
 from app.realtime.session import LiveSession
 from app.sessions.schemas import Session, TranscriptSource
 from app.storage.session_repository import SessionRepository
-from app.stt.vad import FRAME_MS
+from app.stt.vad import FRAME_MS, EnergyVad
 from tests.fakes import (
     FakeAudioSource,
     FakeSttEngine,
@@ -71,7 +71,11 @@ def utterance(frame_count=20):
 async def run_audio(live, sources, engine=None, timeout=6.0):
     """Start capture, wait for sources to drain, then stop."""
     pipeline = build_pipeline(
-        live, engine or FakeSttEngine(), sources=sources, loop=asyncio.get_running_loop()
+        live,
+        engine or FakeSttEngine(),
+        sources=sources,
+        loop=asyncio.get_running_loop(),
+        detector_factory=EnergyVad,
     )
     await live.start_audio(pipeline)
 
@@ -186,7 +190,9 @@ async def test_audio_status_is_emitted_on_start_and_stop(live):
 
 async def test_starting_audio_twice_is_idempotent(live):
     source = FakeAudioSource(silence_frames(200), channel=AudioChannel.LOOPBACK)
-    pipeline = build_pipeline(live, FakeSttEngine(), sources=[source])
+    pipeline = build_pipeline(
+        live, FakeSttEngine(), sources=[source], detector_factory=EnergyVad
+    )
 
     await live.start_audio(pipeline)
     channels = await live.start_audio(pipeline)
@@ -198,7 +204,9 @@ async def test_starting_audio_twice_is_idempotent(live):
 
 async def test_close_stops_audio(live):
     source = FakeAudioSource(silence_frames(500), channel=AudioChannel.LOOPBACK)
-    pipeline = build_pipeline(live, FakeSttEngine(), sources=[source])
+    pipeline = build_pipeline(
+        live, FakeSttEngine(), sources=[source], detector_factory=EnergyVad
+    )
     await live.start_audio(pipeline)
 
     await live.close()

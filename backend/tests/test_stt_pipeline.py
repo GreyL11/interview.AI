@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import numpy as np
 import pytest
@@ -52,6 +53,7 @@ async def run_worker(probabilities, frames, engine=None, partial_interval_ms=100
     await asyncio.get_running_loop().run_in_executor(None, source.exhausted.wait, 5.0)
     await asyncio.sleep(0.2)  # let queued coroutines land on the loop
     worker.stop()
+    await asyncio.sleep(0.05)  # let executor-published coroutines land on the loop
     return recorder, worker
 
 
@@ -184,3 +186,54 @@ async def test_pipeline_rolls_back_when_a_worker_fails_to_start():
 
     # The already-running worker must not be left orphaned holding a device.
     assert good._thread is None or not good._thread.is_alive()
+
+
+class SlowSttEngine(FakeSttEngine):
+    def __init__(self, delay: float = 0.05):
+        super().__init__()
+        self.delay = delay
+
+    def transcribe(self, audio, is_final):
+        time.sleep(self.delay)
+        return super().transcribe(audio, is_final)
+
+
+async def test_slow_stt_does_not_block_audio_frame_consumption():
+    frames = speech_frames(100) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 100 + [0.0] * SILENCE_TO_END
+
+    _, worker = await run_worker(
+        probabilities,
+        frames,
+        engine=SlowSttEngine(delay=0.1),
+        partial_interval_ms=200,
+    )
+
+    assert worker.frames_consumed == len(frames)
+
+
+async def test_slow_partials_are_coalesced_and_final_is_executed():
+    frames = speech_frames(100) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 100 + [0.0] * SILENCE_TO_END
+    engine = SlowSttEngine(delay=0.1)
+
+    recorder, worker = await run_worker(
+        probabilities,
+        frames,
+        engine=engine,
+        partial_interval_ms=100,
+    )
+
+    assert worker.partials_scheduled >= 1
+    assert worker.partials_coalesced > 0
+    assert any(is_final for _, is_final in engine.calls)
+    assert recorder.calls[-1][2] is True
+
+
+async def test_stop_shuts_down_the_transcription_executor():
+    frames = speech_frames(20) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 20 + [0.0] * SILENCE_TO_END
+
+    _, worker = await run_worker(probabilities, frames, engine=SlowSttEngine())
+
+    assert worker._executor is None
