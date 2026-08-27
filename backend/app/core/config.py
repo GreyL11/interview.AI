@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     rag_min_similarity: float = 0.25
     rag_overfetch: int = 4  # search top_k * this, since SQLite filtering drops hits
 
+    # Session memory
+    memory_max_tokens: int = 1200  # verbatim window; older turns get summarised
+
     log_level: str = "INFO"
 
     @property

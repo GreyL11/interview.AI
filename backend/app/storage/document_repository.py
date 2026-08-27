@@ -1,3 +1,7 @@
+# Deferred annotations: this class defines a `list()` method, which shadows the
+# builtin inside the class body and breaks `list[...]` annotations at runtime.
+from __future__ import annotations
+
 import sqlite3
 
 from app.documents.schemas import (

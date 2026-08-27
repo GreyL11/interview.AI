@@ -42,12 +42,66 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 CREATE TABLE IF NOT EXISTS vector_seq (next_id INTEGER NOT NULL);
 
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    ended_at   TEXT,
+    status     TEXT NOT NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    config     TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS turns (
+    turn_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL,
+    question      TEXT NOT NULL,
+    category      TEXT NOT NULL DEFAULT '',
+    domain        TEXT NOT NULL DEFAULT '',
+    confidence    REAL NOT NULL DEFAULT 0,
+    answer        TEXT,
+    context_found INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL,
+    latency_ms    INTEGER,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    turn_id    INTEGER,
+    source     TEXT NOT NULL,
+    is_final   INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    started_at TEXT,
+    ended_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS retrieval_hits (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id  INTEGER NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL,
+    score    REAL NOT NULL,
+    rank     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id          TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    summary             TEXT NOT NULL DEFAULT '',
+    topics              TEXT NOT NULL DEFAULT '[]',
+    covered_through_seq INTEGER NOT NULL DEFAULT 0,
+    updated_at          TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_chunks_document  ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_vector    ON chunks(vector_id);
 CREATE INDEX IF NOT EXISTS idx_documents_lookup ON documents(knowledge_type, status);
+CREATE INDEX IF NOT EXISTS idx_turns_session    ON turns(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_transcripts_sess ON transcripts(session_id, is_final);
+CREATE INDEX IF NOT EXISTS idx_hits_turn        ON retrieval_hits(turn_id);
 """
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 
 
 class Database:

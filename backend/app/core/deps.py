@@ -10,11 +10,13 @@ from app.documents.parsers.text import TextParser
 from app.documents.service import DocumentService
 from app.embeddings.base import EmbeddingProvider
 from app.embeddings.onnx_embedder import OnnxEmbedder
+from app.memory.sqlite_memory import SqliteSessionMemory
 from app.retrieval.base import Retriever
 from app.retrieval.local_retriever import LocalRetriever
 from app.storage.chunk_repository import ChunkRepository
 from app.storage.database import Database
 from app.storage.document_repository import DocumentRepository
+from app.storage.session_repository import SessionRepository
 from app.vector_store.base import VectorStore
 from app.vector_store.faiss_store import FaissVectorStore
 
@@ -69,3 +71,13 @@ def get_document_service() -> DocumentService:
 @lru_cache
 def get_retriever() -> Retriever:
     return LocalRetriever(get_embedder(), get_vector_store(), get_chunk_repository())
+
+
+@lru_cache
+def get_session_repository() -> SessionRepository:
+    return SessionRepository(get_database())
+
+
+@lru_cache
+def get_session_memory() -> SqliteSessionMemory:
+    return SqliteSessionMemory(get_session_repository())
