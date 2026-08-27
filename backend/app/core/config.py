@@ -40,6 +40,26 @@ class Settings(BaseSettings):
     ws_replay_buffer: int = 200
     api_token: str = ""  # set by the desktop shell at spawn; empty disables the check
 
+    # Audio capture
+    audio_queue_frames: int = 200  # ~6s at 32ms/frame before dropping oldest
+    audio_capture_mic: bool = True        # candidate, recorded for review
+    audio_capture_loopback: bool = True   # interviewer, drives question detection
+
+    # Voice activity detection
+    vad_threshold: float = 0.5
+    vad_start_frames: int = 2        # ~64ms of speech to open an utterance
+    vad_silence_ms: int = 700        # sustained silence to close one
+    vad_min_utterance_ms: int = 300  # below this it is a click, not speech
+    vad_max_utterance_ms: int = 30_000
+
+    # Speech to text
+    stt_model: str = "distil-small.en"
+    stt_device: str = "auto"          # auto -> cuda when usable, else cpu
+    stt_compute_type: str = "int8"
+    stt_beam_size: int = 5
+    stt_language: str = "en"
+    stt_partial_interval_ms: int = 1000
+
     log_level: str = "INFO"
 
     @property
