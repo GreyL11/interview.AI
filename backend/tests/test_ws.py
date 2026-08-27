@@ -183,6 +183,53 @@ def test_bad_token_is_rejected(ws_client, monkeypatch):
             socket.receive_text()
 
 
+def test_socket_survives_a_missing_gemini_key(database, retriever, monkeypatch):
+    """Regression: GeminiClient used to raise at construction, which happened
+    before websocket.accept() and rejected the handshake with a 502 — taking
+    transcription and the whole session down over a missing key. A session must
+    start, transcribe, and record without one; only answers should fail."""
+    from app.core.config import settings as app_settings
+    from app.llm.gemini_client import GeminiClient
+
+    monkeypatch.setattr(app_settings, "gemini_api_key", "")
+
+    repo = SessionRepository(database)
+    real_client = GeminiClient()  # must not raise
+    monkeypatch.setattr(deps, "get_session_repository", lambda: repo)
+    monkeypatch.setattr(deps, "get_retriever", lambda: retriever)
+    monkeypatch.setattr(deps, "get_llm_client", lambda: real_client)
+    monkeypatch.setattr(deps, "get_summarizer", lambda: None)
+    monkeypatch.setattr(
+        deps, "get_session_memory",
+        lambda: __import__("app.memory.session_memory",
+                           fromlist=["InMemorySessionMemory"]).InMemorySessionMemory(),
+    )
+    import app.api.ws as ws_module
+
+    for name in ("get_session_repository", "get_retriever", "get_llm_client",
+                 "get_summarizer", "get_session_memory"):
+        monkeypatch.setattr(ws_module, name, getattr(deps, name))
+
+    with TestClient(app) as client:
+        session_id = new_session(repo)
+        with client.websocket_connect(f"/ws/session/{session_id}") as socket:
+            assert json.loads(socket.receive_text())["type"] == EventType.SESSION_STARTED
+
+            socket.send_text(json.dumps({
+                "type": EventType.QUESTION_MANUAL,
+                "data": {"text": "How would you handle duplicate records?"},
+            }))
+            seen = read_until(socket, EventType.ANSWER_ERROR)
+
+        types = [e["type"] for e in seen]
+        # The transcript still lands; only the answer fails.
+        assert EventType.TRANSCRIPT_FINAL in types
+        assert "GEMINI_API_KEY" in seen[-1]["data"]["message"]
+        assert repo.get_transcript(session_id)
+
+    session_manager._sessions.clear()
+
+
 def test_correct_token_is_accepted(ws_client, monkeypatch):
     from app.core.config import settings
 

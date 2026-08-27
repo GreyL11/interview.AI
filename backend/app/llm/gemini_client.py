@@ -11,12 +11,29 @@ logger = get_logger(__name__)
 
 
 class GeminiClient(LLMClient):
+    """Gemini behind the LLMClient interface.
+
+    Construction is deliberately side-effect free and never raises: a live
+    session must still start, transcribe, and record without a configured key.
+    A missing key surfaces per-answer as answer.error, which the UI can show
+    against that one turn, instead of refusing the WebSocket handshake and
+    taking the whole session down.
+    """
+
     def __init__(self) -> None:
+        self._client = None
+
+    def _ensure_client(self):
+        if self._client is not None:
+            return self._client
         if not settings.gemini_api_key:
-            raise LLMError("GEMINI_API_KEY is not configured")
+            raise LLMError(
+                "GEMINI_API_KEY is not configured. Add it in Setup to enable answers."
+            )
         from google import genai
 
         self._client = genai.Client(api_key=settings.gemini_api_key)
+        return self._client
 
     def _config(self):
         from google.genai import types
@@ -24,10 +41,11 @@ class GeminiClient(LLMClient):
         return types.GenerateContentConfig(response_mime_type="application/json")
 
     async def generate_answer(self, prompt: str) -> Answer:
+        client = self._ensure_client()
         logger.info("llm_request_started model=%s", settings.gemini_model)
         try:
             response = await asyncio.wait_for(
-                self._client.aio.models.generate_content(
+                client.aio.models.generate_content(
                     model=settings.gemini_model, contents=prompt, config=self._config()
                 ),
                 timeout=settings.gemini_timeout_seconds,
@@ -41,9 +59,10 @@ class GeminiClient(LLMClient):
         return _to_answer(response.text or "")
 
     async def stream_answer(self, prompt: str) -> AsyncIterator[str]:
+        client = self._ensure_client()
         logger.info("llm_stream_started model=%s", settings.gemini_model)
         try:
-            stream = await self._client.aio.models.generate_content_stream(
+            stream = await client.aio.models.generate_content_stream(
                 model=settings.gemini_model, contents=prompt, config=self._config()
             )
             async for chunk in stream:
