@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api import documents, health, question, sessions, settings_api, ws
+from app.core.auth import TokenMiddleware
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.documents.service import DocumentError
@@ -37,7 +38,9 @@ async def lifespan(app: FastAPI):
     await session_manager.close_all()
 
 
-app = FastAPI(title="Interview Coach API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Interview Coach API", version="0.3.0", lifespan=lifespan)
+
+app.add_middleware(TokenMiddleware)
 
 app.include_router(health.router)
 app.include_router(question.router)
