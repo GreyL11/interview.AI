@@ -64,6 +64,7 @@ class LiveSession:
         self._subscribers: set[Emitter] = set()
         self._replay: deque[Event] = deque(maxlen=settings.ws_replay_buffer)
         self._lock = asyncio.Lock()
+        self._audio = None
 
     # ------------------------------------------------------------ subscribers
 
@@ -280,9 +281,35 @@ class LiveSession:
         self._background.add(task)
         task.add_done_callback(self._background.discard)
 
+    # -------------------------------------------------------------------- audio
+
+    async def start_audio(self, pipeline) -> list[str]:
+        """Begin live capture. Returns the channels actually opened."""
+        if self._audio is not None:
+            return [c.value for c in self._audio.channels]
+
+        await asyncio.to_thread(pipeline.start)
+        self._audio = pipeline
+        channels = [c.value for c in pipeline.channels]
+        await self.emit(event(EventType.SESSION_STATUS, audio="ok", channels=channels))
+        logger.info("audio_attached session=%s channels=%s", self.session_id, channels)
+        return channels
+
+    async def stop_audio(self) -> None:
+        if self._audio is None:
+            return
+        pipeline, self._audio = self._audio, None
+        await asyncio.to_thread(pipeline.stop)
+        await self.emit(event(EventType.SESSION_STATUS, audio="stopped"))
+
+    @property
+    def audio_active(self) -> bool:
+        return self._audio is not None
+
     # ------------------------------------------------------------------ closing
 
     async def close(self) -> None:
+        await self.stop_audio()
         await self.cancel(CancelReason.SESSION_ENDED)
         for task in list(self._background):
             task.cancel()

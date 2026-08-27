@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import documents, health, question, sessions, ws
+from app.api import documents, health, question, sessions, settings_api, ws
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.documents.service import DocumentError
@@ -43,6 +43,7 @@ app.include_router(health.router)
 app.include_router(question.router)
 app.include_router(documents.router)
 app.include_router(sessions.router)
+app.include_router(settings_api.router)
 app.include_router(ws.router)
 
 

@@ -18,6 +18,14 @@ onnxruntime>=1.20
 tokenizers>=0.20
 huggingface-hub>=0.26
 
+# Live audio and speech-to-text. Not installed in the dev environment used to
+# build M4/M5 -- those paths are covered by fakes and are pending hardware
+# verification (see README). Both are torch-free: faster-whisper uses
+# CTranslate2, and the bundled Silero VAD runs on onnxruntime, declared above
+# as a direct dependency of the embedding backend rather than assumed transitive.
+faster-whisper>=1.1
+sounddevice>=0.5
+
 pytest>=8.3
 pytest-asyncio>=0.24
 httpx>=0.27

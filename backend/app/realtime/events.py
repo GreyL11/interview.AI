@@ -27,6 +27,8 @@ class EventType(StrEnum):
     SESSION_STOP = "session.stop"
     QUESTION_MANUAL = "question.manual"
     ANSWER_CANCEL = "answer.cancel"
+    AUDIO_START = "audio.start"
+    AUDIO_STOP = "audio.stop"
     PING = "ping"
     PONG = "pong"
 

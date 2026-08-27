@@ -20,6 +20,8 @@ from app.storage.chunk_repository import ChunkRepository
 from app.storage.database import Database
 from app.storage.document_repository import DocumentRepository
 from app.storage.session_repository import SessionRepository
+from app.stt.base import SttEngine
+from app.stt.faster_whisper_engine import FasterWhisperEngine
 from app.vector_store.base import VectorStore
 from app.vector_store.faiss_store import FaissVectorStore
 
@@ -94,3 +96,8 @@ def get_llm_client() -> LLMClient:
 @lru_cache
 def get_summarizer() -> SessionSummarizer:
     return SessionSummarizer(get_session_repository(), get_llm_client())
+
+
+@lru_cache
+def get_stt_engine() -> SttEngine:
+    return FasterWhisperEngine()

@@ -83,6 +83,24 @@ async def session_socket(
         live.unsubscribe(emit)
 
 
+async def _start_audio(websocket: WebSocket, live: LiveSession) -> None:
+    """Attach live capture. A machine with no usable device must still be able
+    to practise with typed questions, so this reports and continues."""
+    from app.audio.base import AudioError
+    from app.core.deps import get_stt_engine
+    from app.realtime.audio_binding import build_pipeline
+    from app.stt.base import SttError
+
+    try:
+        pipeline = build_pipeline(live, get_stt_engine())
+        await live.start_audio(pipeline)
+    except (AudioError, SttError) as exc:
+        logger.warning("audio_start_failed session=%s error=%s", live.session_id, exc)
+        await websocket.send_text(
+            event(EventType.SESSION_STATUS, audio="error", message=str(exc)).model_dump_json()
+        )
+
+
 async def _pump(websocket: WebSocket, live: LiveSession) -> None:
     while True:
         raw = await websocket.receive_text()
@@ -104,6 +122,12 @@ async def _pump(websocket: WebSocket, live: LiveSession) -> None:
 
         elif message.type == EventType.ANSWER_CANCEL:
             await live.cancel(CancelReason.USER_STOP)
+
+        elif message.type == EventType.AUDIO_START:
+            await _start_audio(websocket, live)
+
+        elif message.type == EventType.AUDIO_STOP:
+            await live.stop_audio()
 
         elif message.type == EventType.SESSION_STOP:
             await session_manager.close(live.session_id)
