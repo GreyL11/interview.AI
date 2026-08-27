@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # Session memory
     memory_max_tokens: int = 1200  # verbatim window; older turns get summarised
 
+    # Question detection (only final transcripts ever reach this)
+    question_min_words: int = 3
+    question_min_confidence: float = 0.5
+    question_coalesce_ms: int = 1200  # a follow-on clause corrects, not re-asks
+
+    # Realtime transport
+    ws_replay_buffer: int = 200
+    api_token: str = ""  # set by the desktop shell at spawn; empty disables the check
+
     log_level: str = "INFO"
 
     @property

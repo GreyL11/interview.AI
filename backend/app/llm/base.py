@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 
 from app.schemas.answer import Answer
 
@@ -11,6 +12,16 @@ class LLMClient(ABC):
     @abstractmethod
     async def generate_answer(self, prompt: str) -> Answer:
         ...
+
+    async def stream_answer(self, prompt: str) -> AsyncIterator[str]:
+        """Yield raw response text as it arrives.
+
+        Default implementation falls back to the non-streaming call and emits
+        one chunk, so every client satisfies the streaming contract even if the
+        provider cannot stream.
+        """
+        answer = await self.generate_answer(prompt)
+        yield answer.model_dump_json()
 
 
 class LLMError(Exception):

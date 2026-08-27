@@ -56,3 +56,56 @@ class FakeLLM(LLMClient):
     async def generate_answer(self, prompt: str) -> Answer:
         self.prompts.append(prompt)
         return self.answer
+
+
+class SlowStreamingLLM(LLMClient):
+    """Streams an answer in small chunks with a controllable delay.
+
+    The delay is what makes cancellation testable: it holds a turn open long
+    enough for a second question to supersede it.
+    """
+
+    def __init__(self, answer: Answer | None = None, chunk_delay: float = 0.02) -> None:
+        self.answer = answer or Answer(
+            summary="Stream the answer progressively.",
+            key_points=["one", "two"],
+            detailed_answer="detail",
+        )
+        self.chunk_delay = chunk_delay
+        self.prompts: list[str] = []
+        self.started = 0
+        self.cancelled = 0
+
+    async def generate_answer(self, prompt: str) -> Answer:
+        self.prompts.append(prompt)
+        return self.answer
+
+    async def stream_answer(self, prompt: str):
+        import asyncio
+
+        self.prompts.append(prompt)
+        self.started += 1
+        payload = self.answer.model_dump_json()
+        try:
+            for i in range(0, len(payload), 12):
+                await asyncio.sleep(self.chunk_delay)
+                yield payload[i : i + 12]
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+
+
+class BrokenLLM(LLMClient):
+    def __init__(self, message: str = "provider exploded") -> None:
+        self.message = message
+
+    async def generate_answer(self, prompt: str) -> Answer:
+        from app.llm.base import LLMError
+
+        raise LLMError(self.message)
+
+    async def stream_answer(self, prompt: str):
+        from app.llm.base import LLMError
+
+        raise LLMError(self.message)
+        yield ""  # pragma: no cover - unreachable, keeps this an async generator

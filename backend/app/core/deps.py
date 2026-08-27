@@ -10,7 +10,10 @@ from app.documents.parsers.text import TextParser
 from app.documents.service import DocumentService
 from app.embeddings.base import EmbeddingProvider
 from app.embeddings.onnx_embedder import OnnxEmbedder
+from app.llm.base import LLMClient
+from app.llm.gemini_client import GeminiClient
 from app.memory.sqlite_memory import SqliteSessionMemory
+from app.memory.summarizer import SessionSummarizer
 from app.retrieval.base import Retriever
 from app.retrieval.local_retriever import LocalRetriever
 from app.storage.chunk_repository import ChunkRepository
@@ -81,3 +84,13 @@ def get_session_repository() -> SessionRepository:
 @lru_cache
 def get_session_memory() -> SqliteSessionMemory:
     return SqliteSessionMemory(get_session_repository())
+
+
+@lru_cache
+def get_llm_client() -> LLMClient:
+    return GeminiClient()
+
+
+@lru_cache
+def get_summarizer() -> SessionSummarizer:
+    return SessionSummarizer(get_session_repository(), get_llm_client())

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import documents, health, question, sessions
+from app.api import documents, health, question, sessions, ws
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.documents.service import DocumentError
@@ -32,6 +32,10 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    from app.realtime.manager import session_manager
+
+    await session_manager.close_all()
+
 
 app = FastAPI(title="Interview Coach API", version="0.2.0", lifespan=lifespan)
 
@@ -39,6 +43,7 @@ app.include_router(health.router)
 app.include_router(question.router)
 app.include_router(documents.router)
 app.include_router(sessions.router)
+app.include_router(ws.router)
 
 
 @app.exception_handler(LLMError)
