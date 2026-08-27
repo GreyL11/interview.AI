@@ -1,0 +1,42 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local data: user documents, embeddings, vector indexes, session storage
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.faiss
+*.index
+index.faiss
+index.pkl
+
+# Models / caches downloaded at runtime
+models/
+.cache/
+
+# Node / Tauri (later phases)
+node_modules/
+dist/
+src-tauri/target/
+
+# Editors & OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
