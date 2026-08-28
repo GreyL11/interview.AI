@@ -72,3 +72,37 @@ def test_explicit_cuda_without_a_usable_device_is_actionable(monkeypatch):
 
     with pytest.raises(SttError, match="STT_DEVICE=cpu"):
         FasterWhisperEngine(device="cuda", compute_type="float16")._resolve_device()
+
+
+def test_warmup_runs_the_throwaway_inference_pass_only_once(monkeypatch, tmp_path):
+    """AudioPipeline.start() blocks on warmup() every time audio starts (a
+    stop/start toggle, a second session, a reconnect). Re-running a real
+    inference pass on an already-warm model on every one of those calls would
+    burn CPU and delay capture for no benefit, so only the first call should
+    actually transcribe."""
+    transcribe_calls = []
+
+    class FakeWhisperModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def transcribe(self, audio, **kwargs):
+            transcribe_calls.append(audio)
+            return [], SimpleNamespace(language="en")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "faster_whisper",
+        SimpleNamespace(WhisperModel=FakeWhisperModel),
+    )
+
+    engine = FasterWhisperEngine(
+        model_name="mock-model", device="cpu", compute_type="int8",
+        download_root=str(tmp_path),
+    )
+
+    engine.warmup()
+    engine.warmup()
+    engine.warmup()
+
+    assert len(transcribe_calls) == 1

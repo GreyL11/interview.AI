@@ -34,6 +34,7 @@ class FasterWhisperEngine(SttEngine):
         self._download_root = download_root or str(settings.data_dir / "models" / "whisper")
         self._model = None
         self._lock = threading.Lock()
+        self._warmed_up = False
 
     def _ensure_loaded(self):
         if self._model is not None:
@@ -112,15 +113,24 @@ class FasterWhisperEngine(SttEngine):
         return "cpu", self._compute_type
 
     def warmup(self) -> None:
-        """Load the model and run one throwaway pass.
+        """Load the model and run one throwaway pass, the first time only.
 
-        Loading alone is not enough: the first real `transcribe` still pays for
-        CTranslate2's lazy graph setup. Half a second of silence buys that back
-        before anyone speaks, instead of charging it to the first question.
+        Loading alone is not enough on that first call: the first real
+        `transcribe` still pays for CTranslate2's lazy graph setup, so half a
+        second of silence buys that back before anyone speaks. But
+        AudioPipeline.start() now blocks on this call every time audio starts
+        (a stop/start toggle, a second session, a reconnect) — repeating a real
+        inference pass on an already-warm model would just burn CPU and delay
+        capture for no benefit, so every call after the first is a no-op.
         """
+        if self._warmed_up:
+            self._ensure_loaded()
+            log_metric("stt_warmup_skipped", model=self._model_name)
+            return
         started = time.monotonic()
         self._ensure_loaded()
         self.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), is_final=False)
+        self._warmed_up = True
         log_metric(
             "stt_warmup_completed",
             model=self._model_name,

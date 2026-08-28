@@ -112,7 +112,7 @@ def test_detail_records_which_layer_fired():
     assert QuestionDetector().inspect("Tell me about caching").detail == "interview_prompt"
     assert QuestionDetector().inspect("Why did you choose that").detail == "interrogative"
     assert QuestionDetector().inspect("Is this thread safe?").detail == "punctuation"
-    assert QuestionDetector().inspect("Very good").detail == "too_short"
+    assert QuestionDetector().inspect("Very good").detail == "no_question_pattern"
 
 
 def test_coalesces_a_rapid_correction():
