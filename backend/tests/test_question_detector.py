@@ -154,3 +154,78 @@ def test_low_confidence_is_rejected():
     detection = detector.inspect("What is a database index?")
     assert not detection.accepted
     assert detection.reason == RejectionReason.LOW_CONFIDENCE
+
+
+# ------------------------------------------------------- preceding context
+# Reported bug: "By using this study, just write a character count program."
+# isn't itself phrased as a question, so it was rejected and discarded. The
+# very next utterance, "How many times each character is repeated?", was then
+# answered as a standalone fragment with no idea what "it" refers to.
+
+
+def test_a_rejected_setup_utterance_is_prepended_to_the_next_question():
+    detector = QuestionDetector()
+    setup = detector.inspect(
+        "By using this study, just write a character count program.", now=100.0
+    )
+    assert not setup.accepted
+
+    question = detector.inspect("How many times each character is repeated?", now=101.0)
+    assert question.accepted
+    assert "character count program" in question.text
+    assert "How many times each character is repeated" in question.text
+
+
+def test_context_older_than_the_window_is_not_used():
+    detector = QuestionDetector(context_window_ms=1000)
+    detector.inspect(
+        "By using this study, just write a character count program.", now=100.0
+    )
+
+    question = detector.inspect("How many times each character is repeated?", now=105.0)
+    assert question.accepted
+    assert "character count program" not in question.text
+
+
+def test_context_is_cleared_once_consumed():
+    """The setup fragment answers exactly one question; it must not also
+    attach itself to whatever is asked right after."""
+    detector = QuestionDetector()
+    detector.inspect(
+        "By using this study, just write a character count program.", now=100.0
+    )
+    detector.inspect("How many times each character is repeated?", now=101.0)
+
+    unrelated = detector.inspect("What is a database index?", now=102.0)
+    assert unrelated.accepted
+    assert "character count program" not in unrelated.text
+
+
+def test_a_previous_accepted_question_is_never_used_as_context():
+    """Only rejected fragments become context. An accepted question is a
+    complete, separate turn and must never be glued onto the next one, even
+    when it lands just outside the correction window."""
+    detector = QuestionDetector(coalesce_ms=50)
+    first = detector.inspect("How would you design a URL shortener?", now=100.0)
+    assert first.accepted
+
+    second = detector.inspect("What is a database index?", now=100.5)
+    assert second.accepted
+    assert not second.supersedes
+    assert "URL shortener" not in second.text
+
+
+def test_buffer_context_false_ignores_and_skips_the_context_buffer():
+    """The flag session.py uses for typed/candidate speech: no read, no write."""
+    detector = QuestionDetector()
+    detector.inspect(
+        "By using this study, just write a character count program.",
+        now=100.0,
+        buffer_context=False,
+    )
+
+    question = detector.inspect(
+        "How many times each character is repeated?", now=101.0, buffer_context=False
+    )
+    assert question.accepted
+    assert "character count program" not in question.text

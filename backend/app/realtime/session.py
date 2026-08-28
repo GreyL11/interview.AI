@@ -115,10 +115,13 @@ class LiveSession:
         if source == TranscriptSource.MIC:
             return
 
-        await self.consider(text)
+        await self.consider(text, source)
 
-    async def consider(self, text: str) -> None:
-        detection = self._detector.inspect(text)
+    async def consider(self, text: str, source: TranscriptSource = TranscriptSource.LOOPBACK) -> None:
+        # Only live interviewer speech may draw on or feed the detector's
+        # preceding-context buffer -- a typed question is the user's own
+        # prompt, not interviewer setup, and must behave exactly as before.
+        detection = self._detector.inspect(text, buffer_context=source == TranscriptSource.LOOPBACK)
         if not detection.accepted:
             await self.emit(
                 event(

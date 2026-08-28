@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     question_min_words: int = 2
     question_min_confidence: float = 0.5
     question_coalesce_ms: int = 1200  # a follow-on clause corrects, not re-asks
+    # How far back a rejected interviewer utterance ("just write a character
+    # count program") can still be prepended as context once the very next
+    # utterance turns out to be the actual question. Deliberately short: this
+    # bridges two halves of one thought, not a running transcript history.
+    question_context_window_ms: int = 4000
 
     # Realtime transport
     ws_replay_buffer: int = 200

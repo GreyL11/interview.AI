@@ -284,6 +284,76 @@ async def test_filler_utterance_is_rejected_visibly(sessions, session_id, retrie
     assert sessions.get_turns(session_id) == []
 
 
+async def test_interviewer_setup_context_reaches_the_detected_question(
+    sessions, session_id, retriever
+):
+    """Reported bug: 'By using this study, just write a character count
+    program.' isn't a question on its own and was previously discarded, so
+    the next utterance was answered as a bare, context-free fragment."""
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.on_transcript(
+        "By using this study, just write a character count program.",
+        TranscriptSource.LOOPBACK, is_final=True,
+    )
+    await live.on_transcript(
+        "How many times each character is repeated?",
+        TranscriptSource.LOOPBACK, is_final=True,
+    )
+    await drain(live)
+
+    detected = collector.of(EventType.QUESTION_DETECTED)
+    assert detected
+    question = detected[0].data["question"]
+    assert "character count program" in question
+    assert "How many times each character is repeated" in question
+
+
+async def test_mic_speech_never_becomes_interviewer_context(sessions, session_id, retriever):
+    """The candidate's own words, even spoken right before an interviewer
+    question, must never be folded into what gets asked."""
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.on_transcript(
+        "I think the answer involves a character count program.",
+        TranscriptSource.MIC, is_final=True,
+    )
+    await live.on_transcript(
+        "How many times each character is repeated?",
+        TranscriptSource.LOOPBACK, is_final=True,
+    )
+    await drain(live)
+
+    detected = collector.of(EventType.QUESTION_DETECTED)
+    assert detected
+    assert "character count program" not in detected[0].data["question"]
+
+
+async def test_manual_question_is_not_augmented_with_interviewer_context(
+    sessions, session_id, retriever
+):
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.on_transcript(
+        "By using this study, just write a character count program.",
+        TranscriptSource.LOOPBACK, is_final=True,
+    )
+    await live.on_transcript(
+        "What is a database index?", TranscriptSource.MANUAL, is_final=True,
+    )
+    await drain(live)
+
+    detected = collector.of(EventType.QUESTION_DETECTED)
+    assert detected
+    assert detected[0].data["question"] == "What is a database index?"
+
+
 # ----------------------------------------------------------------- retrieval
 
 
