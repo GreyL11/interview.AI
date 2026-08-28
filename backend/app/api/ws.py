@@ -1,4 +1,5 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from app.core.config import settings
 from app.core.deps import (
@@ -103,22 +104,42 @@ async def _start_audio(websocket: WebSocket, live: LiveSession) -> None:
 
 async def _pump(websocket: WebSocket, live: LiveSession) -> None:
     while True:
-        raw = await websocket.receive_text()
+        if websocket.client_state != WebSocketState.CONNECTED:
+            return
+
+        try:
+            raw = await websocket.receive_text()
+        except (WebSocketDisconnect, RuntimeError):
+            return
+
         try:
             message = ClientMessage.model_validate_json(raw)
         except Exception as exc:
+            if websocket.client_state != WebSocketState.CONNECTED:
+                return
+
             await websocket.send_text(
-                event(EventType.ERROR, code="BadMessage", message=str(exc)).model_dump_json()
+                event(
+                    EventType.ERROR,
+                    code="BadMessage",
+                    message=str(exc),
+                ).model_dump_json()
             )
             continue
 
         if message.type == EventType.PING:
-            await websocket.send_text(event(EventType.PONG).model_dump_json())
+            await websocket.send_text(
+                event(EventType.PONG).model_dump_json()
+            )
 
         elif message.type == EventType.QUESTION_MANUAL:
             text = str(message.data.get("text", "")).strip()
             if text:
-                await live.on_transcript(text, TranscriptSource.MANUAL, is_final=True)
+                await live.on_transcript(
+                    text,
+                    TranscriptSource.MANUAL,
+                    is_final=True,
+                )
 
         elif message.type == EventType.ANSWER_CANCEL:
             await live.cancel(CancelReason.USER_STOP)
