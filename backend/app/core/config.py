@@ -79,12 +79,13 @@ class Settings(BaseSettings):
     stt_partial_min_audio_ms: int = 500      # below this a partial says nothing useful
     stt_max_partials_per_utterance: int = 4  # bounds re-transcription of one utterance
 
-    # Inference queue bands, lowest number first out. The default order is
-    # interviewer-final > interviewer-partial > candidate-final > candidate-partial,
-    # because only the interviewer's final transcript can produce an answer.
+    # Inference queue bands, lowest number first out. Every final outranks
+    # every partial regardless of channel -- a candidate-final must never wait
+    # behind an interviewer-partial -- and loopback still wins within each
+    # band, since only the interviewer's final transcript can produce an answer.
     stt_priority_loopback_final: int = 0
-    stt_priority_loopback_partial: int = 1
-    stt_priority_mic_final: int = 2
+    stt_priority_mic_final: int = 1
+    stt_priority_loopback_partial: int = 2
     stt_priority_mic_partial: int = 3
 
     log_level: str = "INFO"

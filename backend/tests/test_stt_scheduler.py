@@ -64,9 +64,32 @@ class GatedSttEngine(FakeSttEngine):
 
 
 def test_priority_bands_follow_the_configured_order():
-    assert priority_for(AudioChannel.LOOPBACK, True) < priority_for(AudioChannel.LOOPBACK, False)
-    assert priority_for(AudioChannel.LOOPBACK, False) < priority_for(AudioChannel.MIC, True)
-    assert priority_for(AudioChannel.MIC, True) < priority_for(AudioChannel.MIC, False)
+    # Every final must outrank every partial, regardless of channel -- a MIC
+    # final must never queue behind a LOOPBACK partial -- with loopback still
+    # winning within each band.
+    assert priority_for(AudioChannel.LOOPBACK, True) < priority_for(AudioChannel.MIC, True)
+    assert priority_for(AudioChannel.MIC, True) < priority_for(AudioChannel.LOOPBACK, False)
+    assert priority_for(AudioChannel.LOOPBACK, False) < priority_for(AudioChannel.MIC, False)
+
+
+def test_a_final_never_queues_behind_a_partial_of_any_channel(scheduler):
+    """Regression: bands used to be per-channel (LB final, LB partial, MIC
+    final, MIC partial), so a queued LOOPBACK partial could outrank a MIC
+    final and delay it. Every final must now beat every partial outright."""
+    gate = Gate()
+    scheduler.submit(gate, channel=AudioChannel.LOOPBACK, is_final=True)
+    assert gate.entered.wait(5.0)
+
+    order: list[str] = []
+    scheduler.submit(
+        lambda: order.append("loopback_partial"), channel=AudioChannel.LOOPBACK, is_final=False
+    )
+    scheduler.submit(lambda: order.append("mic_final"), channel=AudioChannel.MIC, is_final=True)
+
+    gate.release.set()
+    scheduler._queue.join()
+
+    assert order == ["mic_final", "loopback_partial"]
 
 
 def test_loopback_final_runs_before_everything_queued_ahead_of_it(scheduler):
@@ -92,7 +115,7 @@ def test_loopback_final_runs_before_everything_queued_ahead_of_it(scheduler):
     gate.release.set()
     scheduler._queue.join()
 
-    assert order == ["loopback_final", "loopback_partial", "mic_final", "mic_partial"]
+    assert order == ["loopback_final", "mic_final", "loopback_partial", "mic_partial"]
 
 
 def test_mic_backlog_does_not_delay_a_loopback_final(scheduler):
