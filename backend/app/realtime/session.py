@@ -217,6 +217,15 @@ class LiveSession:
             prompt = build_prompt(
                 question, classification.category, [c.as_context() for c in chunks], history
             )
+            log_metric(
+                "llm_request_prepared",
+                session_id=self.session_id,
+                question_id=turn_id,
+                prompt_chars=len(prompt),
+                prompt_lines=prompt.count("\n") + 1 if prompt else 0,
+                context_chunks=len(chunks),
+                history_turns=len(history) // 2,
+            )
 
             answer = await self._stream(turn_id, prompt)
             answer = validate(answer, classification, context_found=context_found)

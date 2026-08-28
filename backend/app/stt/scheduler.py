@@ -21,6 +21,7 @@ from typing import Any
 from app.audio.base import AudioChannel
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.metrics import log_metric
 
 logger = get_logger(__name__)
 
@@ -58,7 +59,16 @@ class InferenceJob:
     inference is not interruptible, so a running job always runs to completion.
     """
 
-    __slots__ = ("channel", "utterance_id", "is_final", "_fn", "_lock", "_state", "_done")
+    __slots__ = (
+        "channel",
+        "utterance_id",
+        "is_final",
+        "priority",
+        "_fn",
+        "_lock",
+        "_state",
+        "_done",
+    )
 
     def __init__(
         self,
@@ -66,11 +76,13 @@ class InferenceJob:
         channel: AudioChannel,
         utterance_id: int,
         is_final: bool,
+        priority: int,
     ) -> None:
         self._fn = fn
         self.channel = channel
         self.utterance_id = utterance_id
         self.is_final = is_final
+        self.priority = priority
         self._lock = threading.Lock()
         self._state = "queued"  # queued -> running -> finished, or queued -> cancelled
         self._done = threading.Event()
@@ -201,8 +213,30 @@ class InferenceScheduler:
         """Queue a job. Returns None if the scheduler is not running."""
         if not self._running:
             return None
-        job = InferenceJob(fn, channel, utterance_id, is_final)
-        self._put(priority if priority is not None else priority_for(channel, is_final), job)
+        job_priority = priority if priority is not None else priority_for(channel, is_final)
+        job = InferenceJob(fn, channel, utterance_id, is_final, job_priority)
+        self._put(job_priority, job)
+        log_metric(
+            "stt_job_enqueued",
+            channel=channel.value,
+            utterance_id=utterance_id,
+            is_final=is_final,
+            priority=job_priority,
+            queue_depth=self.depth,
+        )
+        log_metric(
+            "stt_job_priority",
+            channel=channel.value,
+            utterance_id=utterance_id,
+            is_final=is_final,
+            priority=job_priority,
+        )
+        log_metric(
+            "stt_queue_depth",
+            channel=channel.value,
+            utterance_id=utterance_id,
+            depth=self.depth,
+        )
         return job
 
     def _put(self, priority: int, job: InferenceJob | None) -> None:
@@ -237,7 +271,21 @@ class InferenceScheduler:
                     return
                 if not item.job.claim():
                     continue  # cancelled while it waited
+                log_metric(
+                    "stt_job_started",
+                    channel=item.job.channel.value,
+                    utterance_id=item.job.utterance_id,
+                    is_final=item.job.is_final,
+                    priority=item.job.priority,
+                )
                 item.job.run()
+                log_metric(
+                    "stt_job_completed",
+                    channel=item.job.channel.value,
+                    utterance_id=item.job.utterance_id,
+                    is_final=item.job.is_final,
+                    priority=item.job.priority,
+                )
             finally:
                 self._queue.task_done()
 

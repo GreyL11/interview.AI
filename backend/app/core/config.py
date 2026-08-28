@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
     gemini_timeout_seconds: float = 30.0
+    gemini_fallback_models: str = ""
+    gemini_fallback_model: str = ""
+    gemini_retry_max_attempts: int = 3
+    gemini_retry_initial_delay_seconds: float = 0.5
+    gemini_retry_max_delay_seconds: float = 4.0
 
     # Local storage
     data_dir: Path = Path("./data")

@@ -153,6 +153,13 @@ class TranscriptionWorker:
             if job.is_final:
                 finals.append(job)
             elif job.cancel():
+                log_metric(
+                    "stt_job_cancelled",
+                    channel=job.channel.value,
+                    utterance_id=job.utterance_id,
+                    is_final=job.is_final,
+                    priority=job.priority,
+                )
                 self.partials_cancelled += 1
         for job in finals:
             job.wait(timeout=timeout)
@@ -371,6 +378,13 @@ class TranscriptionWorker:
             if job.is_final or job.utterance_id > utterance_id:
                 continue
             if job.cancel():
+                log_metric(
+                    "stt_job_cancelled",
+                    channel=job.channel.value,
+                    utterance_id=job.utterance_id,
+                    is_final=job.is_final,
+                    priority=job.priority,
+                )
                 self.partials_cancelled += 1
                 self._outstanding.discard(job)
                 if self._partial_job is job:
@@ -469,19 +483,46 @@ class AudioPipeline:
 
     def start(self) -> None:
         started: list[TranscriptionWorker] = []
-        for worker in self._workers:
-            try:
-                worker.start()
-                started.append(worker)
-            except Exception:
-                logger.exception("worker_start_failed; stopping the ones already running")
-                for running in started:
-                    running.stop()
-                raise
-        self._workers = started
-        # One warmup for the whole pipeline: every channel shares one engine.
-        if started:
-            started[0].warmup()
+        if not self._workers:
+            return
+
+        first_worker = self._workers[0]
+        scheduler = first_worker._scheduler
+        warmup_error: Exception | None = None
+
+        scheduler.acquire()
+        try:
+            def run_warmup() -> None:
+                nonlocal warmup_error
+                try:
+                    first_worker._engine.warmup()
+                except Exception as exc:
+                    warmup_error = exc
+                    raise
+
+            warmup_job = scheduler.submit(
+                run_warmup,
+                channel=first_worker.channel,
+                priority=WARMUP_PRIORITY,
+            )
+            if warmup_job is not None:
+                warmup_job.wait()
+            if warmup_error is not None:
+                logger.error("stt_warmup_failed error=%s", warmup_error)
+                raise warmup_error
+
+            for worker in self._workers:
+                try:
+                    worker.start()
+                    started.append(worker)
+                except Exception:
+                    logger.exception("worker_start_failed; stopping the ones already running")
+                    for running in started:
+                        running.stop()
+                    raise
+            self._workers = started
+        finally:
+            scheduler.release()
 
     def stop(self) -> None:
         for worker in self._workers:

@@ -120,10 +120,7 @@ class FasterWhisperEngine(SttEngine):
         """
         started = time.monotonic()
         self._ensure_loaded()
-        try:
-            self.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), is_final=False)
-        except SttError as exc:
-            logger.warning("stt_warmup_pass_failed error=%s", exc)
+        self.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), is_final=False)
         log_metric(
             "stt_warmup_completed",
             model=self._model_name,

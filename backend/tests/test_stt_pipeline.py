@@ -140,8 +140,10 @@ async def test_final_pass_gets_the_whole_utterance():
     final_calls = [c for c in engine.calls if c[1]]
     partial_calls = [c for c in engine.calls if not c[1]]
     assert final_calls
-    # The final pass sees at least as much audio as any interim pass.
-    assert final_calls[-1][0] >= max(c[0] for c in partial_calls)
+    # If an interim pass completed before the final was scheduled, the final
+    # must contain at least as much audio.
+    if partial_calls:
+        assert final_calls[-1][0] >= max(c[0] for c in partial_calls)
 
 
 async def test_pipeline_starts_and_stops_all_workers():
@@ -231,6 +233,28 @@ async def test_slow_partials_are_coalesced_and_final_is_executed():
     assert recorder.calls[-1][2] is True
 
 
+async def test_stt_queue_metrics_are_emitted(monkeypatch):
+    events: list[tuple[str, dict]] = []
+
+    def record(event, **fields):
+        events.append((event, fields))
+
+    monkeypatch.setattr("app.stt.scheduler.log_metric", record)
+    monkeypatch.setattr("app.stt.pipeline.log_metric", record)
+
+    frames = speech_frames(20) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 20 + [0.0] * SILENCE_TO_END
+
+    await run_worker(probabilities, frames, partial_interval_ms=200)
+
+    event_names = [name for name, _ in events]
+    assert "stt_job_enqueued" in event_names
+    assert "stt_job_started" in event_names
+    assert "stt_job_completed" in event_names
+    assert "stt_job_priority" in event_names
+    assert "stt_queue_depth" in event_names
+
+
 async def test_stop_releases_the_inference_scheduler():
     frames = speech_frames(20) + silence_frames(SILENCE_TO_END)
     probabilities = [0.9] * 20 + [0.0] * SILENCE_TO_END
@@ -239,3 +263,73 @@ async def test_stop_releases_the_inference_scheduler():
 
     assert not worker._scheduler.running
     assert not any(t.name.startswith("stt-infer") for t in threading.enumerate())
+
+
+class BlockingWarmupEngine(FakeSttEngine):
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def warmup(self):
+        self.entered.set()
+        self.release.wait(5.0)
+
+
+class ExplodingWarmupEngine(FakeSttEngine):
+    def warmup(self):
+        raise SttError("warmup failed")
+
+
+class RecordingAudioSource(FakeAudioSource):
+    def __init__(self, frames, channel=AudioChannel.LOOPBACK):
+        super().__init__(frames, channel=channel)
+        self.started = threading.Event()
+
+    def start(self):
+        self.started.set()
+        super().start()
+
+
+async def test_pipeline_waits_for_warmup_before_starting_audio():
+    loop = asyncio.get_running_loop()
+    engine = BlockingWarmupEngine()
+    source = RecordingAudioSource(silence_frames(5))
+    worker = TranscriptionWorker(
+        source=source,
+        detector=ScriptedSpeechDetector([0.0] * 5),
+        engine=engine,
+        loop=loop,
+        on_transcript=Recorder(),
+    )
+    pipeline = AudioPipeline([worker])
+
+    start_task = asyncio.create_task(asyncio.to_thread(pipeline.start))
+    await asyncio.get_running_loop().run_in_executor(None, engine.entered.wait, 5.0)
+
+    assert not source.started.is_set()
+
+    engine.release.set()
+    await start_task
+
+    assert source.started.is_set()
+    pipeline.stop()
+
+
+async def test_pipeline_cleans_up_when_warmup_fails():
+    loop = asyncio.get_running_loop()
+    source = RecordingAudioSource(silence_frames(5))
+    worker = TranscriptionWorker(
+        source=source,
+        detector=ScriptedSpeechDetector([0.0] * 5),
+        engine=ExplodingWarmupEngine(),
+        loop=loop,
+        on_transcript=Recorder(),
+    )
+    pipeline = AudioPipeline([worker])
+
+    with pytest.raises(SttError, match="warmup failed"):
+        await asyncio.to_thread(pipeline.start)
+
+    assert not source.started.is_set()
+    assert not worker._scheduler.running
