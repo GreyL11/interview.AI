@@ -103,6 +103,7 @@ class LiveSession:
         source: TranscriptSource,
         is_final: bool,
         trace: LatencyTrace | None = None,
+        now: float | None = None,
     ) -> None:
         if not is_final:
             await self.emit(
@@ -122,18 +123,39 @@ class LiveSession:
         if source == TranscriptSource.MIC:
             return
 
-        await self.consider(text, source, trace)
+        await self.consider(text, source, trace, now=now)
 
     async def consider(
         self,
         text: str,
         source: TranscriptSource = TranscriptSource.LOOPBACK,
         trace: LatencyTrace | None = None,
+        *,
+        now: float | None = None,
     ) -> None:
         # Only live interviewer speech may draw on or feed the detector's
         # preceding-context buffer -- a typed question is the user's own
         # prompt, not interviewer setup, and must behave exactly as before.
-        detection = self._detector.inspect(text, buffer_context=source == TranscriptSource.LOOPBACK)
+        # `now` is normally None (the detector falls back to time.monotonic())
+        # -- it exists so a deterministic replay harness can drive the same
+        # merge-window logic with synthetic timestamps instead of real sleeps.
+        detection = self._detector.inspect(
+            text, now, buffer_context=source == TranscriptSource.LOOPBACK
+        )
+        if settings.question_detector_diagnostics:
+            log_metric(
+                "question_detector_decision",
+                session_id=self.session_id,
+                source=source.value,
+                text=text,
+                detected=detection.accepted,
+                category=detection.classification.category.value
+                if detection.classification else None,
+                confidence=detection.classification.confidence
+                if detection.classification else None,
+                reason=detection.reason.value if detection.reason else None,
+                detail=detection.detail,
+            )
         if not detection.accepted:
             await self.emit(
                 event(

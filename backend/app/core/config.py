@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     # supersede it first. A complete question is never delayed -- see
     # question_detector._looks_incomplete.
     question_stabilization_ms: int = 400
+    # Off by default: logs every detector decision (accepted or rejected,
+    # with category/confidence/reason) via the existing structured metrics
+    # logger, for inspecting real-world detector behavior during manual
+    # testing. Never covers MIC audio -- that never reaches the detector.
+    question_detector_diagnostics: bool = False
 
     # Realtime transport
     ws_replay_buffer: int = 200

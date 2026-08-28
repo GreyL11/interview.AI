@@ -256,3 +256,79 @@ No hardcoded SLA assertion exists for the Gemini-dependent rows — a slow
 network or a loaded model would make such a test flaky for reasons outside
 this codebase's control. `grep "metric question_latency_trace"` on a real log
 gives the actual distribution.
+
+## Collecting real-machine latency
+
+The app already emits one `question_latency_trace` line per answered
+question. To turn a real session into a table, capture the log and summarize
+it — no extra instrumentation, no database, no observability stack:
+
+```bash
+python -m app --port 8000 > run.log 2>&1
+```
+
+Run the interview (real audio, real Gemini), then:
+
+```bash
+.venv/Scripts/python.exe scripts/summarize_latency.py run.log
+```
+
+```
+Latency summary over 5 completed question trace(s)
+(traces without a first visible token -- cancelled/superseded/failed -- are excluded)
+
+Metric                                        n      p50      p95      max
+--------------------------------------------------------------------------
+speech_end_to_stt_final_ms                    5      910     2400     2400
+stt_inference_ms                              5      894     1510     1510
+gemini_request_to_first_text_token_ms         5     1015     2100     2100
+total_question_to_first_visible_token_ms      5     2053     4692     4692
+```
+
+*(numbers above are from the synthetic fixture in
+`tests/fixtures_latency_traces.log`, used to test the tool — not measured
+latency. Your own run produces the real ones.)*
+
+It also reads stdin (`... | summarize_latency.py -`). Traces that never
+reached a visible token are excluded, and each metric reports its own sample
+count so one that only applies sometimes (`retrieval_ms`, skipped on non-RAG
+routes) is never averaged against runs where it did not apply.
+
+## Detector accuracy evaluation
+
+`scripts/detector_eval_dataset.json` is a curated regression dataset (real
+questions, statements, acknowledgements, partials, follow-ups with and
+without context, coding problems, corrections, noisy-STT variants). Each case
+replays its utterances through one fresh `QuestionDetector` with synthetic
+timestamps, so multi-turn context/correction/follow-up behavior is exercised
+for real without any sleeping.
+
+```bash
+.venv/Scripts/python.exe scripts/evaluate_detector.py           # report
+.venv/Scripts/python.exe scripts/evaluate_detector.py --strict  # non-zero exit below thresholds
+```
+
+Detection metrics (precision/recall/accuracy) and category-classification
+accuracy are reported separately — a case only counts toward category
+accuracy if it was correctly detected *and* declares an expected category.
+These are regression numbers against this dataset, not a claim about
+real-world accuracy. `tests/test_analysis_tools.py` runs the same thresholds
+in the normal test suite, so a detector regression fails `pytest` too.
+
+To add a real-world case: append an object to `cases` with an `id`, `group`,
+`utterances` (each with `text`, optional `gap_ms`/`source`), `expect_detected`,
+and optionally `expect_category`.
+
+## Detector diagnostics during manual testing
+
+Set `QUESTION_DETECTOR_DIAGNOSTICS=true` to log every detector decision:
+
+```
+metric question_detector_decision session_id=... source=LOOPBACK
+  text="what is caching" detected=True category=TECHNICAL_KNOWLEDGE
+  confidence=0.6 reason=None detail=interview_prompt
+```
+
+Off by default, zero cost when off (one boolean check). Only interviewer
+LOOPBACK speech reaches the detector, so candidate MIC audio can never appear
+on this path.

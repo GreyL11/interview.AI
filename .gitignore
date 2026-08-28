@@ -41,6 +41,8 @@ Thumbs.db
 
 # Logs
 *.log
+# ...except checked-in test fixtures, which tests depend on.
+!backend/tests/fixtures_*.log
 
 # Frontend build output and deps
 frontend/node_modules/

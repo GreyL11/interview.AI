@@ -36,7 +36,7 @@ _DANGLING_WORDS = frozenset({
     "if", "that", "because", "so", "and", "but", "or", "nor",
     "the", "a", "an", "of", "to", "is", "are", "was", "were", "be", "been",
     "with", "for", "in", "on", "at", "as", "than", "while", "though",
-    "although", "since", "unless", "until", "whether", "when", "which", "who", "whom",
+    "although", "since", "unless", "until", "whether", "when", "where", "which", "who", "whom",
 })
 
 

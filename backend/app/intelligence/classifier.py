@@ -17,7 +17,8 @@ _QUESTION_MARKERS = re.compile(
 _FOLLOW_UP = re.compile(r"^(and |what about|how about)\b", re.IGNORECASE)
 _CODING = re.compile(
     r"\b(write a function|write code|implement|leetcode|reverse a|"
-    r"given an array|write a program|two sum|linked list|binary tree)\b",
+    r"given an array|write a program|two sum|linked list|binary tree|"
+    r"character count|count.{0,15}character|palindrom\w*|longest substring)\b",
     re.IGNORECASE,
 )
 _SQL = re.compile(r"\b(sql|select \*|join|group by|database schema|write a query)\b", re.IGNORECASE)

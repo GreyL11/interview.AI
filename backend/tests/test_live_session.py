@@ -370,6 +370,52 @@ async def test_filler_utterance_is_rejected_visibly(sessions, session_id, retrie
     assert sessions.get_turns(session_id) == []
 
 
+async def test_detector_diagnostics_are_off_by_default(sessions, session_id, retriever, monkeypatch):
+    calls = []
+    monkeypatch.setattr("app.realtime.session.log_metric", lambda event, **f: calls.append((event, f)))
+    live = build(sessions, session_id, retriever, FakeLLM())
+
+    await live.on_transcript("What is caching?", TranscriptSource.LOOPBACK, is_final=True)
+
+    assert "question_detector_decision" not in [e for e, _ in calls]
+
+
+async def test_detector_diagnostics_log_the_decision_when_enabled(
+    sessions, session_id, retriever, monkeypatch
+):
+    from app.core.config import settings
+
+    calls = []
+    monkeypatch.setattr("app.realtime.session.log_metric", lambda event, **f: calls.append((event, f)))
+    monkeypatch.setattr(settings, "question_detector_diagnostics", True)
+    live = build(sessions, session_id, retriever, FakeLLM())
+
+    await live.on_transcript("What is caching?", TranscriptSource.LOOPBACK, is_final=True)
+    await live.on_transcript("yeah", TranscriptSource.LOOPBACK, is_final=True)
+
+    decisions = [f for e, f in calls if e == "question_detector_decision"]
+    assert len(decisions) == 2
+    assert decisions[0]["detected"] is True
+    assert decisions[0]["category"] == "TECHNICAL_KNOWLEDGE"
+    assert decisions[1]["detected"] is False
+    assert decisions[1]["reason"]
+
+
+async def test_diagnostics_never_see_mic_content(sessions, session_id, retriever, monkeypatch):
+    from app.core.config import settings
+
+    calls = []
+    monkeypatch.setattr("app.realtime.session.log_metric", lambda event, **f: calls.append((event, f)))
+    monkeypatch.setattr(settings, "question_detector_diagnostics", True)
+    live = build(sessions, session_id, retriever, FakeLLM())
+
+    await live.on_transcript(
+        "I think we should use a dictionary", TranscriptSource.MIC, is_final=True
+    )
+
+    assert not [f for e, f in calls if e == "question_detector_decision"]
+
+
 async def test_interviewer_setup_context_reaches_the_llm_but_not_the_ui(
     sessions, session_id, retriever
 ):
