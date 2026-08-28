@@ -40,6 +40,81 @@ def test_rejects_statements():
     assert detection.reason == RejectionReason.NOT_A_QUESTION
 
 
+# --------------------------------------------------- conversational preamble
+# The live-session bug: an interviewer acknowledges the previous answer, then
+# asks the real question, and Whisper supplies no question mark.
+
+REPORTED = (
+    "Just tell me how much you write yourself in Python. As you said, four. "
+    "Very good. So tell me what is the difference between shallow copy and deep copy."
+)
+
+
+def test_reported_transcript_is_accepted():
+    detection = QuestionDetector().inspect(REPORTED)
+    assert detection.accepted, f"rejected as {detection.reason} / {detection.detail}"
+
+
+def test_reported_transcript_passes_the_clean_prompt_to_coaching():
+    detection = QuestionDetector().inspect(REPORTED)
+    assert detection.text == (
+        "So tell me what is the difference between shallow copy and deep copy?"
+    )
+    # Filler must not reach the model.
+    assert "Very good" not in detection.text
+    assert "As you said" not in detection.text
+
+
+def test_reported_transcript_is_classified_not_unknown():
+    detection = QuestionDetector().inspect(REPORTED)
+    assert detection.classification is not None
+    assert detection.classification.category != Category.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Very good. So tell me what is the difference between shallow copy and deep copy.",
+        "Okay, can you explain Python decorators?",
+        "Great. Describe the challenges you faced.",
+        "Very good. Now tell me how you implemented authentication.",
+        "That's interesting. Walk me through the architecture.",
+        "How did you implement this pipeline",
+        "Can you give me an example",
+        "Tell me the difference between shallow copy and deep copy",
+        "Explain your project",
+        "Walk me through your architecture",
+    ],
+)
+def test_accepts_prompts_end_to_end(text):
+    detection = QuestionDetector().inspect(text)
+    assert detection.accepted, f"rejected as {detection.reason} / {detection.detail}: {text!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Very good",
+        "Okay",
+        "That's correct",
+        "Thank you",
+        "Interesting",
+        "Great answer",
+        "Let's continue",
+    ],
+)
+def test_rejects_acknowledgements_end_to_end(text):
+    detection = QuestionDetector().inspect(text)
+    assert not detection.accepted, f"wrongly accepted: {text!r}"
+
+
+def test_detail_records_which_layer_fired():
+    assert QuestionDetector().inspect("Tell me about caching").detail == "interview_prompt"
+    assert QuestionDetector().inspect("Why did you choose that").detail == "interrogative"
+    assert QuestionDetector().inspect("Is this thread safe?").detail == "punctuation"
+    assert QuestionDetector().inspect("Very good").detail == "no_question_pattern"
+
+
 def test_coalesces_a_rapid_correction():
     detector = QuestionDetector(coalesce_ms=1000)
     first = detector.inspect("How would you scale this service?", now=100.0)

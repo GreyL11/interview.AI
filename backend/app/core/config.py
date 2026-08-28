@@ -32,7 +32,10 @@ class Settings(BaseSettings):
     memory_max_tokens: int = 1200  # verbatim window; older turns get summarised
 
     # Question detection (only final transcripts ever reach this)
-    question_min_words: int = 3
+    # 2, not 3: real prompts get this short ("Explain decorators"). One-word
+    # noise is still filtered, and acknowledgements are rejected by pattern
+    # rather than by length.
+    question_min_words: int = 2
     question_min_confidence: float = 0.5
     question_coalesce_ms: int = 1200  # a follow-on clause corrects, not re-asks
 
