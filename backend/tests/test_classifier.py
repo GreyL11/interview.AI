@@ -44,3 +44,27 @@ def test_flags_for_coding_category():
     assert result.requires_code is True
     assert result.requires_reasoning is True
     assert result.requires_rag is False
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What's wrong with this code?",
+        "Why does this implementation fail?",
+        "How would you fix the race condition?",
+        "This isn't working, why not?",
+    ],
+)
+def test_verbal_debugging_phrasings_are_classified_as_debugging(question):
+    """These are natural spoken phrasings for a debugging follow-up on code
+    the interviewer just described -- none of them contain the literal
+    "bug"/"crash"/"stack trace" keywords the original regex required."""
+    assert classify(question).category == Category.DEBUGGING
+
+
+def test_a_positive_why_does_this_work_question_is_not_misclassified_as_debugging():
+    """The debugging regex targets fail/broken specifically so a positive
+    "why does X work" mechanism question -- common and unrelated to
+    debugging -- is not swept in by a generic "why does...work" match."""
+    result = classify("Why does event-driven architecture work well for this?")
+    assert result.category != Category.DEBUGGING

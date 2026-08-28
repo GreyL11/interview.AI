@@ -13,7 +13,11 @@ Rules:
 5. For scenario questions: diagnose the problem, describe how you'd investigate,
    propose a solution, and explain how you'd validate it.
 6. For coding questions: explain your approach first, then give optimized code,
-   then state time/space complexity, then list edge cases.
+   then state time/space complexity, then list edge cases. If multiple approaches
+   are explicitly requested (e.g. "brute-force first, then optimize"), summarize
+   the brute-force approach briefly in the approach/explanation, but "code" holds
+   only the final, optimized, working solution unless the brute-force code itself
+   was explicitly asked for.
 7. For debugging questions: state the likely cause, how you'd diagnose it, the fix,
    and why the fix works.
 8. For SQL questions: explain the approach, give the query, explain it, then note
@@ -26,7 +30,13 @@ Rules:
     a different topic, ignore it and answer the current question; only draw on it
     when the current question is clearly a follow-up (e.g. "what about...", "why",
     a bare pronoun referring back).
-12. Respond with ONLY a single JSON object matching the requested schema. No markdown
+12. A narrow follow-up gets a narrow answer, not a restatement of everything already
+    said. "What's the time complexity?" gets the complexity, not the solution again.
+    "Can we optimize it?" focuses on the optimization and how it compares to the
+    previous approach. "Without extra space?" / "without sorting?" re-solves under
+    that new constraint. Use the previous conversation to know what "it"/"this" refers
+    to, but do not repeat code or explanation the candidate already has.
+13. Respond with ONLY a single JSON object matching the requested schema. No markdown
     fences, no commentary outside the JSON.
 """
 

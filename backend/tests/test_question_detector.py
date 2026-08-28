@@ -376,3 +376,107 @@ def test_coalesced_continuation_of_a_dangling_clause_is_stable():
     assert second.stable is True
     assert second.supersedes
     assert "transaction fails" in second.text
+
+
+# ---------------------------------------------------------- coding problems
+# A coding problem's setup clause ("Given an array, find two numbers") has no
+# terminal "?" and is exactly the imperative-task shape -- and is exactly the
+# phrasing most likely to be split by a natural pause before its closing
+# condition ("...whose sum equals a target value") arrives as its own
+# VAD-bounded utterance, well outside the short correction window.
+
+
+def test_multi_sentence_coding_setup_merges_across_a_realistic_pause():
+    detector = QuestionDetector(coalesce_ms=1000, context_window_ms=4000)
+    first = detector.inspect(
+        "Given an array of integers, I want you to find two numbers", now=100.0
+    )
+    assert first.accepted
+    assert first.detail == "imperative_task"
+
+    # 2.5s later: well past coalesce_ms, comfortably inside context_window_ms --
+    # realistic for a second utterance needing its own VAD silence-close.
+    second = detector.inspect("whose sum equals a target value", now=102.5)
+    assert second.accepted
+    assert second.supersedes
+    assert "find two numbers" in second.text
+    assert "sum equals a target value" in second.text
+
+
+def test_a_complete_imperative_coding_prompt_still_uses_the_short_window():
+    """The extended window only applies while the *last* accept was an
+    imperative-task fragment. A complete "?" question reverts to the normal,
+    short correction window immediately."""
+    detector = QuestionDetector(coalesce_ms=200, context_window_ms=4000)
+    detector.inspect("Given an array of integers, I want you to find two numbers", now=100.0)
+    merged = detector.inspect("whose sum equals a target value?", now=100.3)
+    assert merged.accepted and merged.detail == "punctuation"
+
+    # A later, unrelated question arriving after the short window (but still
+    # inside the long one) must NOT merge into the now-complete question.
+    unrelated = detector.inspect("What is a database index?", now=104.0)
+    assert unrelated.accepted
+    assert "two numbers" not in unrelated.text
+
+
+def test_constraint_added_immediately_merges_into_the_coding_question():
+    detector = QuestionDetector()
+    detector.inspect("Find duplicate elements in an array.", now=100.0)
+
+    constrained = detector.inspect("But you cannot use extra space.", now=100.3)
+    assert constrained.accepted
+    assert "duplicate elements" in constrained.text
+    assert "cannot use extra space" in constrained.text
+
+
+def test_correction_to_a_different_coding_problem_excludes_the_old_one():
+    detector = QuestionDetector()
+    detector.inspect("Write a function to reverse a string.", now=100.0)
+
+    corrected = detector.inspect("No, actually reverse a linked list.", now=100.3)
+    assert corrected.accepted
+    assert "linked list" in corrected.text
+    assert "reverse a string" not in corrected.text
+
+
+def test_topic_change_via_lets_do_excludes_the_old_coding_problem():
+    detector = QuestionDetector()
+    detector.inspect(
+        "Find the longest substring without repeating characters.", now=100.0
+    )
+
+    changed = detector.inspect(
+        "Actually, let's do longest palindromic substring instead.", now=100.3
+    )
+    assert changed.accepted
+    assert "palindromic" in changed.text
+    assert "repeating characters" not in changed.text
+
+
+def test_a_complete_coding_prompt_is_not_delayed():
+    """"Write a function to reverse a linked list" is a complete ask despite
+    being imperative-task-triggered -- it must fire immediately, not wait."""
+    detection = QuestionDetector().inspect("Write a function to reverse a linked list")
+    assert detection.accepted
+    assert detection.stable is True
+
+
+def test_short_coding_followups_are_accepted_normally():
+    """These are all >= min_words and end in '?', so they need no special
+    coding-specific handling -- confirming the existing generic path already
+    covers them is the point of this test."""
+    for text in (
+        "Can we optimize it?", "Without sorting?", "Without extra space?",
+        "What's the complexity?", "What happens if the array is empty?",
+    ):
+        detection = QuestionDetector().inspect(text)
+        assert detection.accepted, text
+
+
+def test_acknowledgements_are_not_accepted_even_with_recent_coding_context():
+    detector = QuestionDetector()
+    detector.inspect("Write a function to reverse a linked list.", now=100.0)
+
+    for filler, now in (("Okay.", 100.2), ("Yeah.", 100.4), ("Right.", 100.6)):
+        detection = detector.inspect(filler, now=now)
+        assert not detection.accepted, filler

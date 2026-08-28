@@ -21,7 +21,13 @@ _CODING = re.compile(
     re.IGNORECASE,
 )
 _SQL = re.compile(r"\b(sql|select \*|join|group by|database schema|write a query)\b", re.IGNORECASE)
-_DEBUGGING = re.compile(r"\b(bug|debug|not working|crash(ing)?|stack trace|why is this failing|throws an error)\b", re.IGNORECASE)
+_DEBUGGING = re.compile(
+    r"\bbug\b|\bdebug\b|\bnot working\b|\bisn'?t working\b|\bcrash(?:ing)?\b|"
+    r"\bstack trace\b|\bwhy is this failing\b|\bthrows an error\b|"
+    r"\bwhat'?s wrong\b|\bhow would you fix\b|\brace condition\b|"
+    r"\bwhy (?:does|is|doesn'?t)\b.{0,30}\b(?:fail|failing|broken)\b",
+    re.IGNORECASE,
+)
 _SYSTEM_DESIGN = re.compile(r"\b(design a system|design an?|scale (this|to)|architecture for|how would you design)\b", re.IGNORECASE)
 _ARCHITECTURE = re.compile(r"\b(microservices|monolith|architecture)\b", re.IGNORECASE)
 _BEHAVIORAL = re.compile(r"\b(tell me about a time|describe a situation|biggest (weakness|strength)|handle conflict|team conflict)\b", re.IGNORECASE)

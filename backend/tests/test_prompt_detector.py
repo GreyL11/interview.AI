@@ -116,6 +116,14 @@ def test_coding_task_prompts_still_work():
         assert is_interview_prompt(text), f"should be detected: {text!r}"
 
 
+def test_lets_do_signals_a_new_prompt():
+    """"Let's do X" is how an interviewer commonly replaces a problem mid-
+    sentence without using a recognized imperative verb (e.g. "let's do
+    longest palindromic substring" has no "find"/"write"/"reverse")."""
+    for text in ["let's do longest palindromic substring", "let's try a different approach"]:
+        assert is_interview_prompt(text), f"should be detected: {text!r}"
+
+
 # ------------------------------------------------------------------- negatives
 
 

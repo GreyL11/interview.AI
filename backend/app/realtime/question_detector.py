@@ -9,6 +9,7 @@ from app.core.metrics import log_metric
 from app.intelligence.classifier import classify
 from app.realtime.events import RejectionReason
 from app.realtime.prompt_detector import (
+    REASON_IMPERATIVE_TASK,
     REASON_NO_PATTERN,
     extract_interview_prompt,
 )
@@ -119,6 +120,9 @@ class QuestionDetector:
         )
         self._last_accepted_at: float | None = None
         self._last_text: str = ""
+        #: Which layer accepted the last question -- see the merge-window
+        #: comment in `inspect` for why this matters.
+        self._last_accept_detail: str | None = None
         #: Interviewer utterances that were not themselves a question, kept
         #: around briefly in case the *next* utterance is the question they
         #: were setting up -- see `_context_prefix` / `_remember_as_context`.
@@ -127,6 +131,7 @@ class QuestionDetector:
     def reset(self) -> None:
         self._last_accepted_at = None
         self._last_text = ""
+        self._last_accept_detail = None
         self._context.clear()
 
     def inspect(self, text: str, now: float | None = None, *, buffer_context: bool = True) -> Detection:
@@ -159,12 +164,30 @@ class QuestionDetector:
         # previous question's own "?" sentence would accept pure filler that
         # the length gate exists to keep out -- a follow-up must stand on its
         # own and lean on conversation history instead, never on a merge.
+        #
+        # The merge window itself adapts to *why* the last question was
+        # accepted. A punctuation/interrogative accept ("How would you scale
+        # this?") is a complete sentence Whisper terminated on its own, so a
+        # short window is right -- it is a correction if anything follows.
+        # An imperative-task accept with no terminal "?" ("Given an array of
+        # integers, I want you to find two numbers") is exactly how a coding
+        # problem's setup clause looks *before* its closing condition arrives
+        # ("...whose sum equals a target value"), and that closing clause is
+        # its own VAD-bounded utterance -- a full speech+silence-close cycle
+        # away, comfortably longer than the correction window. Reusing the
+        # (already longer) setup-context window here instead of inventing a
+        # third number covers that realistic gap.
+        merge_window_ms = (
+            self._context_window_ms
+            if self._last_accept_detail == REASON_IMPERATIVE_TASK
+            else self._coalesce_ms
+        )
         combined = text
         supersedes = False
         if (
             not followup_eligible
             and self._last_accepted_at is not None
-            and (now - self._last_accepted_at) * 1000 <= self._coalesce_ms
+            and (now - self._last_accepted_at) * 1000 <= merge_window_ms
         ):
             combined = f"{self._last_text} {text}".strip()
             supersedes = True
@@ -218,6 +241,7 @@ class QuestionDetector:
         self._last_accepted_at = now
         # Coalescing works on raw speech; the cleaned prompt is what coaching sees.
         self._last_text = combined
+        self._last_accept_detail = match.reason
 
         detail = match.reason
         if followup_eligible:

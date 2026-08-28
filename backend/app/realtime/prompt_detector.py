@@ -104,6 +104,9 @@ _PROMPT_ANYWHERE = re.compile(
       | i\s+wan(?:t|na)\s+to\s+(?:know|hear|understand)
       | curious\s+(?:about|how|why|what)
       | your\s+thoughts\s+on
+      | let'?s\s+(?:do|try|build|use|instead\s+do)
+      | how\s+about
+      | what\s+about\s+(?:doing|using|trying)
     )\b""",
     re.IGNORECASE | re.VERBOSE,
 )
