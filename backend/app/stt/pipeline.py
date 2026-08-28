@@ -1,15 +1,21 @@
 import asyncio
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 
 from app.audio.base import SAMPLE_RATE, AudioChannel, AudioSource
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.metrics import elapsed_ms, log_metric
 from app.sessions.schemas import TranscriptSource
 from app.stt.base import SttEngine, SttError
+from app.stt.scheduler import (
+    WARMUP_PRIORITY,
+    InferenceJob,
+    InferenceScheduler,
+    shared_scheduler,
+)
 from app.stt.vad import FRAME_MS, SegmentEvent, Segmenter, SpeechDetector
 
 logger = get_logger(__name__)
@@ -28,6 +34,10 @@ class TranscriptionWorker:
     Lives on a thread rather than the event loop because CTranslate2 inference
     is CPU-bound; it publishes results back with call_soon_threadsafe so the
     session's async code never sees a thread.
+
+    Inference itself is not run here. Every channel submits into one shared
+    priority scheduler, because they all share one Whisper model and would
+    otherwise queue against each other in arrival order — see stt/scheduler.py.
     """
 
     def __init__(
@@ -38,6 +48,8 @@ class TranscriptionWorker:
         loop: asyncio.AbstractEventLoop,
         on_transcript,
         partial_interval_ms: int | None = None,
+        scheduler: InferenceScheduler | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._source = source
         self._detector = detector
@@ -48,26 +60,40 @@ class TranscriptionWorker:
             partial_interval_ms if partial_interval_ms is not None
             else settings.stt_partial_interval_ms
         )
+        self._scheduler = scheduler or shared_scheduler()
+        self._session_id = session_id
         self._segmenter = Segmenter()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._schedule_lock = threading.RLock()
-        self._executor: ThreadPoolExecutor | None = None
-        self._partial_future: Future | None = None
+        self._acquired = False
+        self._partial_job: InferenceJob | None = None
         self._pending_partial: tuple[int, np.ndarray] | None = None
+        self._outstanding: set[InferenceJob] = set()
         self._utterance_id = 0
         self._final_utterance_id = 0
         self._published_final_utterance_id = 0
+        self._partials_this_utterance = 0
+        #: Self-tuning back-off: never re-queue a partial more often than the
+        #: last one took to run, so a slow machine simply produces fewer of them.
+        self._last_partial_inference_ms = 0.0
+        self._speech_end_at: dict[int, float] = {}
         self._stopping = False
         self._loopback_frame_count = 0
         self.frames_consumed = 0
         self.partials_scheduled = 0
         self.partials_coalesced = 0
+        self.partials_skipped = 0
+        self.partials_cancelled = 0
         self.errors = 0
 
     @property
     def transcript_source(self) -> TranscriptSource:
         return _CHANNEL_TO_SOURCE[self._source.channel]
+
+    @property
+    def channel(self) -> AudioChannel:
+        return self._source.channel
 
     def start(self) -> None:
         self._stop.clear()
@@ -76,42 +102,74 @@ class TranscriptionWorker:
         self._final_utterance_id = 0
         self._published_final_utterance_id = 0
         self._pending_partial = None
-        self._partial_future = None
+        self._partial_job = None
+        self._outstanding.clear()
+        self._speech_end_at.clear()
         self._source.start()
-        self._executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix=f"stt-infer-{self._source.channel.value.lower()}",
-        )
-        self._thread = threading.Thread(
-            target=self._run, name=f"stt-{self._source.channel.value}", daemon=True
-        )
-        self._thread.start()
+        self._scheduler.acquire()
+        self._acquired = True
+        try:
+            self._thread = threading.Thread(
+                target=self._run, name=f"stt-{self._source.channel.value}", daemon=True
+            )
+            self._thread.start()
+        except BaseException:
+            # Never leave a reference behind on a worker that never ran, or the
+            # scheduler's threads outlive every session that used them.
+            self._acquired = False
+            self._scheduler.release()
+            raise
         if self._source.channel == AudioChannel.LOOPBACK:
             logger.debug("loopback_worker_thread_started name=%s", self._thread.name)
+
+    def warmup(self) -> None:
+        """Load the model ahead of the first utterance.
+
+        Submitted at the top of the queue rather than run inline: it has to
+        happen before any real inference anyway, and doing it on the scheduler
+        keeps it inside the same shutdown path as everything else.
+        """
+        self._scheduler.submit(
+            self._engine.warmup,
+            channel=self._source.channel,
+            priority=WARMUP_PRIORITY,
+        )
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop.set()
         with self._schedule_lock:
             self._stopping = True
             self._pending_partial = None
+            outstanding = list(self._outstanding)
         self._source.stop()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
-        with self._schedule_lock:
-            executor = self._executor
-            self._executor = None
-        if executor is not None:
-            # Do not cancel a final already queued behind a partial. Shutdown
-            # waits for that ordered work and avoids leaking a worker thread.
-            executor.shutdown(wait=True)
+
+        # A queued partial is worthless now; a queued final is the transcript of
+        # something that was actually said, so it is waited for rather than cut.
+        finals = []
+        for job in outstanding:
+            if job.is_final:
+                finals.append(job)
+            elif job.cancel():
+                self.partials_cancelled += 1
+        for job in finals:
+            job.wait(timeout=timeout)
+
+        if self._acquired:
+            self._acquired = False
+            self._scheduler.release(timeout=timeout)
+
         logger.info(
             "transcription_worker_metrics channel=%s frames=%d partials_scheduled=%d "
-            "partials_coalesced=%d errors=%d",
+            "partials_coalesced=%d partials_skipped=%d partials_cancelled=%d errors=%d",
             self._source.channel.value,
             self.frames_consumed,
             self.partials_scheduled,
             self.partials_coalesced,
+            self.partials_skipped,
+            self.partials_cancelled,
             self.errors,
         )
 
@@ -189,6 +247,13 @@ class TranscriptionWorker:
                     self._utterance_id += 1
                     buffer = [frame]
                     last_partial_ms = 0
+                    self._partials_this_utterance = 0
+                    log_metric(
+                        "speech_start_detected",
+                        session_id=self._session_id,
+                        channel=self._source.channel.value,
+                        utterance_id=self._utterance_id,
+                    )
                     continue
 
                 if event == SegmentEvent.NONE:
@@ -198,12 +263,19 @@ class TranscriptionWorker:
 
                 if event == SegmentEvent.SPEECH_CONTINUE:
                     buffered_ms = len(buffer) * FRAME_MS
-                    if buffered_ms - last_partial_ms >= self._partial_interval_ms:
+                    if buffered_ms - last_partial_ms >= self._next_partial_after_ms():
                         last_partial_ms = buffered_ms
-                        self._schedule_partial(self._utterance_id, buffer)
+                        self._schedule_partial(self._utterance_id, buffer, buffered_ms)
                     continue
 
                 if event == SegmentEvent.SPEECH_END:
+                    log_metric(
+                        "speech_end_detected",
+                        session_id=self._session_id,
+                        channel=self._source.channel.value,
+                        utterance_id=self._utterance_id,
+                        audio_duration_ms=len(buffer) * FRAME_MS,
+                    )
                     self._schedule_final(self._utterance_id, buffer)
                     buffer = []
                     self._detector.reset()
@@ -213,92 +285,144 @@ class TranscriptionWorker:
         finally:
             logger.info("transcription_worker_stopped channel=%s", self._source.channel.value)
 
-    def _schedule_partial(self, utterance_id: int, buffer: list[np.ndarray]) -> None:
-        audio = np.concatenate(buffer)
+    # ------------------------------------------------------------- scheduling
+
+    def _next_partial_after_ms(self) -> float:
+        """Adaptive cadence: the configured interval, or the time the last
+        partial actually took, whichever is longer."""
+        return max(self._partial_interval_ms, self._last_partial_inference_ms)
+
+    def _schedule_partial(
+        self, utterance_id: int, buffer: list[np.ndarray], buffered_ms: int
+    ) -> None:
+        if not settings.stt_enable_partials:
+            return
+        if buffered_ms < settings.stt_partial_min_audio_ms:
+            self.partials_skipped += 1
+            return
         with self._schedule_lock:
             if self._stopping or utterance_id <= self._final_utterance_id:
                 return
-            if self._partial_future is not None and not self._partial_future.done():
+            if self._partials_this_utterance >= settings.stt_max_partials_per_utterance:
+                self.partials_skipped += 1
+                return
+            audio = np.concatenate(buffer)
+            if self._partial_job is not None and not self._partial_job.finished:
                 self._pending_partial = (utterance_id, audio)
                 self.partials_coalesced += 1
                 return
             self._submit_partial_locked(utterance_id, audio)
 
     def _submit_partial_locked(self, utterance_id: int, audio: np.ndarray) -> None:
-        if self._executor is None or self._stopping:
+        if self._stopping:
             return
-        future = self._executor.submit(self._transcribe, audio, False, utterance_id)
-        self._partial_future = future
+        job = self._scheduler.submit(
+            lambda: self._transcribe(audio, False, utterance_id),
+            channel=self._source.channel,
+            utterance_id=utterance_id,
+            is_final=False,
+        )
+        if job is None:
+            return
+        self._partial_job = job
+        self._outstanding.add(job)
+        self._partials_this_utterance += 1
         self.partials_scheduled += 1
-        future.add_done_callback(self._partial_finished)
         logger.debug(
-            "partial_transcription_scheduled channel=%s utterance=%d samples=%d queue_backlog=%s",
+            "partial_transcription_scheduled channel=%s utterance=%d samples=%d "
+            "queue_depth=%d",
             self._source.channel.value,
             utterance_id,
             len(audio),
-            self._source_queue_backlog(),
+            self._scheduler.depth,
         )
-
-    def _partial_finished(self, future: Future) -> None:
-        with self._schedule_lock:
-            if self._partial_future is future:
-                self._partial_future = None
-            pending = self._pending_partial
-            self._pending_partial = None
-            if (
-                pending is not None
-                and pending[0] > self._final_utterance_id
-                and not self._stopping
-            ):
-                self._submit_partial_locked(*pending)
 
     def _schedule_final(self, utterance_id: int, buffer: list[np.ndarray]) -> None:
         if not buffer:
             return
         audio = np.concatenate(buffer)
         with self._schedule_lock:
-            if self._executor is None:
-                return
             self._final_utterance_id = max(self._final_utterance_id, utterance_id)
-            if self._pending_partial is not None and self._pending_partial[0] == utterance_id:
+            self._speech_end_at[utterance_id] = time.monotonic()
+            if self._pending_partial is not None and self._pending_partial[0] <= utterance_id:
                 self._pending_partial = None
-            self._executor.submit(self._transcribe, audio, True, utterance_id)
+            # Anything still queued for this utterance is now dead weight in
+            # front of the only job that matters.
+            self._cancel_stale_partials_locked(utterance_id)
+            job = self._scheduler.submit(
+                lambda: self._transcribe(audio, True, utterance_id),
+                channel=self._source.channel,
+                utterance_id=utterance_id,
+                is_final=True,
+            )
+            if job is None:
+                return
+            self._outstanding.add(job)
         logger.debug(
-            "final_transcription_scheduled channel=%s utterance=%d samples=%d queue_backlog=%s",
+            "final_transcription_scheduled channel=%s utterance=%d samples=%d queue_depth=%d",
             self._source.channel.value,
             utterance_id,
             len(audio),
-            self._source_queue_backlog(),
+            self._scheduler.depth,
         )
 
-    def _source_queue_backlog(self) -> int | None:
-        queue = getattr(self._source, "_queue", None)
-        qsize = getattr(queue, "qsize", None)
-        return qsize() if callable(qsize) else None
+    def _cancel_stale_partials_locked(self, utterance_id: int) -> None:
+        for job in list(self._outstanding):
+            if job.is_final or job.utterance_id > utterance_id:
+                continue
+            if job.cancel():
+                self.partials_cancelled += 1
+                self._outstanding.discard(job)
+                if self._partial_job is job:
+                    self._partial_job = None
+
+    # -------------------------------------------------------------- inference
 
     def _transcribe(self, audio: np.ndarray, is_final: bool, utterance_id: int) -> None:
         started = time.monotonic()
-        # Interim passes re-transcribe the whole utterance snapshot. The audio
-        # thread coalesces snapshots while one is in flight, bounding work to a
-        # single active and a single newest pending partial per channel.
+        audio_ms = int(len(audio) / SAMPLE_RATE * 1000)
+        kind = "final" if is_final else "partial"
+        speech_end_at = self._speech_end_at.get(utterance_id) if is_final else None
+
+        log_metric(
+            f"{kind}_transcription_started",
+            session_id=self._session_id,
+            channel=self._source.channel.value,
+            utterance_id=utterance_id,
+            audio_duration_ms=audio_ms,
+            queue_wait_ms=(
+                elapsed_ms(speech_end_at, started) if speech_end_at is not None else None
+            ),
+        )
+
+        # Interim passes re-transcribe the whole utterance snapshot. Snapshots
+        # are coalesced, capped per utterance, and cancelled once the final for
+        # that utterance is queued, so the wasted work is bounded.
         try:
             transcript = self._engine.transcribe(audio, is_final=is_final)
         except SttError as exc:
             self.errors += 1
             logger.warning("transcription_failed final=%s error=%s", is_final, exc)
             return
-        duration_seconds = time.monotonic() - started
-        duration_ms = int(len(audio) / SAMPLE_RATE * 1000)
-        logger.info(
-            "transcription_completed channel=%s final=%s utterance=%d audio_ms=%d "
-            "inference_seconds=%.3f chars=%d",
-            self._source.channel.value,
-            is_final,
-            utterance_id,
-            duration_ms,
-            duration_seconds,
-            len(transcript.text),
+        finally:
+            if not is_final:
+                self._last_partial_inference_ms = (time.monotonic() - started) * 1000
+                self._finish_partial(utterance_id)
+
+        completed = time.monotonic()
+        log_metric(
+            f"{kind}_transcription_completed",
+            session_id=self._session_id,
+            channel=self._source.channel.value,
+            utterance_id=utterance_id,
+            audio_duration_ms=audio_ms,
+            duration_ms=elapsed_ms(started, completed),
+            speech_end_to_transcript_ms=(
+                elapsed_ms(speech_end_at, completed) if speech_end_at is not None else None
+            ),
+            chars=len(transcript.text),
         )
+
         if not is_final:
             with self._schedule_lock:
                 if self._stopping or utterance_id <= self._published_final_utterance_id:
@@ -313,7 +437,24 @@ class TranscriptionWorker:
                 self._published_final_utterance_id = max(
                     self._published_final_utterance_id, utterance_id
                 )
+                self._speech_end_at.pop(utterance_id, None)
         self._publish(transcript.text, is_final)
+
+    def _finish_partial(self, utterance_id: int) -> None:
+        """Release the in-flight slot and promote the newest pending snapshot."""
+        with self._schedule_lock:
+            for job in list(self._outstanding):
+                if not job.is_final and job.utterance_id == utterance_id:
+                    self._outstanding.discard(job)
+            self._partial_job = None
+            pending = self._pending_partial
+            self._pending_partial = None
+            if (
+                pending is not None
+                and pending[0] > self._final_utterance_id
+                and not self._stopping
+            ):
+                self._submit_partial_locked(*pending)
 
 
 class AudioPipeline:
@@ -338,6 +479,9 @@ class AudioPipeline:
                     running.stop()
                 raise
         self._workers = started
+        # One warmup for the whole pipeline: every channel shares one engine.
+        if started:
+            started[0].warmup()
 
     def stop(self) -> None:
         for worker in self._workers:

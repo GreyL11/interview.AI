@@ -97,8 +97,12 @@ async def update_settings(update: SettingsUpdate) -> SettingsView:
         get_summarizer.cache_clear()
     if "stt_model" in changed or "stt_device" in changed:
         from app.core.deps import get_stt_engine
+        from app.stt.scheduler import reset_shared_scheduler
 
         get_stt_engine.cache_clear()
+        # The scheduler's worker count is derived from STT settings, so it has
+        # to be rebuilt alongside the engine rather than outliving it.
+        reset_shared_scheduler()
 
     return _view()
 

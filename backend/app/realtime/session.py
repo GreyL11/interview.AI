@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.metrics import elapsed_ms, log_metric
 from app.documents.schemas import PERSONAL_KNOWLEDGE_TYPES, RetrievedChunk
 from app.intelligence.answer_validator import AnswerValidationError, validate
 from app.intelligence.router import Route, route_for
@@ -154,6 +155,13 @@ class LiveSession:
                 )
             )
             self._current_turn_id = turn.turn_id
+            log_metric(
+                "question_detected",
+                session_id=self.session_id,
+                question_id=turn.turn_id,
+                category=classification.category.value,
+                confidence=classification.confidence,
+            )
             # Emitted before generation starts so the UI can show what was heard
             # and how it was understood, even if the answer later fails.
             await self.emit(event(
@@ -193,6 +201,11 @@ class LiveSession:
     async def _answer(self, turn_id: int, question: str, classification: Classification) -> None:
         started = time.monotonic()
         try:
+            log_metric(
+                "question_processing_started",
+                session_id=self.session_id,
+                question_id=turn_id,
+            )
             await self.emit(event(EventType.ANSWER_STARTED, turn_id=turn_id, question=question,
                                   classification=classification.model_dump(mode="json")))
 
@@ -262,7 +275,18 @@ class LiveSession:
     async def _stream(self, turn_id: int, prompt: str) -> Answer:
         buffer = ""
         last_summary = ""
+        requested_at = time.monotonic()
+        saw_first_token = False
+        log_metric("llm_request_started", session_id=self.session_id, question_id=turn_id)
         async for chunk in self._llm.stream_answer(prompt):
+            if not saw_first_token:
+                saw_first_token = True
+                log_metric(
+                    "llm_first_token_received",
+                    session_id=self.session_id,
+                    question_id=turn_id,
+                    duration_ms=elapsed_ms(requested_at, time.monotonic()),
+                )
             buffer += chunk
             if not self._is_current(turn_id):
                 raise asyncio.CancelledError()
@@ -271,6 +295,13 @@ class LiveSession:
                 last_summary = partial
                 await self.emit(event(EventType.ANSWER_DELTA, turn_id=turn_id, summary=partial))
 
+        log_metric(
+            "llm_response_completed",
+            session_id=self.session_id,
+            question_id=turn_id,
+            duration_ms=elapsed_ms(requested_at, time.monotonic()),
+            chars=len(buffer),
+        )
         if not buffer.strip():
             raise LLMError("Model returned an empty response")
         return Answer.model_validate(parse_answer_payload(buffer))

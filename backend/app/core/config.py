@@ -63,6 +63,25 @@ class Settings(BaseSettings):
     stt_language: str = "en"
     stt_partial_interval_ms: int = 1000
 
+    # STT execution. One shared CTranslate2 model serves every channel, so
+    # concurrency here is what the model is actually told to support: raising
+    # it without raising num_workers just moves the queue into C++.
+    stt_inference_concurrency: int = 1
+    stt_cpu_threads: int = 0  # 0 = let CTranslate2 size its own intra-op pool
+
+    # Partial transcripts are display-only best effort; finals are the product.
+    stt_enable_partials: bool = True
+    stt_partial_min_audio_ms: int = 500      # below this a partial says nothing useful
+    stt_max_partials_per_utterance: int = 4  # bounds re-transcription of one utterance
+
+    # Inference queue bands, lowest number first out. The default order is
+    # interviewer-final > interviewer-partial > candidate-final > candidate-partial,
+    # because only the interviewer's final transcript can produce an answer.
+    stt_priority_loopback_final: int = 0
+    stt_priority_loopback_partial: int = 1
+    stt_priority_mic_final: int = 2
+    stt_priority_mic_partial: int = 3
+
     log_level: str = "INFO"
 
     @property

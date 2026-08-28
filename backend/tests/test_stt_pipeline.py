@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import numpy as np
@@ -230,10 +231,11 @@ async def test_slow_partials_are_coalesced_and_final_is_executed():
     assert recorder.calls[-1][2] is True
 
 
-async def test_stop_shuts_down_the_transcription_executor():
+async def test_stop_releases_the_inference_scheduler():
     frames = speech_frames(20) + silence_frames(SILENCE_TO_END)
     probabilities = [0.9] * 20 + [0.0] * SILENCE_TO_END
 
     _, worker = await run_worker(probabilities, frames, engine=SlowSttEngine())
 
-    assert worker._executor is None
+    assert not worker._scheduler.running
+    assert not any(t.name.startswith("stt-infer") for t in threading.enumerate())

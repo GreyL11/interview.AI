@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.core.config import Settings
+from app.core.config import Settings, settings
 from app.stt.base import SttError
 from app.stt.faster_whisper_engine import FasterWhisperEngine
 
@@ -55,6 +55,10 @@ def test_explicit_cuda_configuration_is_passed_to_whisper_model(monkeypatch, tmp
             "device": "cuda",
             "compute_type": "float16",
             "download_root": str(tmp_path),
+            # Must match the scheduler's thread count, or CTranslate2 serialises
+            # the extra threads internally where priority cannot reach them.
+            "num_workers": settings.stt_inference_concurrency,
+            "cpu_threads": settings.stt_cpu_threads,
         })
     ]
 

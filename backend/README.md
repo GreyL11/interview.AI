@@ -77,6 +77,10 @@ Key interfaces, each with one real implementation — swap without touching call
 `Retriever`, `EmbeddingProvider`, `VectorStore`, `DocumentParser`, `Chunker`,
 `AudioSource`, `SttEngine`, `SessionMemory`, `LLMClient`.
 
+STT inference scheduling, partial-transcript policy, latency metrics, and
+recommended per-hardware configuration are covered in
+[PERFORMANCE.md](PERFORMANCE.md).
+
 ### Decisions worth knowing
 
 **SQLite is the source of truth; FAISS only holds vectors.** Retrieval joins vector ids

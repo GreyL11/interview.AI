@@ -1,10 +1,12 @@
 import threading
+import time
 
 import numpy as np
 
 from app.audio.base import SAMPLE_RATE
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.metrics import elapsed_ms, log_metric
 from app.stt.base import SttEngine, SttError, Transcript
 
 logger = get_logger(__name__)
@@ -54,6 +56,12 @@ class FasterWhisperEngine(SttEngine):
                     device=device,
                     compute_type=compute_type,
                     download_root=self._download_root,
+                    # CTranslate2 serialises calls across num_workers slots. If
+                    # this were left at 1 while the scheduler ran two threads,
+                    # the second would block inside C++ where no priority
+                    # applies — so the two numbers must agree.
+                    num_workers=max(1, settings.stt_inference_concurrency),
+                    cpu_threads=max(0, settings.stt_cpu_threads),
                 )
             except Exception as exc:
                 if device == "cuda":
@@ -104,7 +112,23 @@ class FasterWhisperEngine(SttEngine):
         return "cpu", self._compute_type
 
     def warmup(self) -> None:
+        """Load the model and run one throwaway pass.
+
+        Loading alone is not enough: the first real `transcribe` still pays for
+        CTranslate2's lazy graph setup. Half a second of silence buys that back
+        before anyone speaks, instead of charging it to the first question.
+        """
+        started = time.monotonic()
         self._ensure_loaded()
+        try:
+            self.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), is_final=False)
+        except SttError as exc:
+            logger.warning("stt_warmup_pass_failed error=%s", exc)
+        log_metric(
+            "stt_warmup_completed",
+            model=self._model_name,
+            duration_ms=elapsed_ms(started, time.monotonic()),
+        )
 
     def transcribe(self, audio: np.ndarray, is_final: bool) -> Transcript:
         model = self._ensure_loaded()
