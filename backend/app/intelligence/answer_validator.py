@@ -33,7 +33,12 @@ def validate(
     warnings = list(answer.warnings)
 
     if not context_found:
-        combined = " ".join([answer.summary, answer.detailed_answer, *answer.key_points])
+        combined = " ".join([
+            answer.summary,
+            answer.detailed_answer,
+            *answer.key_points,
+            *(s.content for s in answer.sections or []),
+        ])
         if _FIRST_PERSON_PAST.search(combined):
             warnings.append(
                 "Answer claims first-person past experience but no personal context was "

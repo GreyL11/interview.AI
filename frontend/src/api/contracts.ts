@@ -75,6 +75,11 @@ export interface Complexity {
   space: string;
 }
 
+export interface AnswerSection {
+  heading: string;
+  content: string;
+}
+
 export interface Answer {
   summary: string;
   key_points: string[];
@@ -83,6 +88,9 @@ export interface Answer {
   code: string | null;
   complexity: Complexity | null;
   edge_cases: string[] | null;
+  // Debugging / SQL / system design / behavioral structure, e.g.
+  // Likely Cause / Diagnosis / Fix, or Situation / Task / Action / Result.
+  sections: AnswerSection[] | null;
   warnings: string[];
 }
 

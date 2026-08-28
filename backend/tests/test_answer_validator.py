@@ -2,7 +2,7 @@ import pytest
 
 from app.intelligence.answer_validator import AnswerValidationError, validate
 from app.intelligence.classifier import classify
-from app.schemas.answer import Answer
+from app.schemas.answer import Answer, AnswerSection
 
 
 def test_empty_summary_rejected():
@@ -48,6 +48,21 @@ def test_claims_in_key_points_and_detail_are_checked():
         detailed_answer="Background.",
     )
     assert validate(answer, classify("What is caching?"), context_found=False).warnings
+
+
+def test_claims_inside_sections_are_checked():
+    """A behavioral answer's STAR content lives in `sections`, not
+    `key_points`/`detailed_answer` -- the fabrication scan must reach it."""
+    answer = Answer(
+        summary="Here is how I'd approach it.",
+        sections=[
+            AnswerSection(heading="Action", content="I led the migration myself."),
+        ],
+    )
+    result = validate(
+        answer, classify("Tell me about a time you had a team conflict"), context_found=False
+    )
+    assert result.warnings
 
 
 def test_existing_warnings_are_preserved():

@@ -7,7 +7,7 @@ import pytest
 
 from app.audio.base import AudioChannel
 from app.sessions.schemas import TranscriptSource
-from app.stt.base import SttError
+from app.stt.base import SttError, Transcript
 from app.stt.pipeline import AudioPipeline, TranscriptionWorker
 from app.stt.vad import FRAME_MS
 from tests.fakes import (
@@ -27,7 +27,7 @@ class Recorder:
     def __init__(self):
         self.calls = []
 
-    async def __call__(self, text, source, is_final):
+    async def __call__(self, text, source, is_final, trace=None):
         self.calls.append((text, source, is_final))
 
     def finals(self):
@@ -333,3 +333,49 @@ async def test_pipeline_cleans_up_when_warmup_fails():
 
     assert not source.started.is_set()
     assert not worker._scheduler.running
+
+
+# ---------------------------------------------------- partial/final divergence
+
+
+class DivergingSttEngine(FakeSttEngine):
+    """A partial that looks nothing like the eventual final -- simulates an
+    STT engine guessing wrong on interim, unstable audio."""
+
+    def transcribe(self, audio, is_final):
+        self.calls.append((len(audio), is_final))
+        text = self.final_text if is_final else "completely unrelated garbled words"
+        return Transcript(text=text, is_final=is_final, duration_ms=len(audio) // 16)
+
+
+async def test_final_diverging_from_its_partial_is_logged(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "app.stt.pipeline.log_metric",
+        lambda event, **f: events.append((event, f)),
+    )
+
+    frames = speech_frames(30) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 30 + [0.0] * SILENCE_TO_END
+
+    await run_worker(probabilities, frames, engine=DivergingSttEngine(), partial_interval_ms=200)
+
+    diverged = [f for e, f in events if e == "stt_final_diverges_from_partial"]
+    assert diverged
+    assert diverged[0]["overlap"] < 0.4
+
+
+async def test_a_final_matching_its_partial_is_not_flagged(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "app.stt.pipeline.log_metric",
+        lambda event, **f: events.append((event, f)),
+    )
+
+    frames = speech_frames(30) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 30 + [0.0] * SILENCE_TO_END
+
+    # FakeSttEngine's partial is a literal prefix of its final -- high overlap.
+    await run_worker(probabilities, frames, engine=FakeSttEngine(), partial_interval_ms=200)
+
+    assert not [f for e, f in events if e == "stt_final_diverges_from_partial"]

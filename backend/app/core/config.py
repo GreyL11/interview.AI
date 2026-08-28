@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     # utterance turns out to be the actual question. Deliberately short: this
     # bridges two halves of one thought, not a running transcript history.
     question_context_window_ms: int = 4000
+    # How long after the last accepted question a short fragment ("Why?", "How?")
+    # may still count as a follow-up rather than noise. Long enough to cover
+    # "candidate read the streamed answer, then asked a quick follow-up".
+    question_followup_window_ms: int = 45_000
+    # How long to hold a question that looks mid-clause ("...what happens
+    # when") before asking it, giving a quick continuation a chance to
+    # supersede it first. A complete question is never delayed -- see
+    # question_detector._looks_incomplete.
+    question_stabilization_ms: int = 400
 
     # Realtime transport
     ws_replay_buffer: int = 200

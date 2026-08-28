@@ -217,3 +217,40 @@ async def test_close_stops_audio(live):
 async def test_stopping_audio_that_never_started_is_harmless(live):
     await live.stop_audio()
     assert not live.audio_active
+
+
+async def test_a_question_produces_one_correlated_latency_trace(live, monkeypatch):
+    """The whole speech-end -> first-visible-token path must be reconstructable
+    from one grep-able log line, keyed by question_id."""
+    import app.core.metrics as metrics_module
+
+    traces = []
+    original = metrics_module.log_metric
+
+    def record(event, **fields):
+        if event == "question_latency_trace":
+            traces.append(fields)
+        return original(event, **fields)
+
+    monkeypatch.setattr(metrics_module, "log_metric", record)
+
+    source = FakeAudioSource(utterance(), channel=AudioChannel.LOOPBACK)
+    await run_audio(live, [source])
+
+    assert len(traces) == 1
+    trace = traces[0]
+    assert trace["question_id"] is not None
+    # STT and Gemini stage timings must all be present and non-negative.
+    for field in (
+        "speech_end_to_stt_final_ms",
+        "stt_queue_wait_ms",
+        "stt_inference_ms",
+        "stt_final_to_question_detected_ms",
+        "llm_task_to_gemini_request_ms",
+        "gemini_request_to_first_text_token_ms",
+        "total_question_to_first_visible_token_ms",
+    ):
+        assert field in trace, f"missing {field}"
+        assert trace[field] >= 0, f"{field} was negative: {trace[field]}"
+    # Cancelling nothing (first question of the session) costs nothing.
+    assert trace["previous_answer_cancel_wait_ms"] == 0

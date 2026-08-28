@@ -185,3 +185,74 @@ CUDA stays explicit-opt-in — `STT_DEVICE=auto` never selects it, matching the
 existing safety behavior in `FasterWhisperEngine._resolve_device`. This
 project does not ship multiple bundled models; the model stays whatever
 `STT_MODEL` names, downloaded on first use.
+
+## Question stabilization
+
+A question that ends mid-clause ("Can you explain what happens when") is
+detected structurally (`app/realtime/question_detector.py::_looks_incomplete`
+checks the last word against a fixed set of dangling conjunctions/
+prepositions/articles) and is *not* asked immediately. `LiveSession` holds it
+for `QUESTION_STABILIZATION_MS` (default 400ms) via a cancellable task
+(`_pending_ask`); if the interviewer's continuation arrives within the
+existing correction-coalesce window, the detector merges it into one complete
+question and the stale timer is cancelled before it ever fires. A confident,
+complete question (the overwhelming majority) is never delayed — this only
+applies to the specific dangling-word case. Short follow-ups ("Why?") are
+exempt regardless, since a bare interrogative would otherwise falsely trip
+the same word check.
+
+This does not (and cannot, given VAD's own ~700ms silence-close time) catch
+every possible pause length — a long deliberate pause will still fire on the
+incomplete fragment, same as before this feature existed. It only removes a
+real number of previously-guaranteed wasted Gemini calls: any continuation
+that arrives within roughly one correction-coalesce window.
+
+## Answer modes
+
+`app/llm/prompts.py` now routes the JSON schema hint by the *existing*
+classifier category (no new classification step): CODING keeps its existing
+approach/code/complexity/edge_cases shape; SQL, DEBUGGING, SYSTEM_DESIGN /
+ARCHITECTURE, and BEHAVIORAL get a shared `sections: [{heading, content}]`
+shape (Likely Cause/Diagnosis/Fix/Why It Works; Situation/Task/Action/Result;
+etc.) — one generic field covers all of them rather than a bespoke field per
+category. Everything else keeps the original summary/key_points/
+detailed_answer shape. The system instruction also now explicitly states that
+only the question under "CURRENT INTERVIEWER QUESTION" is to be answered;
+earlier conversation is background only.
+
+## Benchmarking
+
+`scripts/benchmark_pipeline.py` measures six representative scenarios (short
+question, multi-sentence, coding, follow-up, correction, setup+question)
+through the real detection/retrieval/prompt-construction pipeline with a
+zero-delay fake LLM — this isolates **application-controlled overhead only**
+and is not a Gemini latency estimate. Pass `--live` with `GEMINI_API_KEY` set
+to additionally run the existing `GeminiClient.benchmark_stream_latency()`
+against the real API for an app-prompt-vs-minimal-prompt comparison — the only
+number either benchmark produces that reflects real network/model latency.
+
+```bash
+.venv/Scripts/python.exe scripts/benchmark_pipeline.py
+```
+
+## Performance budgets
+
+Local, deterministic stages have a budget because they are ours to control;
+Gemini's own latency is reported as a distribution, not budgeted, because it
+is not:
+
+| Stage | Budget | Measured via |
+|---|---|---|
+| Question detection (`stt_final_to_question_detected_ms`) | < 10ms | `question_latency_trace` |
+| Prompt construction (`prompt_build_ms`) | < 5ms | `question_latency_trace` |
+| Retrieval, non-RAG routes | ~0ms (skipped entirely) | `question_latency_trace` |
+| Retrieval, RAG/FOLLOW_UP routes | budgeted per `RAG_TOP_K`/`RAG_OVERFETCH`, not fixed | `question_latency_trace` |
+| STT queue wait for a final | near-zero when a worker is free (priority scheduler) | `stt_queue_wait_ms` |
+| Cancel-wait when superseding an answer | sub-millisecond (measured; not a bottleneck) | `previous_answer_cancel_wait_ms` |
+| Gemini request → first text token | **not budgeted** — report p50/p95/worst observed from production logs | `gemini_request_to_first_text_token_ms` |
+| End-to-end, speech-end → first visible token | as low as the above stages allow; dominated by Gemini | `total_question_to_first_visible_token_ms` |
+
+No hardcoded SLA assertion exists for the Gemini-dependent rows — a slow
+network or a loaded model would make such a test flaky for reasons outside
+this codebase's control. `grep "metric question_latency_trace"` on a real log
+gives the actual distribution.

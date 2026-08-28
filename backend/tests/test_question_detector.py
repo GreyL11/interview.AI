@@ -164,6 +164,9 @@ def test_low_confidence_is_rejected():
 
 
 def test_a_rejected_setup_utterance_is_prepended_to_the_next_question():
+    """Context is attached to what the LLM sees (effective_text), not to what
+    the UI displays (text) -- the panel should show the clean question the
+    interviewer actually asked, not a merged wall of text."""
     detector = QuestionDetector()
     setup = detector.inspect(
         "By using this study, just write a character count program.", now=100.0
@@ -172,8 +175,10 @@ def test_a_rejected_setup_utterance_is_prepended_to_the_next_question():
 
     question = detector.inspect("How many times each character is repeated?", now=101.0)
     assert question.accepted
-    assert "character count program" in question.text
-    assert "How many times each character is repeated" in question.text
+    assert question.text == "How many times each character is repeated?"
+    assert "character count program" not in question.text
+    assert "character count program" in question.effective_text
+    assert "How many times each character is repeated" in question.effective_text
 
 
 def test_context_older_than_the_window_is_not_used():
@@ -184,7 +189,7 @@ def test_context_older_than_the_window_is_not_used():
 
     question = detector.inspect("How many times each character is repeated?", now=105.0)
     assert question.accepted
-    assert "character count program" not in question.text
+    assert "character count program" not in question.effective_text
 
 
 def test_context_is_cleared_once_consumed():
@@ -198,7 +203,7 @@ def test_context_is_cleared_once_consumed():
 
     unrelated = detector.inspect("What is a database index?", now=102.0)
     assert unrelated.accepted
-    assert "character count program" not in unrelated.text
+    assert "character count program" not in unrelated.effective_text
 
 
 def test_a_previous_accepted_question_is_never_used_as_context():
@@ -228,4 +233,146 @@ def test_buffer_context_false_ignores_and_skips_the_context_buffer():
         "How many times each character is repeated?", now=101.0, buffer_context=False
     )
     assert question.accepted
-    assert "character count program" not in question.text
+    assert "character count program" not in question.effective_text
+
+
+# --------------------------------------------------------------- follow-ups
+# A bare "Why?" is below question_min_words and would normally be rejected
+# outright -- but right after a real question, it plainly means something.
+# SessionMemory already threads the previous Q&A into every LLM prompt, so
+# the detector's only job is deciding whether it's worth asking at all.
+
+
+@pytest.mark.parametrize("followup", ["Why?", "How?", "Why", "How"])
+def test_a_short_followup_is_accepted_after_a_recent_question(followup):
+    detector = QuestionDetector()
+    first = detector.inspect("What is a hash map?", now=100.0)
+    assert first.accepted
+
+    second = detector.inspect(followup, now=110.0)
+    assert second.accepted
+    assert second.detail == "follow_up"
+
+
+def test_a_short_followup_is_rejected_with_no_recent_question():
+    detector = QuestionDetector()
+    detection = detector.inspect("Why?", now=100.0)
+    assert not detection.accepted
+    assert detection.reason == RejectionReason.TOO_SHORT
+
+
+def test_a_short_followup_expires_outside_the_followup_window():
+    detector = QuestionDetector(followup_window_ms=5000)
+    detector.inspect("What is a hash map?", now=100.0)
+
+    detection = detector.inspect("Why?", now=110.0)  # 10s later, well past 5s
+    assert not detection.accepted
+    assert detection.reason == RejectionReason.TOO_SHORT
+
+
+def test_a_short_acknowledgement_is_not_treated_as_a_followup():
+    """The follow-up bypass only lifts the word-count floor; a short filler
+    still has to pass the same sentence classifier as everything else."""
+    detector = QuestionDetector()
+    detector.inspect("What is a hash map?", now=100.0)
+
+    detection = detector.inspect("Okay.", now=101.0)
+    assert not detection.accepted
+
+
+def test_manual_short_followup_is_not_accepted():
+    """buffer_context=False (typed/candidate speech) gets no follow-up bypass
+    either -- session.py's contract for that flag covers both mechanisms."""
+    detector = QuestionDetector()
+    detector.inspect("What is a hash map?", now=100.0, buffer_context=True)
+
+    detection = detector.inspect("Why?", now=101.0, buffer_context=False)
+    assert not detection.accepted
+
+
+def test_a_short_followup_does_not_pollute_the_context_buffer():
+    """A follow-up too thin to carry meaning shouldn't be remembered as setup
+    for some later, unrelated question."""
+    detector = QuestionDetector()
+    detector.inspect("What is a hash map?", now=100.0)
+    detector.inspect("Why?", now=101.0)
+
+    unrelated = detector.inspect("How would you design a URL shortener?", now=102.0)
+    assert unrelated.accepted
+    assert unrelated.effective_text == unrelated.text
+
+
+# ------------------------------------------------------------------- noise
+
+
+def test_garbage_fragments_are_not_remembered_as_context():
+    """Stray punctuation / broken STT output shouldn't attach itself to a
+    later question just because it arrived recently."""
+    detector = QuestionDetector()
+    detector.inspect("?? -- ...", now=100.0)
+
+    question = detector.inspect("How would you design a URL shortener?", now=100.5)
+    assert question.accepted
+    assert question.effective_text == question.text
+
+
+# --------------------------------------------------------------- stability
+# "Can you explain what happens when" is grammatically a question (starts
+# with "can you") but trails off mid-clause. Firing on it wastes a Gemini
+# call on a fragment the interviewer was still in the middle of saying.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Can you explain what happens when",
+        "Tell me about a project you built and",
+        "What is the difference between a list and a",
+        "How would you scale this if",
+    ],
+)
+def test_a_dangling_clause_is_flagged_unstable(text):
+    detection = QuestionDetector().inspect(text)
+    assert detection.accepted
+    assert detection.stable is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Explain caching?",
+        "Write a program to reverse a linked list",
+        "What is the difference between a list and a tuple?",
+        "Is this thread safe?",
+    ],
+)
+def test_a_complete_question_is_flagged_stable(text):
+    detection = QuestionDetector().inspect(text)
+    assert detection.accepted
+    assert detection.stable is True
+
+
+def test_a_followup_is_always_stable_even_ending_in_a_dangling_word():
+    """'When?' ends on a word that would flag a longer clause as unstable,
+    but as a short, self-contained follow-up it must not be delayed."""
+    detector = QuestionDetector()
+    detector.inspect("What is a hash map?", now=100.0)
+
+    detection = detector.inspect("When?", now=101.0)
+    assert detection.accepted
+    assert detection.stable is True
+
+
+def test_coalesced_continuation_of_a_dangling_clause_is_stable():
+    """The existing correction-coalesce window already merges a quick
+    continuation into one detection -- once merged, the *combined* text is
+    re-evaluated fresh and is no longer dangling."""
+    detector = QuestionDetector(coalesce_ms=1000)
+    first = detector.inspect("Can you explain what happens when", now=100.0)
+    assert first.accepted and first.stable is False
+
+    second = detector.inspect("a transaction fails?", now=100.4)
+    assert second.accepted
+    assert second.stable is True
+    assert second.supersedes
+    assert "transaction fails" in second.text

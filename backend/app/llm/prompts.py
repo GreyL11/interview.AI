@@ -7,13 +7,27 @@ Rules:
 2. Never invent personal experience. If no personal context is supplied, speak in the
    conditional ("I would...", "My approach would be..."), not the past tense
    ("I did...", "I built...").
-3. For technical questions: explain the approach and mention trade-offs when relevant.
-4. For scenario questions: diagnose the problem, describe how you'd investigate,
+3. Put the single most useful sentence in "summary" -- write it as if it is the only
+   line the candidate has time to read before speaking. Everything else supports it.
+4. For technical questions: explain the approach and mention trade-offs when relevant.
+5. For scenario questions: diagnose the problem, describe how you'd investigate,
    propose a solution, and explain how you'd validate it.
-5. For coding questions: explain your approach first, then give optimized code,
+6. For coding questions: explain your approach first, then give optimized code,
    then state time/space complexity, then list edge cases.
-6. Respond with ONLY a single JSON object matching the requested schema. No markdown
-   fences, no commentary outside the JSON.
+7. For debugging questions: state the likely cause, how you'd diagnose it, the fix,
+   and why the fix works.
+8. For SQL questions: explain the approach, give the query, explain it, then note
+   performance considerations (indexes, scan cost) if relevant.
+9. For system design questions: cover requirements, high-level architecture,
+   components, data flow, trade-offs, and scaling considerations.
+10. For behavioral questions: use Situation, Task, Action, Result.
+11. There is exactly one question to answer: the one under "CURRENT INTERVIEWER
+    QUESTION" below. Any earlier conversation is background only -- if it looks like
+    a different topic, ignore it and answer the current question; only draw on it
+    when the current question is clearly a follow-up (e.g. "what about...", "why",
+    a bare pronoun referring back).
+12. Respond with ONLY a single JSON object matching the requested schema. No markdown
+    fences, no commentary outside the JSON.
 """
 
 GENERIC_SCHEMA_HINT = """{
@@ -30,6 +44,61 @@ CODING_SCHEMA_HINT = """{
   "edge_cases": ["edge case 1", "edge case 2"]
 }"""
 
+SQL_SCHEMA_HINT = """{
+  "summary": "one or two sentence answer",
+  "key_points": ["approach step 1", "approach step 2"],
+  "code": "the SQL query",
+  "sections": [
+    {"heading": "Explanation", "content": "what the query does and why"},
+    {"heading": "Performance", "content": "indexes / scan cost considerations, if relevant"}
+  ]
+}"""
+
+DEBUGGING_SCHEMA_HINT = """{
+  "summary": "one or two sentence answer",
+  "sections": [
+    {"heading": "Likely Cause", "content": "..."},
+    {"heading": "Diagnosis", "content": "how you would confirm it"},
+    {"heading": "Fix", "content": "..."},
+    {"heading": "Why It Works", "content": "..."}
+  ],
+  "code": "fix snippet, only if a code change is the fix, else omit"
+}"""
+
+SYSTEM_DESIGN_SCHEMA_HINT = """{
+  "summary": "one or two sentence answer",
+  "sections": [
+    {"heading": "Requirements", "content": "functional and non-functional"},
+    {"heading": "High-Level Architecture", "content": "..."},
+    {"heading": "Components", "content": "..."},
+    {"heading": "Data Flow", "content": "..."},
+    {"heading": "Trade-offs", "content": "..."},
+    {"heading": "Scaling Considerations", "content": "..."}
+  ]
+}"""
+
+BEHAVIORAL_SCHEMA_HINT = """{
+  "summary": "one or two sentence answer",
+  "sections": [
+    {"heading": "Situation", "content": "..."},
+    {"heading": "Task", "content": "..."},
+    {"heading": "Action", "content": "..."},
+    {"heading": "Result", "content": "..."}
+  ]
+}"""
+
+# Deliberately not every Category: most (TECHNICAL_KNOWLEDGE, SCENARIO,
+# PERSONAL_EXPERIENCE, RESUME, PROJECT, FOLLOW_UP, UNKNOWN) read fine as
+# summary/key_points/detailed_answer and get no special-cased structure.
+_SCHEMA_BY_CATEGORY: dict[Category, str] = {
+    Category.CODING: CODING_SCHEMA_HINT,
+    Category.SQL: SQL_SCHEMA_HINT,
+    Category.DEBUGGING: DEBUGGING_SCHEMA_HINT,
+    Category.SYSTEM_DESIGN: SYSTEM_DESIGN_SCHEMA_HINT,
+    Category.ARCHITECTURE: SYSTEM_DESIGN_SCHEMA_HINT,
+    Category.BEHAVIORAL: BEHAVIORAL_SCHEMA_HINT,
+}
+
 
 def build_prompt(
     question: str,
@@ -39,14 +108,21 @@ def build_prompt(
 ) -> str:
     parts = [SYSTEM_INSTRUCTION]
 
-    if context:
-        parts.append("Relevant personal/knowledge-base context:\n" + "\n".join(f"- {c}" for c in context))
+    if context or conversation_history:
+        background = ["INTERVIEW CONTEXT (background only -- see rule 11 above):"]
+        if context:
+            background.append(
+                "Relevant personal/knowledge-base context:\n"
+                + "\n".join(f"- {c}" for c in context)
+            )
+        if conversation_history:
+            background.append(
+                "Previous Q&A this session (oldest first):\n" + "\n".join(conversation_history)
+            )
+        parts.append("\n\n".join(background))
 
-    if conversation_history:
-        parts.append("Recent conversation (oldest first):\n" + "\n".join(conversation_history))
-
-    schema = CODING_SCHEMA_HINT if category == Category.CODING else GENERIC_SCHEMA_HINT
+    schema = _SCHEMA_BY_CATEGORY.get(category, GENERIC_SCHEMA_HINT)
     parts.append(f"Respond using exactly this JSON shape:\n{schema}")
-    parts.append(f"Interview question ({category.value}): {question}")
+    parts.append(f"CURRENT INTERVIEWER QUESTION ({category.value}): {question}")
 
     return "\n\n".join(parts)

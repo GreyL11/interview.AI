@@ -95,6 +95,17 @@ export function AnswerPanel({ turn }: { turn: TurnView | null }) {
             </ol>
           )}
 
+          {answer.sections !== null && answer.sections.length > 0 && (
+            <div className="sections">
+              {answer.sections.map((section) => (
+                <div key={section.heading} className="section">
+                  <h4>{section.heading}</h4>
+                  <p>{section.content}</p>
+                </div>
+              ))}
+            </div>
+          )}
+
           {answer.code !== null && answer.code !== "" && (
             <pre className="code">
               <code>{answer.code}</code>

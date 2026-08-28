@@ -1,4 +1,5 @@
 import asyncio
+import time
 import uuid
 
 import pytest
@@ -228,6 +229,23 @@ async def test_rapid_fire_questions_leave_one_winner(sessions, session_id, retri
     assert len(answered) == 1
 
 
+async def test_superseding_a_question_records_a_real_cancel_wait(sessions, session_id, retriever):
+    """ask()'s cancel-and-await pattern must actually record time spent
+    waiting for the superseded task to unwind, not just report zero."""
+    from app.core.metrics import LatencyTrace
+
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0.02))
+    trace = LatencyTrace(speech_end_at=time.monotonic())
+
+    await live.ask("How would you design a URL shortener?")
+    await asyncio.sleep(0.01)  # let the first task get into its stream loop
+    await live.ask("What is a database index?", trace=trace)
+    await drain(live)
+
+    assert trace.cancel_wait_ms is not None
+    assert trace.cancel_wait_ms >= 0
+
+
 # ------------------------------------------------------------------ transcript
 
 
@@ -254,6 +272,74 @@ async def test_final_transcript_triggers_detection(sessions, session_id, retriev
 
     assert EventType.TRANSCRIPT_FINAL in collector.types()
     assert EventType.ANSWER_COMPLETED in collector.types()
+
+
+async def test_a_dangling_question_does_not_fire_immediately(sessions, session_id, retriever):
+    """A mid-clause question must not spend a Gemini call before its brief
+    stabilization window elapses."""
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.on_transcript(
+        "Can you explain what happens when", TranscriptSource.LOOPBACK, is_final=True
+    )
+
+    assert EventType.QUESTION_DETECTED not in collector.types()
+    assert live._pending_ask is not None
+
+    await live._pending_ask  # let the stabilization window elapse
+    await drain(live)
+
+    assert EventType.QUESTION_DETECTED in collector.types()
+    assert EventType.ANSWER_COMPLETED in collector.types()
+
+
+async def test_a_quick_continuation_supersedes_the_pending_dangling_question(
+    sessions, session_id, retriever
+):
+    """The continuation arrives inside the correction-coalesce window, so the
+    detector merges it into one complete question -- only that one Gemini
+    call should ever happen."""
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm)
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.on_transcript(
+        "Can you explain what happens when", TranscriptSource.LOOPBACK, is_final=True
+    )
+    pending = live._pending_ask
+    assert pending is not None
+
+    await live.on_transcript(
+        "a transaction fails?", TranscriptSource.LOOPBACK, is_final=True
+    )
+    await asyncio.gather(pending, return_exceptions=True)
+    await drain(live)
+
+    # The stale timer must not still be alive and must not have fired its own ask.
+    assert pending.cancelled()
+    assert live._pending_ask is None
+    detected = collector.of(EventType.QUESTION_DETECTED)
+    assert len(detected) == 1
+    assert "transaction fails" in detected[0].data["question"]
+    assert len(llm.prompts) == 1
+
+
+async def test_pending_ask_is_cancelled_on_session_close(sessions, session_id, retriever):
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
+
+    await live.on_transcript(
+        "Can you explain what happens when", TranscriptSource.LOOPBACK, is_final=True
+    )
+    pending = live._pending_ask
+    assert pending is not None
+
+    await live.close()
+    await asyncio.gather(pending, return_exceptions=True)
+
+    assert pending.cancelled()
 
 
 async def test_mic_transcript_is_recorded_but_never_answered(sessions, session_id, retriever):
@@ -284,13 +370,18 @@ async def test_filler_utterance_is_rejected_visibly(sessions, session_id, retrie
     assert sessions.get_turns(session_id) == []
 
 
-async def test_interviewer_setup_context_reaches_the_detected_question(
+async def test_interviewer_setup_context_reaches_the_llm_but_not_the_ui(
     sessions, session_id, retriever
 ):
     """Reported bug: 'By using this study, just write a character count
     program.' isn't a question on its own and was previously discarded, so
-    the next utterance was answered as a bare, context-free fragment."""
-    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
+    the next utterance was answered as a bare, context-free fragment.
+
+    The fix attaches that setup to what the LLM sees, not to what the panel
+    displays -- the interviewer didn't ask a two-sentence question, so the UI
+    shouldn't show one."""
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm)
     collector = Collector()
     live.subscribe(collector)
 
@@ -306,9 +397,11 @@ async def test_interviewer_setup_context_reaches_the_detected_question(
 
     detected = collector.of(EventType.QUESTION_DETECTED)
     assert detected
-    question = detected[0].data["question"]
-    assert "character count program" in question
-    assert "How many times each character is repeated" in question
+    assert detected[0].data["question"] == "How many times each character is repeated?"
+
+    assert llm.prompts
+    assert "character count program" in llm.prompts[-1]
+    assert "How many times each character is repeated" in llm.prompts[-1]
 
 
 async def test_mic_speech_never_becomes_interviewer_context(sessions, session_id, retriever):
@@ -352,6 +445,57 @@ async def test_manual_question_is_not_augmented_with_interviewer_context(
     detected = collector.of(EventType.QUESTION_DETECTED)
     assert detected
     assert detected[0].data["question"] == "What is a database index?"
+
+
+async def test_short_followup_reaches_the_llm_with_conversation_history(
+    sessions, session_id, retriever
+):
+    """'Why?' is below question_min_words and would normally be rejected --
+    but right after a real, answered question it's a legitimate follow-up.
+    SessionMemory already carries the prior Q&A into every prompt, so once
+    the detector lets it through, no extra plumbing is needed."""
+    from app.memory.sqlite_memory import SqliteSessionMemory
+
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm, memory=SqliteSessionMemory(sessions))
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.on_transcript("What is a hash map?", TranscriptSource.LOOPBACK, is_final=True)
+    await drain(live)
+
+    await live.on_transcript("Why?", TranscriptSource.LOOPBACK, is_final=True)
+    await drain(live)
+
+    detected = collector.of(EventType.QUESTION_DETECTED)
+    assert len(detected) == 2
+    assert detected[1].data["question"] == "Why?"
+    assert "hash map" in llm.prompts[-1]
+
+
+async def test_self_interruption_never_leaves_an_incorrect_answer(sessions, session_id, retriever):
+    """'Explain hash ma-' matches on its own (it contains 'explain'), but an
+    interviewer correcting themselves mid-thought must never let that
+    incomplete fragment surface as a completed, incorrect answer."""
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0.05))
+    collector = Collector()
+    live.subscribe(collector)
+
+    await live.on_transcript("Explain hash ma-", TranscriptSource.LOOPBACK, is_final=True)
+    await live.on_transcript(
+        "No actually explain hash collisions.", TranscriptSource.LOOPBACK, is_final=True
+    )
+    await drain(live)
+
+    completed = collector.of(EventType.ANSWER_COMPLETED)
+    assert len(completed) == 1
+
+    turns = sessions.get_turns(session_id)
+    answered = [t for t in turns if t.status == TurnStatus.ANSWERED]
+    cancelled = [t for t in turns if t.status == TurnStatus.CANCELLED]
+    assert len(answered) == 1
+    assert len(cancelled) == 1
+    assert "collisions" in answered[0].question.lower()
 
 
 # ----------------------------------------------------------------- retrieval

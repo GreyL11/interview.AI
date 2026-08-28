@@ -8,9 +8,19 @@ class Complexity(BaseModel):
     space: str
 
 
+class AnswerSection(BaseModel):
+    """One labeled block of a structured answer (e.g. "Likely Cause",
+    "Situation"). Generic on purpose: debugging, SQL, system design, and
+    behavioral answers all reduce to "an ordered list of headed sections",
+    so one shape covers every mode without a bespoke field per category."""
+
+    heading: str
+    content: str
+
+
 class Answer(BaseModel):
-    """Generic interview answer. Coding-specific fields are optional and
-    populated only when the route is CODING."""
+    """Generic interview answer. Mode-specific fields are optional and
+    populated only when the route calls for that structure."""
 
     summary: str
     key_points: list[str] = []
@@ -21,6 +31,10 @@ class Answer(BaseModel):
     code: str | None = None
     complexity: Complexity | None = None
     edge_cases: list[str] | None = None
+
+    # Debugging / SQL / system design / behavioral: e.g. Likely Cause,
+    # Diagnosis, Fix; or Situation, Task, Action, Result.
+    sections: list[AnswerSection] | None = None
 
     warnings: list[str] = []
 

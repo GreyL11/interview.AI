@@ -6,6 +6,8 @@ grep alone. Deliberately not a metrics framework: this is a desktop app with
 one user, and a log line is the thing a support bundle already carries.
 """
 
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from app.core.logging import get_logger
@@ -33,3 +35,73 @@ def log_metric(event: str, **fields: Any) -> None:
 def elapsed_ms(started: float, now: float) -> int:
     """Monotonic-clock delta in whole milliseconds."""
     return int((now - started) * 1000)
+
+
+@dataclass
+class LatencyTrace:
+    """One interviewer utterance's timing, from speech-end through the first
+    visible answer token, correlated by question_id in one summary line.
+
+    Threaded explicitly through the pipeline (STT worker -> LiveSession)
+    rather than looked up from a dict by ID: there is then never a table of
+    in-flight traces to leak or expire if a stage never completes. All
+    timestamps are `time.monotonic()`, matching the rest of the codebase, so
+    a value recorded on the STT worker thread can still be safely subtracted
+    from one recorded later on the event loop.
+    """
+
+    speech_end_at: float
+    stt_queue_wait_ms: int | None = None
+    stt_inference_ms: int | None = None
+    stt_final_at: float | None = None
+    question_detected_at: float | None = None
+    ask_started_at: float | None = None
+    cancel_wait_ms: int | None = None
+    retrieval_ms: int | None = None
+    prompt_build_ms: int | None = None
+    gemini_request_at: float | None = None
+    #: Gemini's first streamed chunk of any kind. In this app's configuration
+    #: (plain JSON text streaming, no function calling) this is the same
+    #: moment as the first *text* chunk -- see the note on `stream_answer`.
+    gemini_first_response_at: float | None = None
+    #: First chunk containing text. Structurally this is *not* the same as
+    #: the first useful answer token: the response is streamed JSON, so the
+    #: first several chunks are usually the `{"summary": "` preamble before
+    #: any of the actual summary text appears.
+    gemini_first_text_token_at: float | None = None
+
+    def _ms(self, start: float | None, end: float | None) -> int | None:
+        if start is None or end is None:
+            return None
+        return elapsed_ms(start, end)
+
+    def emit_first_token(self, question_id: int) -> None:
+        """Log the one consolidated trace line, at the moment the first
+        *visible* answer token is forwarded onto the WebSocket -- the actual
+        "time to first useful token" the user experiences, which can lag the
+        raw Gemini first-token time by however long the JSON preamble takes
+        to stream past (see `gemini_first_text_token_at`)."""
+        now = time.monotonic()
+        log_metric(
+            "question_latency_trace",
+            question_id=question_id,
+            speech_end_to_stt_final_ms=self._ms(self.speech_end_at, self.stt_final_at),
+            stt_queue_wait_ms=self.stt_queue_wait_ms,
+            stt_inference_ms=self.stt_inference_ms,
+            stt_final_to_question_detected_ms=self._ms(
+                self.stt_final_at, self.question_detected_at
+            ),
+            question_detected_to_ask_ms=self._ms(self.question_detected_at, self.ask_started_at),
+            previous_answer_cancel_wait_ms=self.cancel_wait_ms,
+            retrieval_ms=self.retrieval_ms,
+            prompt_build_ms=self.prompt_build_ms,
+            llm_task_to_gemini_request_ms=self._ms(self.ask_started_at, self.gemini_request_at),
+            gemini_request_to_first_response_ms=self._ms(
+                self.gemini_request_at, self.gemini_first_response_at
+            ),
+            gemini_request_to_first_text_token_ms=self._ms(
+                self.gemini_request_at, self.gemini_first_text_token_at
+            ),
+            first_token_to_websocket_send_ms=self._ms(self.gemini_first_text_token_at, now),
+            total_question_to_first_visible_token_ms=self._ms(self.speech_end_at, now),
+        )

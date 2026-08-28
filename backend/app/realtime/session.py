@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.core.metrics import elapsed_ms, log_metric
+from app.core.metrics import LatencyTrace, elapsed_ms, log_metric
 from app.documents.schemas import PERSONAL_KNOWLEDGE_TYPES, RetrievedChunk
 from app.intelligence.answer_validator import AnswerValidationError, validate
 from app.intelligence.router import Route, route_for
@@ -14,7 +14,7 @@ from app.llm.prompts import build_prompt
 from app.llm.streaming import extract_partial_summary, parse_answer_payload
 from app.memory.base import SessionMemory
 from app.realtime.events import CancelReason, Event, EventType, event
-from app.realtime.question_detector import QuestionDetector
+from app.realtime.question_detector import Detection, QuestionDetector
 from app.retrieval.base import Retriever
 from app.schemas.answer import Answer
 from app.schemas.classification import Classification
@@ -61,6 +61,9 @@ class LiveSession:
         self._seq = 0
         self._current_turn_id: int | None = None
         self._task: asyncio.Task | None = None
+        #: A question detected as mid-clause waits here briefly for a
+        #: continuation to supersede it -- see `consider` / `_delayed_ask`.
+        self._pending_ask: asyncio.Task | None = None
         self._background: set[asyncio.Task] = set()
         self._subscribers: set[Emitter] = set()
         self._replay: deque[Event] = deque(maxlen=settings.ws_replay_buffer)
@@ -95,7 +98,11 @@ class LiveSession:
     # -------------------------------------------------------------- transcript
 
     async def on_transcript(
-        self, text: str, source: TranscriptSource, is_final: bool
+        self,
+        text: str,
+        source: TranscriptSource,
+        is_final: bool,
+        trace: LatencyTrace | None = None,
     ) -> None:
         if not is_final:
             await self.emit(
@@ -115,9 +122,14 @@ class LiveSession:
         if source == TranscriptSource.MIC:
             return
 
-        await self.consider(text, source)
+        await self.consider(text, source, trace)
 
-    async def consider(self, text: str, source: TranscriptSource = TranscriptSource.LOOPBACK) -> None:
+    async def consider(
+        self,
+        text: str,
+        source: TranscriptSource = TranscriptSource.LOOPBACK,
+        trace: LatencyTrace | None = None,
+    ) -> None:
         # Only live interviewer speech may draw on or feed the detector's
         # preceding-context buffer -- a typed question is the user's own
         # prompt, not interviewer setup, and must behave exactly as before.
@@ -132,14 +144,85 @@ class LiveSession:
             )
             return
 
-        await self.ask(detection.text, detection.classification)
+        if trace is not None:
+            trace.question_detected_at = time.monotonic()
+
+        # Any older mid-clause fragment is now superseded by real speech --
+        # either this *is* its continuation (already merged by the detector's
+        # own coalescing, and re-evaluated fresh below) or it is unrelated and
+        # the stale fragment must not fire on its own.
+        self._cancel_pending_ask()
+
+        if detection.stable:
+            await self.ask(
+                detection.text,
+                detection.classification,
+                effective_question=detection.effective_text,
+                trace=trace,
+            )
+            return
+
+        log_metric(
+            "question_stabilization_started",
+            session_id=self.session_id,
+            delay_ms=settings.question_stabilization_ms,
+        )
+        self._pending_ask = asyncio.create_task(self._delayed_ask(detection, trace))
+
+    def _cancel_pending_ask(self) -> None:
+        if self._pending_ask is not None and not self._pending_ask.done():
+            self._pending_ask.cancel()
+        self._pending_ask = None
+
+    async def _delayed_ask(self, detection: Detection, trace: LatencyTrace | None) -> None:
+        """Give a mid-clause question a brief window to be superseded by its
+        own continuation before spending a Gemini call on the fragment."""
+        started = time.monotonic()
+        try:
+            await asyncio.sleep(settings.question_stabilization_ms / 1000)
+        except asyncio.CancelledError:
+            log_metric(
+                "question_stabilization_superseded",
+                session_id=self.session_id,
+                waited_ms=elapsed_ms(started, time.monotonic()),
+            )
+            raise
+        log_metric(
+            "question_stabilization_completed",
+            session_id=self.session_id,
+            duration_ms=elapsed_ms(started, time.monotonic()),
+        )
+        await self.ask(
+            detection.text,
+            detection.classification,
+            effective_question=detection.effective_text,
+            trace=trace,
+        )
 
     # ------------------------------------------------------------------- asking
 
-    async def ask(self, question: str, classification: Classification | None = None) -> int:
-        """Start answering. Cancels any answer already in flight."""
+    async def ask(
+        self,
+        question: str,
+        classification: Classification | None = None,
+        *,
+        effective_question: str | None = None,
+        trace: LatencyTrace | None = None,
+    ) -> int:
+        """Start answering. Cancels any answer already in flight.
+
+        `question` is what gets shown and persisted -- the interview panel and
+        session history. `effective_question` is what the LLM actually sees;
+        it defaults to `question` and only differs when the detector attached
+        preceding setup context, so a verbose merged prompt never has to
+        appear in the UI as if the interviewer said all of it.
+        """
+        effective_question = effective_question or question
         async with self._lock:
+            cancel_started = time.monotonic()
             await self._cancel_current(CancelReason.SUPERSEDED)
+            if trace is not None:
+                trace.cancel_wait_ms = elapsed_ms(cancel_started, time.monotonic())
 
             if classification is None:
                 from app.intelligence.classifier import classify
@@ -173,7 +256,11 @@ class LiveSession:
                 question=question,
                 classification=classification.model_dump(mode="json"),
             ))
-            self._task = asyncio.create_task(self._answer(turn.turn_id, question, classification))
+            if trace is not None:
+                trace.ask_started_at = time.monotonic()
+            self._task = asyncio.create_task(
+                self._answer(turn.turn_id, question, effective_question, classification, trace)
+            )
             return turn.turn_id
 
     async def cancel(self, reason: CancelReason = CancelReason.USER_STOP) -> None:
@@ -201,7 +288,14 @@ class LiveSession:
     def _is_current(self, turn_id: int) -> bool:
         return self._current_turn_id == turn_id
 
-    async def _answer(self, turn_id: int, question: str, classification: Classification) -> None:
+    async def _answer(
+        self,
+        turn_id: int,
+        question: str,
+        effective_question: str,
+        classification: Classification,
+        trace: LatencyTrace | None = None,
+    ) -> None:
         started = time.monotonic()
         try:
             log_metric(
@@ -213,13 +307,28 @@ class LiveSession:
                                   classification=classification.model_dump(mode="json")))
 
             route = route_for(classification.category)
-            chunks = await self._retrieve(route, question, turn_id)
-            context_found = bool(chunks)
-
-            history = self._memory.bounded_context(self.session_id)
-            prompt = build_prompt(
-                question, classification.category, [c.as_context() for c in chunks], history
+            retrieval_started = time.monotonic()
+            # Independent work: retrieval (FAISS/embedding, its own thread
+            # hops) and conversation history (a sync SQLite read) share no
+            # data, so run them concurrently instead of back-to-back. For the
+            # common non-RAG routes retrieval is a no-op and this just moves
+            # the (tiny) history read off the event loop; for RAG/FOLLOW_UP it
+            # genuinely overlaps two independent I/O calls.
+            chunks, history = await asyncio.gather(
+                self._retrieve(route, effective_question, turn_id),
+                asyncio.to_thread(self._memory.bounded_context, self.session_id),
             )
+            context_found = bool(chunks)
+            if trace is not None:
+                trace.retrieval_ms = elapsed_ms(retrieval_started, time.monotonic())
+
+            prompt_started = time.monotonic()
+            prompt = build_prompt(
+                effective_question, classification.category,
+                [c.as_context() for c in chunks], history,
+            )
+            if trace is not None:
+                trace.prompt_build_ms = elapsed_ms(prompt_started, time.monotonic())
             log_metric(
                 "llm_request_prepared",
                 session_id=self.session_id,
@@ -230,7 +339,7 @@ class LiveSession:
                 history_turns=len(history) // 2,
             )
 
-            answer = await self._stream(turn_id, prompt)
+            answer = await self._stream(turn_id, prompt, trace)
             answer = validate(answer, classification, context_found=context_found)
 
             if not self._is_current(turn_id):
@@ -284,28 +393,40 @@ class LiveSession:
             question, knowledge_types=list(PERSONAL_KNOWLEDGE_TYPES)
         )
 
-    async def _stream(self, turn_id: int, prompt: str) -> Answer:
+    async def _stream(self, turn_id: int, prompt: str, trace: LatencyTrace | None = None) -> Answer:
         buffer = ""
         last_summary = ""
         requested_at = time.monotonic()
         saw_first_token = False
+        if trace is not None:
+            trace.gemini_request_at = requested_at
         log_metric("llm_request_started", session_id=self.session_id, question_id=turn_id)
         async for chunk in self._llm.stream_answer(prompt):
             if not saw_first_token:
                 saw_first_token = True
+                now = time.monotonic()
                 log_metric(
                     "llm_first_token_received",
                     session_id=self.session_id,
                     question_id=turn_id,
-                    duration_ms=elapsed_ms(requested_at, time.monotonic()),
+                    duration_ms=elapsed_ms(requested_at, now),
                 )
+                if trace is not None:
+                    # This app never streams a textless chunk (JSON text only,
+                    # function calling disabled), so "first response" and
+                    # "first text token" are the same moment here.
+                    trace.gemini_first_response_at = now
+                    trace.gemini_first_text_token_at = now
             buffer += chunk
             if not self._is_current(turn_id):
                 raise asyncio.CancelledError()
             partial = extract_partial_summary(buffer)
             if partial and partial != last_summary:
+                is_first_visible = last_summary == ""
                 last_summary = partial
                 await self.emit(event(EventType.ANSWER_DELTA, turn_id=turn_id, summary=partial))
+                if is_first_visible and trace is not None:
+                    trace.emit_first_token(turn_id)
 
         log_metric(
             "llm_response_completed",
@@ -361,6 +482,7 @@ class LiveSession:
 
     async def close(self) -> None:
         await self.stop_audio()
+        self._cancel_pending_ask()
         await self.cancel(CancelReason.SESSION_ENDED)
         for task in list(self._background):
             task.cancel()

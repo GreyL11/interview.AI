@@ -7,7 +7,7 @@ import numpy as np
 from app.audio.base import SAMPLE_RATE, AudioChannel, AudioSource
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.core.metrics import elapsed_ms, log_metric
+from app.core.metrics import LatencyTrace, elapsed_ms, log_metric
 from app.sessions.schemas import TranscriptSource
 from app.stt.base import SttEngine, SttError
 from app.stt.scheduler import (
@@ -21,6 +21,21 @@ from app.stt.vad import FRAME_MS, SegmentEvent, Segmenter, SpeechDetector
 logger = get_logger(__name__)
 
 _LOOPBACK_DIAGNOSTIC_INTERVAL = 500
+#: Below this word-overlap ratio, a final is suspiciously different from the
+#: last partial shown for the same utterance -- surfaced as a diagnostic only,
+#: never acted on (STT accuracy is a model problem, not something to "fix" by
+#: discarding a transcript).
+_DIVERGENCE_WARN_THRESHOLD = 0.4
+
+
+def _word_overlap(a: str, b: str) -> float:
+    """Jaccard similarity over lowercased word sets. Cheap, deterministic,
+    good enough to flag "these look like different utterances", not to judge
+    transcription quality precisely."""
+    words_a, words_b = set(a.lower().split()), set(b.lower().split())
+    if not words_a or not words_b:
+        return 1.0  # nothing to compare against; not a divergence
+    return len(words_a & words_b) / len(words_a | words_b)
 
 _CHANNEL_TO_SOURCE = {
     AudioChannel.MIC: TranscriptSource.MIC,
@@ -77,6 +92,10 @@ class TranscriptionWorker:
         #: Self-tuning back-off: never re-queue a partial more often than the
         #: last one took to run, so a slow machine simply produces fewer of them.
         self._last_partial_inference_ms = 0.0
+        #: Last published partial's text and utterance, purely for the
+        #: divergence diagnostic in `_transcribe` -- never affects behavior.
+        self._last_partial_text = ""
+        self._last_partial_utterance_id = 0
         self._speech_end_at: dict[int, float] = {}
         self._stopping = False
         self._loopback_frame_count = 0
@@ -180,11 +199,11 @@ class TranscriptionWorker:
             self.errors,
         )
 
-    def _publish(self, text: str, is_final: bool) -> None:
+    def _publish(self, text: str, is_final: bool, trace: LatencyTrace | None = None) -> None:
         if not text.strip():
             return
         asyncio.run_coroutine_threadsafe(
-            self._on_transcript(text, self.transcript_source, is_final), self._loop
+            self._on_transcript(text, self.transcript_source, is_final, trace), self._loop
         )
 
     def _run(self) -> None:
@@ -437,6 +456,7 @@ class TranscriptionWorker:
             chars=len(transcript.text),
         )
 
+        trace = None
         if not is_final:
             with self._schedule_lock:
                 if self._stopping or utterance_id <= self._published_final_utterance_id:
@@ -446,13 +466,35 @@ class TranscriptionWorker:
                         utterance_id,
                     )
                     return
+            self._last_partial_text = transcript.text
+            self._last_partial_utterance_id = utterance_id
         else:
             with self._schedule_lock:
                 self._published_final_utterance_id = max(
                     self._published_final_utterance_id, utterance_id
                 )
                 self._speech_end_at.pop(utterance_id, None)
-        self._publish(transcript.text, is_final)
+            if self._last_partial_utterance_id == utterance_id and self._last_partial_text:
+                overlap = _word_overlap(self._last_partial_text, transcript.text)
+                if overlap < _DIVERGENCE_WARN_THRESHOLD:
+                    log_metric(
+                        "stt_final_diverges_from_partial",
+                        channel=self._source.channel.value,
+                        utterance_id=utterance_id,
+                        overlap=round(overlap, 2),
+                        partial_chars=len(self._last_partial_text),
+                        final_chars=len(transcript.text),
+                    )
+            # Only a LOOPBACK final can ever become a question -- no point
+            # building a trace for MIC audio or interim partials.
+            if speech_end_at is not None and self.channel == AudioChannel.LOOPBACK:
+                trace = LatencyTrace(
+                    speech_end_at=speech_end_at,
+                    stt_queue_wait_ms=elapsed_ms(speech_end_at, started),
+                    stt_inference_ms=elapsed_ms(started, completed),
+                    stt_final_at=completed,
+                )
+        self._publish(transcript.text, is_final, trace)
 
     def _finish_partial(self, utterance_id: int) -> None:
         """Release the in-flight slot and promote the newest pending snapshot."""

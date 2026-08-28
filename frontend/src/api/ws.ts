@@ -24,6 +24,11 @@ export class SessionSocket {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private closedByUs = false;
   private lastSeq = 0;
+  // Local-only latency diagnostics: the backend can't see receive-to-render
+  // time, so this pairs question.detected with the first answer.delta for
+  // the same turn and logs the gap. Never sent anywhere.
+  private pendingQuestionTurnId: number | null = null;
+  private pendingQuestionAt: number | null = null;
 
   constructor(
     private readonly sessionId: string,
@@ -59,6 +64,7 @@ export class SessionSocket {
       const event = parseServerEvent(parsed);
       if (event === null) return;
       if (event.seq > this.lastSeq) this.lastSeq = event.seq;
+      this.traceFirstVisibleToken(event);
       this.onEvent(event);
     };
 
@@ -76,6 +82,28 @@ export class SessionSocket {
       this.onConnection("reconnecting");
       this.scheduleRetry();
     };
+  }
+
+  /** Logs receive-to-first-visible-token time for one turn, once. This is a
+   * message-to-message gap (question.detected -> first answer.delta), not a
+   * paint measurement -- React dispatches and renders synchronously in the
+   * same tick with no debounce in this app, so it is a close proxy without
+   * needing a render-observer hook. */
+  private traceFirstVisibleToken(event: ServerEvent): void {
+    if (event.type === "question.detected") {
+      this.pendingQuestionTurnId = event.turn_id;
+      this.pendingQuestionAt = performance.now();
+      return;
+    }
+    if (
+      event.type === "answer.delta" &&
+      event.turn_id === this.pendingQuestionTurnId &&
+      this.pendingQuestionAt !== null
+    ) {
+      const ms = performance.now() - this.pendingQuestionAt;
+      console.debug(`[latency] question_detected -> first answer.delta: ${ms.toFixed(1)}ms`);
+      this.pendingQuestionAt = null;
+    }
   }
 
   private scheduleRetry(): void {
