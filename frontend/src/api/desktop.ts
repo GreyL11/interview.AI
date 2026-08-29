@@ -100,6 +100,30 @@ export async function retryBackend(): Promise<void> {
   await invoke("retry_backend");
 }
 
+/**
+ * Make sure the page knows where the backend is.
+ *
+ * The shell injects `window.__BACKEND__` before page scripts run, which covers
+ * the normal case. It does not survive a webview reload, and it is written
+ * from a background thread once the backend is ready -- so a page that loaded
+ * early could read it before it exists. Without this the app would silently
+ * fall back to the *development* port and token and report a confusing
+ * "cannot reach the backend at :8000".
+ *
+ * Asking the shell is authoritative: it is the process that chose the port.
+ */
+export async function ensureBackendRuntime(): Promise<boolean> {
+  if (!isDesktop()) return true;
+  if (window.__BACKEND__ !== undefined) return true;
+  try {
+    const { invoke } = await core();
+    window.__BACKEND__ = await invoke<{ port: number; token: string }>("backend_info");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Reveal the backend log directory. No-op outside the desktop shell. */
 export async function openLogsFolder(): Promise<void> {
   if (!isDesktop()) return;

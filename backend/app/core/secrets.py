@@ -64,39 +64,60 @@ class KeyringSecretStore:
     """
 
     def __init__(self) -> None:
-        self._available: bool | None = None
+        self._backend = None
+        self._probed = False
 
     @property
     def available(self) -> bool:
-        if self._available is None:
-            self._available = self._probe()
-        return self._available
+        return self._resolve() is not None
 
-    def _probe(self) -> bool:
+    def _resolve(self):
+        """Find a usable backend, once.
+
+        keyring normally discovers its backend through package entry points --
+        metadata that PyInstaller does not carry into a frozen build. When that
+        discovery yields nothing usable, this falls back to importing the
+        platform backend directly, which survives freezing because the module
+        is a real import the analyser can see.
+        """
+        if self._probed:
+            return self._backend
+        self._probed = True
+
         try:
             import keyring
             from keyring.backends.fail import Keyring as FailKeyring
         except Exception as exc:
-            logger.info("secret_store_unavailable reason=import_failed error=%s", exc)
-            return False
-        backend = keyring.get_keyring()
-        # `fail.Keyring` is what keyring installs when it finds no real backend;
+            logger.warning("secret_store_unavailable reason=import_failed error=%s", exc)
+            return None
+
+        discovered = None
+        try:
+            discovered = keyring.get_keyring()
+        except Exception as exc:
+            logger.info("secret_store_discovery_failed error=%s", type(exc).__name__)
+
+        # `fail.Keyring` is the sentinel keyring installs when it finds nothing;
         # it raises on every operation. Treat it as absent rather than
         # discovering that on the user's first save.
-        if isinstance(backend, FailKeyring):
-            logger.info("secret_store_unavailable reason=no_backend")
-            return False
-        logger.info("secret_store_ready backend=%s", type(backend).__name__)
-        return True
+        if discovered is not None and not isinstance(discovered, FailKeyring):
+            self._backend = discovered
+        else:
+            self._backend = _platform_backend()
+
+        if self._backend is None:
+            logger.warning("secret_store_unavailable reason=no_backend")
+        else:
+            logger.info("secret_store_ready backend=%s", type(self._backend).__name__)
+        return self._backend
 
     def get(self, name: str) -> str | None:
         _validate(name)
-        if not self.available:
+        backend = self._resolve()
+        if backend is None:
             return None
-        import keyring
-
         try:
-            return keyring.get_password(SERVICE_NAME, name)
+            return backend.get_password(SERVICE_NAME, name)
         except Exception as exc:
             # Never include the exception's value payload; some backends echo
             # the entry back in their error text.
@@ -105,24 +126,22 @@ class KeyringSecretStore:
 
     def set(self, name: str, value: str) -> None:
         _validate(name)
-        if not self.available:
+        backend = self._resolve()
+        if backend is None:
             raise SecretStoreUnavailable("no OS credential store is available")
-        import keyring
-
         try:
-            keyring.set_password(SERVICE_NAME, name, value)
+            backend.set_password(SERVICE_NAME, name, value)
         except Exception as exc:
             logger.warning("secret_write_failed name=%s error=%s", name, type(exc).__name__)
             raise SecretStoreUnavailable("the OS credential store rejected the write") from exc
 
     def delete(self, name: str) -> None:
         _validate(name)
-        if not self.available:
+        backend = self._resolve()
+        if backend is None:
             return
-        import keyring
-
         try:
-            keyring.delete_password(SERVICE_NAME, name)
+            backend.delete_password(SERVICE_NAME, name)
         except Exception as exc:
             # Deleting something that is not there is success, not an error.
             logger.info("secret_delete_noop name=%s error=%s", name, type(exc).__name__)
@@ -153,6 +172,41 @@ class InMemorySecretStore:
     def delete(self, name: str) -> None:
         _validate(name)
         self._values.pop(name, None)
+
+
+def _platform_backend():
+    """Import the platform's keyring backend directly, bypassing discovery.
+
+    Only returns a backend that reports itself viable, so this cannot hand back
+    something that will raise on first use.
+    """
+    import sys
+
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        candidates = ["keyring.backends.Windows:WinVaultKeyring"]
+    elif sys.platform == "darwin":
+        candidates = ["keyring.backends.macOS:Keyring"]
+    else:
+        candidates = ["keyring.backends.SecretService:Keyring"]
+
+    for candidate in candidates:
+        module_name, class_name = candidate.split(":")
+        try:
+            import importlib
+
+            backend_class = getattr(importlib.import_module(module_name), class_name)
+            # priority raises on an unusable backend; that is how keyring
+            # itself decides viability.
+            _ = backend_class.priority
+            return backend_class()
+        except Exception as exc:
+            logger.info(
+                "secret_backend_unavailable candidate=%s error=%s",
+                candidate,
+                type(exc).__name__,
+            )
+    return None
 
 
 _store: SecretStore = KeyringSecretStore()

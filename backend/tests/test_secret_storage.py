@@ -249,3 +249,35 @@ def test_removing_an_environment_key_says_it_will_return(client, store):
 
 def _provider(client, name: str) -> dict:
     return next(p for p in client.get("/settings").json()["providers"] if p["name"] == name)
+
+
+# ------------------------------------------- frozen-build backend resolution
+
+
+def test_the_backend_is_resolved_directly_when_discovery_finds_nothing(monkeypatch):
+    """PyInstaller does not carry the entry-point metadata keyring uses to find
+    its backend, so a frozen build can end up with keyring's `fail` sentinel.
+    The store must import the platform backend directly instead of concluding
+    that the machine has no credential store."""
+    import keyring
+    from keyring.backends.fail import Keyring as FailKeyring
+
+    from app.core.secrets import KeyringSecretStore
+
+    monkeypatch.setattr(keyring, "get_keyring", lambda: FailKeyring())
+
+    resolved = KeyringSecretStore()._resolve()
+
+    assert resolved is not None
+    assert not isinstance(resolved, FailKeyring)
+
+
+def test_a_machine_with_no_backend_at_all_reports_unavailable(monkeypatch):
+    import app.core.secrets as secrets_module
+    import keyring
+    from keyring.backends.fail import Keyring as FailKeyring
+
+    monkeypatch.setattr(keyring, "get_keyring", lambda: FailKeyring())
+    monkeypatch.setattr(secrets_module, "_platform_backend", lambda: None)
+
+    assert secrets_module.KeyringSecretStore().available is False

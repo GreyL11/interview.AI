@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { api } from "./api/client.ts";
 import {
+  ensureBackendRuntime,
   getStartupState,
   isDesktop,
   onStartupChange,
@@ -59,6 +60,10 @@ export function App() {
     let cancelled = false;
     const check = async () => {
       try {
+        // Resolve the port/token from the shell first. Cheap after the first
+        // call, and it stops every request falling back to the dev port when
+        // the injected value is missing.
+        await ensureBackendRuntime();
         await api.health();
         if (!cancelled) setBackendUp(true);
       } catch {

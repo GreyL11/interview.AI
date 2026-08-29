@@ -38,6 +38,13 @@ def load_persisted_secrets(store: SecretStore | None = None) -> dict[str, str]:
     "unset") for logging and for the startup summary. Never returns values.
     """
     store = store if store is not None else secret_store()
+
+    # Probed unconditionally, even when every key came from the environment.
+    # Otherwise the packaged app's log would be silent about whether saving a
+    # key is possible at all -- which is the first thing to check when a user
+    # reports that their key did not survive a restart.
+    logger.info("secret_store_available=%s", store.available)
+
     sources: dict[str, str] = {}
 
     for name in sorted(SECRET_KEYS):

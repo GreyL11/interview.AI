@@ -26,6 +26,10 @@ export interface BackendRuntime {
 }
 
 export function backendRuntime(): BackendRuntime {
+  // The dev fallback below is only correct outside the desktop shell. Inside
+  // it, a missing __BACKEND__ means the port is genuinely unknown, and
+  // ensureBackendRuntime() is expected to have filled it in before any request
+  // is made -- see App.tsx.
   const injected = typeof window !== "undefined" ? window.__BACKEND__ : undefined;
   const port = injected?.port ?? DEV_PORT;
   const token = injected?.token ?? DEV_TOKEN;
