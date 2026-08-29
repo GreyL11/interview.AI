@@ -1,0 +1,30 @@
+<!-- Interview Coach app icon.
+
+     The ensō (円相) is the Zen brush circle: drawn in one uninterrupted motion and left open
+     rather than closed. That is what practice is — one continuous movement, deliberately
+     unfinished — so the gesture is kept from the original drawing.
+
+     What changed, and why:
+
+     - The barbell is gone. It was doing semantic work for a gym app; here it only added a
+       second shape that merged into a single pink dash at 32px, which is the size this icon
+       spends most of its life at.
+     - One mark inside the ring, in the app's own accent blue, following the kamon (家紋) crest
+       rule: one enclosing ring, one mark, nothing else. It survives the shrink where the
+       barbell collars did not.
+     - The plate is rounded rather than square. Full-bleed black reads as a black tile among
+       transparent neighbours on a light taskbar; rounding it makes it read as an icon.
+       It is NOT transparent on purpose — a bone-white stroke on a light theme would disappear,
+       and the plate is what guarantees contrast in both themes.
+
+     The circle is a filled outline, not a stroke, so the brush tapers: thin where the stroke
+     starts, swelling through the sweep, thinning into the tail. A uniform ring reads as a washer.
+     Path is baked, not generated. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+  <rect width="108" height="108" rx="24" fill="#12141a"/>
+
+  <path opacity="0.95" fill="#EDE6DA" d="M74.4,29.7 L77.4,32.2 L80.0,35.0 L82.3,38.2 L84.2,41.6 L85.6,45.3 L86.6,49.2 L87.2,53.1 L87.2,57.2 L86.8,61.2 L85.8,65.2 L84.4,69.0 L82.5,72.6 L80.1,76.0 L77.4,79.1 L74.2,81.8 L70.8,84.1 L67.0,86.0 L63.1,87.4 L59.0,88.3 L54.8,88.7 L50.6,88.6 L46.5,87.9 L42.4,86.8 L38.6,85.1 L35.0,83.0 L31.6,80.4 L28.7,77.5 L26.1,74.2 L23.9,70.7 L22.2,66.9 L21.0,62.9 L20.3,58.8 L20.1,54.7 L20.5,50.7 L21.3,46.7 L22.6,42.8 L24.3,39.2 L26.5,35.8 L29.0,32.8 L31.9,30.1 L35.1,27.7 L38.5,25.8 L42.1,24.3 L45.8,23.3 L46.7,26.7 L43.5,28.0 L40.6,29.6 L37.8,31.6 L35.4,33.9 L33.3,36.4 L31.5,39.1 L30.0,42.0 L28.9,45.1 L28.2,48.2 L27.8,51.4 L27.9,54.6 L28.3,57.7 L29.0,60.7 L30.2,63.7 L31.6,66.4 L33.3,69.0 L35.3,71.3 L37.6,73.4 L40.1,75.2 L42.8,76.7 L45.6,77.8 L48.5,78.7 L51.5,79.1 L54.6,79.3 L57.7,79.1 L60.7,78.5 L63.6,77.6 L66.4,76.3 L69.1,74.7 L71.5,72.8 L73.8,70.7 L75.7,68.2 L77.4,65.6 L78.8,62.7 L79.8,59.7 L80.5,56.5 L80.8,53.3 L80.7,50.1 L80.2,46.8 L79.4,43.6 L78.1,40.5 L76.5,37.6 L74.5,34.9 L72.2,32.4 Z"/>
+
+  <!-- The single mark. Sized to still be a distinct dot, not a smudge, at 32px. -->
+  <circle cx="54" cy="54" r="9.5" fill="#5b8def"/>
+</svg>
