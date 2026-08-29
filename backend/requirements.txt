@@ -5,6 +5,10 @@ pydantic-settings>=2.5
 google-genai>=0.3
 groq>=0.11
 python-dotenv>=1.0
+# OS credential store for API keys (Windows Credential Manager via
+# pywin32-ctypes). A packaged desktop app has no editable .env, so this is
+# where a key typed into Settings goes. Pure Python -- no build tools.
+keyring>=25.0
 
 # Local RAG
 faiss-cpu>=1.9

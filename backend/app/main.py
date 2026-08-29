@@ -29,6 +29,12 @@ async def lifespan(app: FastAPI):
         get_session_repository,
     )
 
+    # Before anything builds a provider: a desktop install ships no .env, so
+    # the only place its keys can come from is the OS credential store.
+    from app.core.secret_config import load_persisted_secrets
+
+    load_persisted_secrets()
+
     stuck = get_document_repository().reset_stuck_processing()
     if stuck:
         logger.warning("recovered_stuck_documents count=%d", stuck)

@@ -25,6 +25,11 @@ hidden = [
     "app.__main__",
 ]
 hidden += collect_submodules("faster_whisper")
+# keyring finds its backend through entry points, which PyInstaller does not
+# follow. Without these the frozen app falls back to keyring's fail backend
+# and reports "no credential store", so saved API keys would not persist.
+hidden += collect_submodules("keyring")
+hidden += ["keyring.backends.Windows", "win32ctypes.core"]
 
 datas = []
 # The Silero VAD model ships inside faster-whisper as an ONNX asset; without
