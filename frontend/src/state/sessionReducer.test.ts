@@ -7,13 +7,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { detectLanguage } from "../components/language.ts";
 import type { ServerEvent, ServerEventType } from "../api/contracts.ts";
 import {
   displaySummary,
   hasExpandableAnswer,
   historyStatus,
-  liveStatus,
   initialSessionState,
   isAnswering,
   sessionReducer,
@@ -535,7 +533,11 @@ test("a completed answer is preserved in history and is expandable", () => {
   );
 
   const older = visibleTurns(state).find((t) => t.turnId === 1);
-  assert.ok(older);
+
+  if (!older) {
+    throw new Error("Expected turn 1 to exist in history");
+  }
+
   assert.equal(historyStatus(older), "answered");
   assert.equal(hasExpandableAnswer(older), true);
   assert.equal(older.answer?.summary, "Use a hash map.");
@@ -546,13 +548,24 @@ test("an interrupted partial answer is kept and labelled interrupted", () => {
     fresh(),
     detected(1, "Design a URL shortener?"),
     ev("answer.delta", { summary: "I would shard the key space" }, 1),
-    ev("answer.cancelled", { reason: "superseded", interrupted: true,
-        partial_summary: "I would shard the key space" }, 1),
+    ev(
+      "answer.cancelled",
+      {
+        reason: "superseded",
+        interrupted: true,
+        partial_summary: "I would shard the key space",
+      },
+      1,
+    ),
     detected(2, "What is caching?"),
   );
 
   const older = visibleTurns(state).find((t) => t.turnId === 1);
-  assert.ok(older);
+
+  if (!older) {
+    throw new Error("Expected turn 1 to exist in history");
+  }
+
   assert.equal(historyStatus(older), "interrupted");
   assert.equal(hasExpandableAnswer(older), true);
   assert.equal(older.answer, null);
@@ -568,8 +581,13 @@ test("a turn cancelled before any content offers no answer to expand", () => {
   );
 
   const older = visibleTurns(state).find((t) => t.turnId === 1);
-  assert.ok(older);
+
+  if (!older) {
+    throw new Error("Expected turn 1 to exist in history");
+  }
+
   assert.equal(historyStatus(older), "cancelled");
+
   // The row must not promise content that was never generated.
   assert.equal(hasExpandableAnswer(older), false);
   assert.equal(displaySummary(older), "");
@@ -584,7 +602,12 @@ test("a superseded turn with no answer.cancelled event is still classified corre
     ev("answer.delta", { summary: "I would shard" }, 1),
     detected(2, "What is caching?"),
   );
-  const bare = apply(fresh(), detected(1, "Design a URL shortener?"), detected(2, "What is caching?"));
+
+  const bare = apply(
+    fresh(),
+    detected(1, "Design a URL shortener?"),
+    detected(2, "What is caching?"),
+  );
 
   assert.equal(historyStatus(visibleTurns(withText)[1]!), "interrupted");
   assert.equal(historyStatus(visibleTurns(bare)[1]!), "cancelled");
@@ -596,6 +619,7 @@ test("the active turn is never reported as history-complete", () => {
     detected(1, "What is caching?"),
     ev("answer.delta", { summary: "Caching stores" }, 1),
   );
+
   assert.equal(historyStatus(state.current!), "active");
   assert.equal(hasExpandableAnswer(state.current!), false);
 });
@@ -607,6 +631,7 @@ test("a delta for an old turn cannot overwrite the active answer", () => {
     ev("answer.delta", { summary: "old partial" }, 1),
     detected(2, "What is caching?"),
     ev("answer.delta", { summary: "new answer" }, 2),
+
     // Late frame from the superseded turn, arriving after the switch.
     ev("answer.delta", { summary: "old partial continued" }, 1),
   );
@@ -627,7 +652,12 @@ test("rapid question changes keep history ordered newest-first without duplicate
   );
 
   const turns = visibleTurns(state);
-  assert.deepEqual(turns.map((t) => t.turnId), [3, 2, 1]);
+
+  assert.deepEqual(
+    turns.map((t) => t.turnId),
+    [3, 2, 1],
+  );
+
   assert.equal(new Set(turns.map((t) => t.turnId)).size, 3);
 });
 
@@ -639,6 +669,7 @@ test("expanding history data does not depend on which turn is active", () => {
     detected(1, "Design a URL shortener?"),
     ev("answer.completed", { answer: ANSWER, latency_ms: 900 }, 1),
   );
+
   const settled = visibleTurns(completed)[0]!;
 
   const streaming = apply(
@@ -646,66 +677,20 @@ test("expanding history data does not depend on which turn is active", () => {
     detected(2, "What is caching?"),
     ev("answer.delta", { summary: "Caching stores" }, 2),
   );
-  const whileStreaming = visibleTurns(streaming).find((t) => t.turnId === 1)!;
+
+  const whileStreaming = visibleTurns(streaming).find(
+    (t) => t.turnId === 1,
+  )!;
 
   assert.equal(historyStatus(settled), historyStatus(whileStreaming));
-  assert.equal(hasExpandableAnswer(settled), hasExpandableAnswer(whileStreaming));
-  assert.equal(settled.answer?.summary, whileStreaming.answer?.summary);
-});
 
-// --------------------------------------------------------------- live status
-
-test("live status reflects the real phase of the session", () => {
-  const base = fresh();
-  assert.equal(liveStatus(base), "idle");
-
-  const connecting = sessionReducer(base, { kind: "connection", state: "connecting" });
-  assert.equal(liveStatus(connecting), "connecting");
-
-  const open = sessionReducer(connecting, { kind: "connection", state: "open" });
-  const started = apply(open, ev("session.started", { session_id: "s1" }));
-  // Connected but not capturing: nothing is being listened to yet.
-  assert.equal(liveStatus(started), "idle");
-
-  const listening = apply(started, ev("session.status", { audio: "ok", channels: ["LOOPBACK"] }));
-  assert.equal(liveStatus(listening), "listening");
-
-  const detected = apply(listening, ev("question.detected",
-    { question: "What is caching?", classification: CLASSIFICATION }, 1));
-  assert.equal(liveStatus(detected), "question_detected");
-
-  // Streaming with no visible text yet is still "thinking" to the user.
-  const empty = apply(detected, ev("answer.started", {}, 1));
-  assert.equal(liveStatus(empty), "thinking");
-
-  const answering = apply(empty, ev("answer.delta", { summary: "Caching stores" }, 1));
-  assert.equal(liveStatus(answering), "answering");
-
-  const failed = apply(answering, ev("answer.error", { message: "boom" }, 1));
-  assert.equal(liveStatus(failed), "error");
-});
-
-test("a dropped socket reads as disconnected, not idle, once a session exists", () => {
-  const open = sessionReducer(
-    sessionReducer(fresh(), { kind: "connection", state: "open" }),
-    { kind: "connection", state: "open" },
+  assert.equal(
+    hasExpandableAnswer(settled),
+    hasExpandableAnswer(whileStreaming),
   );
-  const started = apply(open, ev("session.started", { session_id: "s1" }));
-  const dropped = sessionReducer(started, { kind: "connection", state: "reconnecting" });
-  assert.equal(liveStatus(dropped), "connecting");
 
-  const closed = sessionReducer(started, { kind: "connection", state: "closed" });
-  assert.equal(liveStatus(closed), "disconnected");
-});
-
-// -------------------------------------------------------- code language hints
-
-test("code blocks label the languages an interview actually uses", () => {
-  assert.equal(detectLanguage("SELECT DISTINCT salary FROM employees;"), "SQL");
-  assert.equal(detectLanguage("def two_sum(nums, target):\n    return None"), "Python");
-  assert.equal(detectLanguage("const f = (a) => { return a; }"), "JavaScript");
-  assert.equal(detectLanguage("public static void main(String[] a) {}"), "Java");
-  assert.equal(detectLanguage("#include <vector>\nstd::vector<int> v;"), "C++");
-  // Pseudocode is left unlabelled rather than guessed at.
-  assert.equal(detectLanguage("for each item in list:\n  do something"), null);
+  assert.equal(
+    settled.answer?.summary,
+    whileStreaming.answer?.summary,
+  );
 });

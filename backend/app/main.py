@@ -12,6 +12,7 @@ from app.core.logging import get_logger
 from app.documents.service import DocumentError
 from app.intelligence.answer_validator import AnswerValidationError
 from app.llm.base import LLMError
+from fastapi.middleware.cors import CORSMiddleware
 
 logger = get_logger(__name__)
 
@@ -61,10 +62,7 @@ app = FastAPI(title="Interview Coach API", version="0.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origin_regex=r"^(https?://(tauri\.localhost|localhost|127\.0\.0\.1)(:\d+)?)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -427,18 +427,24 @@ mod job_object {
     use std::sync::OnceLock;
 
     use windows_sys::Win32::Foundation::HANDLE;
+    #[cfg(windows)]
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject,
+    CreateJobObjectW,
+    SetInformationJobObject,
+    JobObjectExtendedLimitInformation,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
+
+
 
     static JOB: OnceLock<usize> = OnceLock::new();
 
     fn job_handle() -> HANDLE {
         *JOB.get_or_init(|| unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if handle != 0 {
+            if !handle.is_null() {
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
                 info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
                 SetInformationJobObject(
@@ -454,7 +460,7 @@ mod job_object {
 
     pub fn assign_current_process_job(child: &Child) {
         let job = job_handle();
-        if job == 0 {
+        if job.is_null() {
             log::warn!("could not create job object; backend may outlive a crash");
             return;
         }

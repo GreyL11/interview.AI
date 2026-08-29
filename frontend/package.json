@@ -12,12 +12,12 @@
     "tauri": "tauri",
     "tauri:build": "tauri build",
     "desktop:build": "npm run backend:package && npm run build && npm run tauri:build",
-    "backend:package": "cd ../backend && pyinstaller --noconfirm packaging/interview-coach-backend.spec"
+    "backend:package": "cd ../backend && python -m PyInstaller --noconfirm packaging/interview-coach-backend.spec"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "@tauri-apps/api": "^2.1.1"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",

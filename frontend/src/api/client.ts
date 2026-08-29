@@ -33,11 +33,17 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(`${runtime.baseUrl}${path}`, { ...init, headers });
-  } catch (cause) {
-    // The backend is a child process; if it died, say so plainly rather than
-    // surfacing a bare "Failed to fetch".
-    throw new ApiError(0, `Cannot reach the backend at ${runtime.baseUrl}. Is it running?`);
-  }
+    } catch (cause) {
+      const detail =
+        cause instanceof Error
+          ? `${cause.name}: ${cause.message}`
+          : String(cause);
+
+      throw new ApiError(
+        0,
+        `Cannot reach the backend at ${runtime.baseUrl}. ${detail}`,
+      );
+    }
 
   if (!response.ok) {
     throw new ApiError(response.status, await errorDetail(response));
