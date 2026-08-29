@@ -15,6 +15,7 @@ The boundary is three functions on purpose. Everything above it deals in
 "is a key configured", never in key material.
 """
 
+import re
 from typing import Protocol
 
 from app.core.logging import get_logger
@@ -23,12 +24,47 @@ logger = get_logger(__name__)
 
 #: Namespace for entries this app owns. Visible to the user in Credential
 #: Manager, so it reads as a product name rather than an internal id.
-SERVICE_NAME = "Interview Coach"
+SERVICE_NAME = "Call Assistant"
 
-#: Only these may be persisted. A closed set stops a future caller from using
-#: the credential store as a general key-value bucket, and makes it trivial to
-#: enumerate what the app is holding on the user's machine.
-SECRET_KEYS = frozenset({"groq_api_key", "gemini_api_key"})
+#: Names this app used before it was renamed. A stored key is filed under the
+#: service name that was current when it was saved, so renaming the product
+#: would otherwise orphan every existing user's API key -- they would open
+#: Settings, see "not configured", and have to find and re-enter it.
+#:
+#: Read-through-and-adopt rather than a one-shot sweep: `keyring` cannot
+#: enumerate a service's entries, so there is nothing to sweep. The first read
+#: after an upgrade finds the old entry, copies it forward, and removes it.
+LEGACY_SERVICE_NAMES = ("Interview Coach",)
+
+#: What a storable secret may be called.
+#:
+#: Deliberately a *shape* check rather than an allowlist of known providers:
+#: any provider's key can be stored, so adding one is a settings change rather
+#: than a code change. It is still constrained, because the name becomes an
+#: entry in the user's Windows Credential Manager -- an unbounded string there
+#: would let a caller create entries the user cannot recognise or clean up.
+_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}_api_key$")
+
+#: Entries this app wrote in an earlier version and no longer uses. They are
+#: deleted on startup rather than left behind: an abandoned credential the user
+#: cannot see in any settings screen, but which still shows up in Windows
+#: Credential Manager under this app's name, is the app's mess to clean up.
+OBSOLETE_SECRET_KEYS = frozenset({"gemini_api_key"})
+
+
+def secret_field_names() -> frozenset[str]:
+    """Secret names the running configuration actually knows how to apply.
+
+    Derived from Settings rather than hardcoded, so a new `*_api_key` field is
+    loaded from the credential store at startup with no further wiring. Storing
+    a key is *not* limited to this set -- see `_validate` -- but only these can
+    be pushed into the live configuration.
+    """
+    from app.core.config import Settings
+
+    return frozenset(
+        name for name in Settings.model_fields if _NAME_PATTERN.match(name)
+    )
 
 
 class SecretStoreUnavailable(RuntimeError):
@@ -51,8 +87,10 @@ class SecretStore(Protocol):
 
 
 def _validate(name: str) -> None:
-    if name not in SECRET_KEYS:
-        raise ValueError(f"{name} is not a storable secret")
+    if not _NAME_PATTERN.match(name or ""):
+        raise ValueError(
+            f"{name!r} is not a valid secret name; expected something like 'groq_api_key'"
+        )
 
 
 class KeyringSecretStore:
@@ -117,12 +155,41 @@ class KeyringSecretStore:
         if backend is None:
             return None
         try:
-            return backend.get_password(SERVICE_NAME, name)
+            value = backend.get_password(SERVICE_NAME, name)
         except Exception as exc:
             # Never include the exception's value payload; some backends echo
             # the entry back in their error text.
             logger.warning("secret_read_failed name=%s error=%s", name, type(exc).__name__)
             return None
+        if value:
+            return value
+        return self._adopt_legacy(backend, name)
+
+    def _adopt_legacy(self, backend, name: str) -> str | None:
+        """Move a key filed under a previous product name onto the current one.
+
+        Runs only when the current name has no entry, so it costs one extra
+        lookup on a genuinely unconfigured install and nothing thereafter.
+        """
+        for legacy in LEGACY_SERVICE_NAMES:
+            try:
+                value = backend.get_password(legacy, name)
+            except Exception:
+                continue
+            if not value:
+                continue
+            try:
+                backend.set_password(SERVICE_NAME, name, value)
+                backend.delete_password(legacy, name)
+                logger.info("secret_migrated name=%s from=%r", name, legacy)
+            except Exception as exc:
+                # The value is still usable this session even if re-filing
+                # failed; the next start will simply try again.
+                logger.warning(
+                    "secret_migration_incomplete name=%s error=%s", name, type(exc).__name__
+                )
+            return value
+        return None
 
     def set(self, name: str, value: str) -> None:
         _validate(name)
@@ -214,6 +281,30 @@ _store: SecretStore = KeyringSecretStore()
 
 def secret_store() -> SecretStore:
     return _store
+
+
+def purge_obsolete_secrets(store: SecretStore | None = None) -> list[str]:
+    """Delete credentials this app no longer uses.
+
+    Runs at startup. Only touches names this app is known to have written
+    itself (`OBSOLETE_SECRET_KEYS`) -- never anything a user or another
+    application put in the credential store. Returns the names attempted, for
+    the startup log.
+
+    Failure is not an error: a machine with no credential store has nothing to
+    purge, and an entry that was already gone is the desired end state anyway.
+    """
+    store = store if store is not None else secret_store()
+    purged: list[str] = []
+    for name in sorted(OBSOLETE_SECRET_KEYS):
+        try:
+            store.delete(name)
+            purged.append(name)
+        except Exception as exc:  # pragma: no cover - store-specific failure
+            logger.info(
+                "obsolete_secret_purge_failed name=%s error=%s", name, type(exc).__name__
+            )
+    return purged
 
 
 def set_secret_store(store: SecretStore) -> None:

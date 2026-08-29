@@ -201,7 +201,7 @@ class LiveSession:
 
     async def _delayed_ask(self, detection: Detection, trace: LatencyTrace | None) -> None:
         """Give a mid-clause question a brief window to be superseded by its
-        own continuation before spending a Gemini call on the fragment."""
+        own continuation before spending a provider call on the fragment."""
         started = time.monotonic()
         try:
             await asyncio.sleep(settings.question_stabilization_ms / 1000)
@@ -456,7 +456,7 @@ class LiveSession:
         requested_at = time.monotonic()
         saw_first_token = False
         if trace is not None:
-            trace.gemini_request_at = requested_at
+            trace.llm_request_at = requested_at
         log_metric("llm_request_started", session_id=self.session_id, question_id=turn_id)
         async for chunk in self._llm.stream_answer(prompt):
             if not saw_first_token:
@@ -472,8 +472,8 @@ class LiveSession:
                     # This app never streams a textless chunk (JSON text only,
                     # function calling disabled), so "first response" and
                     # "first text token" are the same moment here.
-                    trace.gemini_first_response_at = now
-                    trace.gemini_first_text_token_at = now
+                    trace.llm_first_response_at = now
+                    trace.llm_first_text_token_at = now
             buffer += chunk
             if not self._is_current(turn_id):
                 raise asyncio.CancelledError()

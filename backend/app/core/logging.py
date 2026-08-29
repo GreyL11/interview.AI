@@ -27,7 +27,7 @@ def _install_file_handler() -> None:
     try:
         settings.logs_dir.mkdir(parents=True, exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
-            settings.logs_dir / "interview-coach.log",
+            settings.logs_dir / "call-assistant.log",
             maxBytes=_MAX_BYTES,
             backupCount=_BACKUPS,
             encoding="utf-8",

@@ -2,7 +2,6 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.9
 pydantic-settings>=2.5
-google-genai>=0.3
 groq>=0.11
 python-dotenv>=1.0
 # OS credential store for API keys (Windows Credential Manager via
@@ -35,3 +34,17 @@ PyAudioWPatch>=0.2.12.7; sys_platform == "win32"
 pytest>=8.3
 pytest-asyncio>=0.24
 httpx>=0.27
+
+# Freezes the backend into the sidecar the desktop app ships. Declared here
+# because the packaging spec refuses to build without the runtime deps above
+# present, so the build interpreter must be the one that has them.
+pyinstaller>=6.11
+
+# --- Scanned-document OCR -------------------------------------------------
+# Fallback for PDFs that contain images of text instead of text. Both are pure
+# wheels: pypdfium2 statically links the PDF renderer and rapidocr runs on the
+# onnxruntime already declared above, so neither needs a system install
+# (Tesseract, Poppler) or PyTorch -- which the packaging spec excludes because
+# it would add well over a gigabyte to the installer.
+pypdfium2>=4.30
+rapidocr-onnxruntime>=1.3

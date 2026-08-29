@@ -153,7 +153,7 @@ def test_spec_excludes_torch():
     so the exclusion is asserted rather than trusted."""
     from pathlib import Path
 
-    spec = Path(__file__).resolve().parents[1] / "packaging" / "interview-coach-backend.spec"
+    spec = Path(__file__).resolve().parents[1] / "packaging" / "call-assistant-backend.spec"
     text = spec.read_text(encoding="utf-8")
     assert '"torch"' in text
     assert "collect_data_files(\"faster_whisper\", includes=[\"assets/*\"])" in text
@@ -162,3 +162,93 @@ def test_spec_excludes_torch():
 def test_torch_is_not_importable():
     with pytest.raises(ImportError):
         __import__("torch")
+
+
+# ----------------------------------------- renamed product, kept user data
+
+
+def test_the_data_directory_from_the_previous_name_is_adopted(tmp_path, monkeypatch):
+    """Renaming the app changes the Tauri bundle identifier, which changes the
+    per-user data directory. Without this an upgraded install starts against an
+    empty folder: no documents, no history, and a re-download of ~350MB of
+    models, with the originals still on disk under a name the user has no
+    reason to look for."""
+    from app.core.config import LEGACY_APP_IDENTIFIERS, migrate_legacy_data_dir
+
+    legacy = tmp_path / LEGACY_APP_IDENTIFIERS[0]
+    (legacy / "metadata").mkdir(parents=True)
+    (legacy / "metadata" / "app.db").write_bytes(b"the user's history")
+
+    target = tmp_path / "com.callassistant.desktop"
+    moved = migrate_legacy_data_dir(target)
+
+    assert moved == legacy
+    assert (target / "metadata" / "app.db").read_bytes() == b"the user's history"
+    assert not legacy.exists()
+
+
+def test_migration_never_overwrites_data_the_renamed_app_already_wrote(tmp_path):
+    """If the new location is already in use, the old one is left alone rather
+    than merged -- silently combining two databases is worse than leaving a
+    folder behind."""
+    from app.core.config import LEGACY_APP_IDENTIFIERS, migrate_legacy_data_dir
+
+    legacy = tmp_path / LEGACY_APP_IDENTIFIERS[0]
+    legacy.mkdir(parents=True)
+    (legacy / "old.db").write_bytes(b"old")
+
+    target = tmp_path / "com.callassistant.desktop"
+    target.mkdir()
+    (target / "new.db").write_bytes(b"new")
+
+    assert migrate_legacy_data_dir(target) is None
+    assert (target / "new.db").read_bytes() == b"new"
+    assert legacy.exists()
+
+
+def test_migration_is_a_no_op_on_a_fresh_install(tmp_path):
+    from app.core.config import migrate_legacy_data_dir
+
+    target = tmp_path / "com.callassistant.desktop"
+    assert migrate_legacy_data_dir(target) is None
+
+
+def test_migration_ignores_an_empty_legacy_directory(tmp_path):
+    from app.core.config import LEGACY_APP_IDENTIFIERS, migrate_legacy_data_dir
+
+    (tmp_path / LEGACY_APP_IDENTIFIERS[0]).mkdir(parents=True)
+    assert migrate_legacy_data_dir(tmp_path / "com.callassistant.desktop") is None
+
+
+def test_an_empty_log_directory_does_not_block_the_migration(tmp_path):
+    """Regression. `app.core.logging` creates `<data_dir>/logs` the first time
+    any logger is built, which happens at import time -- before the migration
+    runs. Treating that as "already in use" made the migration a silent no-op on
+    every real install, which is exactly what it did on the first attempt."""
+    from app.core.config import LEGACY_APP_IDENTIFIERS, migrate_legacy_data_dir
+
+    legacy = tmp_path / LEGACY_APP_IDENTIFIERS[0]
+    (legacy / "metadata").mkdir(parents=True)
+    (legacy / "metadata" / "app.db").write_bytes(b"the user's history")
+
+    target = tmp_path / "com.callassistant.desktop"
+    (target / "logs").mkdir(parents=True)  # what the logger leaves behind
+
+    assert migrate_legacy_data_dir(target) == legacy
+    assert (target / "metadata" / "app.db").read_bytes() == b"the user's history"
+
+
+def test_a_non_empty_log_directory_still_counts_as_in_use(tmp_path):
+    """Logs that already have content mean the renamed app really has run."""
+    from app.core.config import LEGACY_APP_IDENTIFIERS, migrate_legacy_data_dir
+
+    legacy = tmp_path / LEGACY_APP_IDENTIFIERS[0]
+    legacy.mkdir(parents=True)
+    (legacy / "old.db").write_bytes(b"old")
+
+    target = tmp_path / "com.callassistant.desktop"
+    (target / "logs").mkdir(parents=True)
+    (target / "logs" / "call-assistant.log").write_text("a previous run")
+
+    assert migrate_legacy_data_dir(target) is None
+    assert legacy.exists()

@@ -14,12 +14,12 @@ export function StartupScreen({ state }: { state: StartupState }) {
   return (
     <div className="startup" role="status" aria-live="polite">
       <div className="startup-inner">
-        <p className="startup-brand">Interview Coach</p>
+        <p className="startup-brand">Call Assistant</p>
 
         {failed ? (
           <>
             <h1 className="startup-title">
-              Something prevented Interview Coach from starting.
+              Something prevented Call Assistant from starting.
             </h1>
             {state.detail !== undefined && state.detail !== "" && (
               <pre className="startup-detail">{state.detail}</pre>

@@ -3,6 +3,7 @@ from pathlib import Path
 from app.documents.parsers.base import (
     DocumentParser,
     ParseError,
+    ProgressCallback,
     ensure_text,
     normalize_whitespace,
 )
@@ -13,7 +14,15 @@ class DocxParser(DocumentParser):
     def supports(self, file_type: FileType) -> bool:
         return file_type == FileType.DOCX
 
-    def parse(self, file_path: Path, document_id: str) -> NormalizedDocument:
+    def parse(
+        self,
+        file_path: Path,
+        document_id: str,
+        progress: ProgressCallback | None = None,
+    ) -> NormalizedDocument:
+        # `progress` is unused: these formats parse in milliseconds, so
+        # there is nothing worth narrating. It is accepted to keep one
+        # parser signature across the registry.
         import docx
 
         try:

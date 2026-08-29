@@ -1,7 +1,7 @@
 """Failure-recovery and resilience scenarios.
 
-Complements existing coverage rather than repeating it: Gemini retry/fallback
-and message sanitization live in test_gemini_client.py; WebSocket malformed
+Complements existing coverage rather than repeating it: provider retry/classification
+and message sanitization live in test_groq_client.py; WebSocket malformed
 messages, reconnect replay, and disconnect survival live in test_ws.py; basic
 STT failure survival lives in test_stt_pipeline.py. This file covers the gaps
 those leave -- mid-stream failure, recovery *after* a failure, capture failing

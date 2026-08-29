@@ -15,24 +15,24 @@ def settings_client(client, monkeypatch):
 
 
 def test_get_settings_never_returns_the_key(settings_client, monkeypatch):
-    monkeypatch.setattr(settings, "gemini_api_key", "super-secret-value")
+    monkeypatch.setattr(settings, "groq_api_key", "super-secret-value")
 
     body = settings_client.get("/settings").json()
 
-    assert body["gemini_key_configured"] is True
+    assert body["groq_key_configured"] is True
     assert "super-secret-value" not in str(body)
-    assert "gemini_api_key" not in body
+    assert "groq_api_key" not in body
 
 
 def test_get_settings_reports_unconfigured_key(settings_client, monkeypatch):
-    monkeypatch.setattr(settings, "gemini_api_key", "")
-    assert settings_client.get("/settings").json()["gemini_key_configured"] is False
+    monkeypatch.setattr(settings, "groq_api_key", "")
+    assert settings_client.get("/settings").json()["groq_key_configured"] is False
 
 
 def test_get_settings_exposes_the_setup_fields(settings_client):
     body = settings_client.get("/settings").json()
     for field in (
-        "gemini_model", "embedding_model", "stt_model", "stt_device",
+        "groq_model", "embedding_model", "stt_model", "stt_device",
         "chunk_size", "chunk_overlap", "rag_top_k", "rag_min_similarity",
         "data_dir", "audio_capture_mic", "audio_capture_loopback", "audio_available",
     ):
@@ -49,8 +49,8 @@ def test_keys_cannot_be_set_through_the_generic_settings_update(settings_client)
     """Keys moved to PUT /providers/{name}/key, which is the only path that
     also persists them. Accepting them here too would give two ways to set a
     key with different persistence semantics."""
-    settings_client.put("/settings", json={"gemini_api_key": "SHOULD_BE_IGNORED_123"})
-    assert settings.gemini_api_key != "SHOULD_BE_IGNORED_123"
+    settings_client.put("/settings", json={"groq_api_key": "SHOULD_BE_IGNORED_123"})
+    assert settings.groq_api_key != "SHOULD_BE_IGNORED_123"
 
 
 def test_partial_update_leaves_other_fields_alone(settings_client):
@@ -95,20 +95,45 @@ def test_settings_never_returns_key_material(client):
         assert set(provider) & {"key", "api_key", "secret"} == set()
 
 
-def test_provider_status_lists_both_providers_in_priority_order(client):
+def test_groq_is_the_only_provider(client):
+    """Regression guard for the Gemini removal: a second provider reappearing
+    here means dead routing code has crept back in."""
     body = client.get("/settings").json()
-    names = [p["name"] for p in body["providers"]]
-    assert names == [n.strip() for n in body["provider_priority"].split(",")]
-    assert set(names) == {"groq", "gemini"}
+    assert [p["name"] for p in body["providers"]] == ["groq"]
 
 
-def test_an_unconfigured_provider_reports_unconfigured_not_missing(client):
+def test_an_unconfigured_provider_reports_unconfigured_not_missing(client, monkeypatch):
     """It must still appear, so Settings can explain *why* it is unusable
     rather than silently omitting it."""
-    body = client.get("/settings").json()
-    gemini = next(p for p in body["providers"] if p["name"] == "gemini")
-    assert gemini["configured"] is False
-    assert gemini["available"] is False
+    monkeypatch.setattr(settings, "groq_api_key", "")
+    groq = client.get("/settings").json()["providers"][0]
+    assert groq["configured"] is False
+
+
+def test_models_status_reports_an_explicit_lifecycle_state(settings_client):
+    """"Not downloaded" and "failed halfway" are different problems with
+    different fixes, so the UI is given a state rather than a boolean."""
+    body = settings_client.get("/models/status").json()
+    for entry in body:
+        assert entry["state"] in {
+            "not_downloaded", "downloading", "downloaded", "loading", "ready", "failed",
+        }
+        # The legacy boolean is derived from the state, so they cannot disagree.
+        assert entry["downloaded"] == (
+            entry["state"] in {"downloaded", "loading", "ready"}
+        )
+
+
+def test_a_blank_model_is_rejected_rather_than_saved(settings_client):
+    """A blank model would take the provider down on the next question with a
+    confusing error from Groq instead of a clear one from here."""
+    assert settings_client.put("/settings", json={"groq_model": "   "}).status_code == 400
+    assert settings_client.put("/settings", json={"groq_model": "two words"}).status_code == 400
+
+
+def test_a_valid_model_is_accepted_and_trimmed(settings_client):
+    body = settings_client.put("/settings", json={"groq_model": "  llama-3.3-70b-versatile "}).json()
+    assert body["groq_model"] == "llama-3.3-70b-versatile"
 
 
 def test_settings_report_that_changes_do_not_persist(client):

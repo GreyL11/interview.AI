@@ -107,9 +107,9 @@ fn resolve_command(app: &AppHandle) -> Result<(String, Vec<String>), String> {
     let exe: PathBuf = resource_dir
         .join("backend")
         .join(if cfg!(windows) {
-            "interview-coach-backend.exe"
+            "call-assistant-backend.exe"
         } else {
-            "interview-coach-backend"
+            "call-assistant-backend"
         });
 
     if !exe.exists() {
@@ -168,6 +168,8 @@ pub fn spawn(app: &AppHandle) -> Result<BackendProcess, String> {
         command.creation_flags(0x0800_0000);
     }
 
+    progress(app, "launching_engine", "Starting the local engine");
+
     let mut child = command
         .spawn()
         .map_err(|e| format!("failed to start backend ({program}): {e}"))?;
@@ -182,13 +184,16 @@ pub fn spawn(app: &AppHandle) -> Result<BackendProcess, String> {
     // show instead of "did not become ready in time".
     let stderr_tail = drain_stderr(&mut child);
 
-    progress(app, "starting_engine", "Starting local AI engine");
+    // The stages below are what the user reads while they wait. They are named
+    // after what is actually happening, and each one only appears once the
+    // previous step genuinely completed -- a stage that lies about progress is
+    // worse than no stage at all.
+    progress(app, "waiting_for_process", "Waiting for the local engine");
     let ready = wait_until_ready(&mut child, &stderr_tail)?;
 
-    // The readiness line is printed once uvicorn's socket accepts, but the
-    // shell's contract with the UI is the HTTP API -- so confirm the API really
-    // answers before declaring the backend up.
-    progress(app, "connecting", "Connecting to interview session");
+    // The readiness line is printed once uvicorn's socket accepts. That is not
+    // the same as the API being usable, so it is never treated as READY.
+    progress(app, "checking_health", "Checking the local engine");
     confirm_health(port, &token, &mut child, &stderr_tail)?;
 
     Ok(BackendProcess {
@@ -252,8 +257,26 @@ fn with_tail(message: String, tail: &StderrTail) -> String {
     }
 }
 
-/// Poll `/health` until it answers. The readiness line already said the socket
-/// is open; this proves the app behind it is actually serving.
+/// The origin the packaged WebView serves the frontend from on Windows.
+///
+/// Every request the UI makes is cross-origin to `127.0.0.1:<port>` and is
+/// therefore subject to CORS. Sending this header during the readiness check is
+/// the entire point of `confirm_health`: without it the check is a `curl`, and a
+/// `curl` cannot detect the failure this app actually shipped with.
+const WEBVIEW_ORIGIN: &str = "http://tauri.localhost";
+
+/// Prove the backend is usable *by the frontend*, not merely listening.
+///
+/// A running process, an open port and a 200 from `curl` were all true while
+/// the UI showed "Cannot reach the backend". Readiness here means all three of
+/// the things the UI depends on, in the same request it will make:
+///
+///   1. the token is accepted            (Authorization header)
+///   2. the origin is allowed            (Origin header -> CORS response header)
+///   3. the body is what the client expects
+///
+/// Anything less lets the shell declare READY for a backend the UI cannot
+/// actually talk to, which is the failure this whole path exists to prevent.
 fn confirm_health(
     port: u16,
     token: &str,
@@ -262,6 +285,10 @@ fn confirm_health(
 ) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{port}/health");
     let deadline = Instant::now() + HEALTH_TIMEOUT;
+    // Kept so a timeout can explain *how* the last attempt failed rather than
+    // just that time ran out.
+    let mut last_reason = String::from("no response yet");
+
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(with_tail(
@@ -269,22 +296,67 @@ fn confirm_health(
                 tail,
             ));
         }
-        let responded = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(2))
-            .call()
-            .is_ok();
-        if responded {
-            return Ok(());
+
+        match probe_health(&url, token) {
+            Ok(()) => return Ok(()),
+            Err(reason) => last_reason = reason,
         }
+
         if Instant::now() > deadline {
             return Err(with_tail(
-                "backend started but its API never answered".to_string(),
+                format!("the local engine started but is not answering: {last_reason}"),
                 tail,
             ));
         }
         std::thread::sleep(Duration::from_millis(150));
     }
+}
+
+/// One readiness attempt. `Err` carries a reason specific enough to act on.
+fn probe_health(url: &str, token: &str) -> Result<(), String> {
+    let response = ureq::get(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Origin", WEBVIEW_ORIGIN)
+        .timeout(Duration::from_secs(2))
+        .call();
+
+    let response = match response {
+        Ok(response) => response,
+        // ureq treats any 4xx/5xx as an error. Distinguish them: a 401 is a
+        // token mismatch we can name, while a transport error is just "not up
+        // yet" and will be retried.
+        Err(ureq::Error::Status(401, _)) => {
+            return Err("it rejected the shell's access token".into())
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(format!("it returned HTTP {code} from /health"))
+        }
+        // A wildcard rather than naming `Transport`: this arm exists to keep the
+        // match total whatever the http crate adds to its error enum, since a
+        // readiness probe has nothing useful to do differently per transport
+        // failure -- it retries either way.
+        Err(other) => return Err(other.to_string()),
+    };
+
+    // The browser discards a response without this header, so a backend that
+    // omits it is unusable by the UI no matter what status it returned.
+    if response.header("access-control-allow-origin").is_none() {
+        return Err(
+            "it answered but refused the app's own origin, so the interface \
+             cannot read the reply"
+                .into(),
+        );
+    }
+
+    // Read the body rather than trusting the status: a proxy or a stale process
+    // on a recycled port can return 200 for something that is not this backend.
+    let body = response
+        .into_string()
+        .map_err(|e| format!("its reply could not be read: {e}"))?;
+    if !body.contains("healthy") {
+        return Err("something other than the local engine answered on its port".into());
+    }
+    Ok(())
 }
 
 /// Block until the backend prints its readiness line.
@@ -469,5 +541,82 @@ mod job_object {
                 log::warn!("could not assign backend to job object");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener as StdTcpListener;
+
+    #[test]
+    fn free_port_returns_a_port_that_can_actually_be_bound() {
+        let port = free_port().expect("should find a free port");
+        assert!(port > 0);
+        // The port is released before being handed back, so the backend must be
+        // able to take it. If this fails, the release is not happening.
+        StdTcpListener::bind(("127.0.0.1", port)).expect("port should be bindable");
+    }
+
+    #[test]
+    fn free_port_does_not_hand_out_the_same_port_twice_in_a_row() {
+        let (a, b) = (free_port().unwrap(), free_port().unwrap());
+        // Not a guarantee the OS makes, but a regression here would mean the
+        // listener is being leaked rather than dropped.
+        assert!(a != b || StdTcpListener::bind(("127.0.0.1", a)).is_ok());
+    }
+
+    #[test]
+    fn a_minted_token_is_long_and_url_safe() {
+        let token = mint_token();
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn minted_tokens_differ_between_launches() {
+        assert_ne!(mint_token(), mint_token());
+    }
+
+    #[test]
+    fn the_readiness_line_is_parsed() {
+        let line = r#"{"ready":true,"port":8123,"pid":4242,"logs_dir":"C:\logs"}"#;
+        let parsed: ReadyLine = serde_json::from_str(line).expect("should parse");
+        assert!(parsed.ready);
+        assert_eq!(parsed.pid, Some(4242));
+        assert_eq!(parsed.logs_dir.as_deref(), Some("C:\logs"));
+    }
+
+    #[test]
+    fn a_readiness_line_without_the_optional_fields_still_parses() {
+        // Older backends, and any future one that drops a field, must not make
+        // the shell hang waiting for a line it already received.
+        let parsed: ReadyLine =
+            serde_json::from_str(r#"{"ready":true,"port":1}"#).expect("should parse");
+        assert!(parsed.ready);
+        assert_eq!(parsed.pid, None);
+    }
+
+    #[test]
+    fn ordinary_log_output_is_not_mistaken_for_readiness() {
+        assert!(serde_json::from_str::<ReadyLine>("INFO starting up").is_err());
+        assert!(serde_json::from_str::<ReadyLine>("{}").is_err());
+    }
+
+    #[test]
+    fn a_probe_against_a_closed_port_fails_rather_than_hanging() {
+        // Bind and drop, so the port is almost certainly closed.
+        let port = free_port().unwrap();
+        let error = probe_health(&format!("http://127.0.0.1:{port}/health"), "t")
+            .expect_err("a closed port must not report healthy");
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn the_webview_origin_is_the_one_the_backend_allows() {
+        // Kept in lockstep with the backend's CORS regex and its test suite. If
+        // this constant drifts, every request from the packaged UI is rejected
+        // while curl keeps working -- the exact failure this app shipped with.
+        assert_eq!(WEBVIEW_ORIGIN, "http://tauri.localhost");
     }
 }

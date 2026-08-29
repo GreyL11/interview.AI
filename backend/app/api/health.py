@@ -42,7 +42,7 @@ async def ready() -> dict[str, object]:
 
     return {
         "status": "ready",
-        "gemini_configured": bool(settings.gemini_api_key),
+        "groq_configured": bool(settings.groq_api_key),
         "audio_available": audio_available(),
         "data_dir": str(settings.data_dir),
     }

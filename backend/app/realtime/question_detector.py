@@ -23,7 +23,7 @@ logger = get_logger(__name__)
 #: split across a couple of utterances, not a transcript history.
 _MAX_CONTEXT_SEGMENTS = 3
 #: Hard cap on how much buffered context can be prepended, so one rambling
-#: rejected utterance can't balloon the eventual Gemini prompt.
+#: rejected utterance can't balloon the eventual LLM prompt.
 _MAX_CONTEXT_CHARS = 220
 
 _WORD = re.compile(r"[A-Za-z']+")

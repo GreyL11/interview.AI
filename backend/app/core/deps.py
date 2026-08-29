@@ -11,7 +11,7 @@ from app.documents.service import DocumentService
 from app.embeddings.base import EmbeddingProvider
 from app.embeddings.onnx_embedder import OnnxEmbedder
 from app.llm.base import LLMClient
-from app.llm.router import build_router
+from app.llm.groq_client import build_llm_client
 from app.memory.sqlite_memory import SqliteSessionMemory
 from app.memory.summarizer import SessionSummarizer
 from app.retrieval.base import Retriever
@@ -90,8 +90,8 @@ def get_session_memory() -> SqliteSessionMemory:
 
 @lru_cache
 def get_llm_client() -> LLMClient:
-    """The router, not a single provider. Callers still see one LLMClient."""
-    return build_router()
+    """The one cloud provider, behind the shared LLMClient interface."""
+    return build_llm_client()
 
 
 @lru_cache

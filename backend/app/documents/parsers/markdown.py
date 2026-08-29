@@ -3,6 +3,7 @@ from pathlib import Path
 
 from app.documents.parsers.base import (
     DocumentParser,
+    ProgressCallback,
     ensure_text,
     normalize_whitespace,
 )
@@ -32,7 +33,15 @@ class MarkdownParser(DocumentParser):
     def supports(self, file_type: FileType) -> bool:
         return file_type == FileType.MARKDOWN
 
-    def parse(self, file_path: Path, document_id: str) -> NormalizedDocument:
+    def parse(
+        self,
+        file_path: Path,
+        document_id: str,
+        progress: ProgressCallback | None = None,
+    ) -> NormalizedDocument:
+        # `progress` is unused: these formats parse in milliseconds, so
+        # there is nothing worth narrating. It is accepted to keep one
+        # parser signature across the registry.
         raw = read_text_file(file_path)
 
         # Code fences are content, not prose: leave anything inside them alone.

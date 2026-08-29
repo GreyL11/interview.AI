@@ -15,38 +15,97 @@ import type {
 } from "./contracts.ts";
 import { backendRuntime } from "./runtime.ts";
 
+/**
+ * Why a request failed, in the terms a user could act on.
+ *
+ * `fetch` collapses several genuinely different problems into one opaque
+ * "Failed to fetch" — the backend being down, a CORS rejection, and a DNS-level
+ * failure are indistinguishable from the promise alone. These names are what
+ * the UI switches on so it can say something better than "request failed".
+ */
+export type ApiFailure =
+  | "unconfigured" // the shell has not told us where the backend is
+  | "unreachable" // nothing answered on the port
+  | "unauthorized" // the token was rejected
+  | "server" // the backend answered, with a failure
+  | "provider" // the backend reached Groq and Groq failed
+  | "unknown";
+
 export class ApiError extends Error {
   readonly status: number;
+  readonly failure: ApiFailure;
+  /** Technical context for the log. Never shown to the user as-is. */
+  readonly diagnostic: string | undefined;
 
-  constructor(status: number, message: string) {
+  constructor(
+    status: number,
+    message: string,
+    failure: ApiFailure = "unknown",
+    diagnostic?: string,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.failure = failure;
+    this.diagnostic = diagnostic;
   }
+}
+
+function failureForStatus(status: number): ApiFailure {
+  if (status === 401 || status === 403) return "unauthorized";
+  // 502 is what the backend returns when the LLM provider itself failed, and
+  // the detail it carries is already a user-facing sentence from the provider
+  // layer — so it is passed through rather than replaced.
+  if (status === 502) return "provider";
+  if (status >= 500) return "server";
+  return "server";
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const runtime = backendRuntime();
+
+  if (runtime.kind === "unavailable") {
+    // Deliberately not a guessed dev-port request: that produced a confident
+    // error about :8000 while the real backend was healthy elsewhere.
+    throw new ApiError(
+      0,
+      runtime.reason,
+      "unconfigured",
+      `backend runtime unavailable for ${path}`,
+    );
+  }
+
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${runtime.token}`);
 
   let response: Response;
   try {
     response = await fetch(`${runtime.baseUrl}${path}`, { ...init, headers });
-    } catch (cause) {
-      const detail =
-        cause instanceof Error
-          ? `${cause.name}: ${cause.message}`
-          : String(cause);
-
-      throw new ApiError(
-        0,
-        `Cannot reach the backend at ${runtime.baseUrl}. ${detail}`,
-      );
-    }
+  } catch (cause) {
+    // `fetch` rejects identically for a refused connection and a blocked
+    // cross-origin request, so this cannot honestly distinguish them. It says
+    // the thing that is true of both and keeps the technical text for the log.
+    const diagnostic = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    console.error(`api ${path} failed:`, diagnostic);
+    throw new ApiError(
+      0,
+      "Could not reach the local engine.",
+      "unreachable",
+      `${runtime.baseUrl}${path} — ${diagnostic}`,
+    );
+  }
 
   if (!response.ok) {
-    throw new ApiError(response.status, await errorDetail(response));
+    const detail = await errorDetail(response);
+    const failure = failureForStatus(response.status);
+    throw new ApiError(
+      response.status,
+      failure === "unauthorized"
+        ? "The local engine rejected this app's access token. Restart Call Assistant."
+        : detail,
+      failure,
+      `${path} -> ${response.status}`,
+    );
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
@@ -56,9 +115,12 @@ async function errorDetail(response: Response): Promise<string> {
   try {
     const body = (await response.json()) as { detail?: unknown };
     if (typeof body.detail === "string") return body.detail;
-    return JSON.stringify(body.detail ?? body);
+    // An object detail is a validation error shape: useful in the log, but not
+    // a sentence, so the user gets a plain one instead of raw JSON.
+    console.error("api error detail:", body.detail ?? body);
+    return `The local engine reported an error (${response.status}).`;
   } catch {
-    return `${response.status} ${response.statusText}`;
+    return `The local engine reported an error (${response.status} ${response.statusText}).`;
   }
 }
 

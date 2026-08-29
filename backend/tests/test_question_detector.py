@@ -318,7 +318,7 @@ def test_garbage_fragments_are_not_remembered_as_context():
 
 # --------------------------------------------------------------- stability
 # "Can you explain what happens when" is grammatically a question (starts
-# with "can you") but trails off mid-clause. Firing on it wastes a Gemini
+# with "can you") but trails off mid-clause. Firing on it wastes a provider
 # call on a fragment the interviewer was still in the middle of saying.
 
 

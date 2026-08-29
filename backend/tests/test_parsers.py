@@ -55,10 +55,18 @@ def test_pdf_parser(parsers, tmp_path):
     assert doc.metadata["page_count"] == 1
 
 
-def test_pdf_without_text_layer_fails_clearly(parsers, tmp_path):
-    path = write_pdf(tmp_path / "scanned.pdf", [])
-    with pytest.raises(ParseError, match="No extractable text"):
+def test_a_pdf_with_nothing_readable_fails_with_a_next_step(parsers, tmp_path):
+    """A PDF with no text layer is now sent to OCR first, so reaching this error
+    means both reads found nothing. The message has to offer a next step rather
+    than the old flat "not supported" -- see tests/test_pdf_ocr.py for the
+    scanned-document path this used to block."""
+    path = write_pdf(tmp_path / "blank.pdf", [])
+    with pytest.raises(ParseError) as caught:
         parsers.parse(path, FileType.PDF, "doc-1")
+
+    message = str(caught.value)
+    assert "blank.pdf" in message
+    assert "not supported" not in message
 
 
 def test_docx_parser_includes_tables(parsers, tmp_path):

@@ -114,8 +114,24 @@ class DocumentService:
             if not path.exists():
                 raise DocumentError(f"Stored file is missing: {path}")
 
+            # On a worker thread, not the event loop. Parsing a scanned PDF can
+            # take minutes of OCR, and doing that inline would freeze every
+            # other request -- including the /health poll the desktop shell uses
+            # to decide the backend is still alive.
+            #
+            # The callback therefore also runs on that worker thread, which is
+            # why it writes straight to SQLite (serialised by the database's own
+            # write lock) rather than touching the event loop from off it.
+            def report(message: str) -> None:
+                try:
+                    self._documents.update_progress(document_id, message)
+                except Exception:
+                    # Progress is a nicety. Losing it must never fail an ingest
+                    # that is otherwise succeeding.
+                    logger.debug("progress_update_failed id=%s", document_id)
+
             normalized = await asyncio.to_thread(
-                self._parsers.parse, path, document.file_type, document_id
+                self._parsers.parse, path, document.file_type, document_id, report
             )
             chunks = self._chunker.chunk(
                 normalized,

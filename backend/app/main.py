@@ -18,6 +18,14 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Before any directory is created: the migration only runs into a location
+    # that is still empty, and creating them first would defeat it.
+    from app.core.config import migrate_legacy_data_dir
+
+    moved = migrate_legacy_data_dir()
+    if moved is not None:
+        logger.info("adopted_data_dir_from_previous_name path=%s", moved)
+
     for directory in (settings.documents_dir, settings.faiss_path.parent, settings.db_path.parent):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -57,7 +65,7 @@ async def lifespan(app: FastAPI):
     await session_manager.close_all()
 
 
-app = FastAPI(title="Interview Coach API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Call Assistant API", version="0.3.0", lifespan=lifespan)
 
 # Order matters, and Starlette applies these outermost-last: TokenMiddleware is
 # added first so it runs *inside* CORS. If it ran outside, its 401 would carry

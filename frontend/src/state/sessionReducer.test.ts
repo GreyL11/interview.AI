@@ -251,10 +251,14 @@ test("answer.error retires the turn as failed", () => {
   const state = apply(
     fresh(),
     ev("question.detected", { question: "Q?" }, 1),
-    ev("answer.error", { code: "LLMError", message: "GEMINI_API_KEY is not configured" }, 1),
+    ev(
+      "answer.error",
+      { code: "LLMError", message: "No Groq API key is configured." },
+      1,
+    ),
   );
   assert.equal(state.current?.phase, "failed");
-  assert.match(state.current?.errorMessage ?? "", /GEMINI_API_KEY/);
+  assert.match(state.current?.errorMessage ?? "", /Groq API key/);
   assert.equal(state.history.length, 1);
 });
 

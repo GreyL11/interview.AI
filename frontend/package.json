@@ -1,5 +1,5 @@
 {
-  "name": "interview-coach",
+  "name": "call-assistant",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -12,7 +12,7 @@
     "tauri": "tauri",
     "tauri:build": "tauri build",
     "desktop:build": "npm run backend:package && npm run build && npm run tauri:build",
-    "backend:package": "cd ../backend && python -m PyInstaller --noconfirm packaging/interview-coach-backend.spec"
+    "backend:package": "cd ../backend && ../venv/Scripts/python.exe -m PyInstaller --noconfirm packaging/call-assistant-backend.spec"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

@@ -27,6 +27,7 @@ def _to_document(row: sqlite3.Row) -> Document:
         status=DocumentStatus(row["status"]),
         error=row["error"],
         chunk_count=row["chunk_count"],
+        progress=row["progress"],
     )
 
 
@@ -90,15 +91,31 @@ class DocumentRepository:
         chunk_count: int | None = None,
     ) -> None:
         ingested_at = utcnow().isoformat() if status == DocumentStatus.READY else None
+        # Any status change ends the in-flight phase, so progress is cleared
+        # here rather than left behind to describe work that already finished.
         with self._db.write() as conn:
             conn.execute(
                 """UPDATE documents
                    SET status = ?,
                        error = ?,
                        chunk_count = COALESCE(?, chunk_count),
-                       ingested_at = COALESCE(?, ingested_at)
+                       ingested_at = COALESCE(?, ingested_at),
+                       progress = NULL
                    WHERE document_id = ?""",
                 (status.value, error, chunk_count, ingested_at, document_id),
+            )
+
+    def update_progress(self, document_id: str, progress: str | None) -> None:
+        """Record what a long-running ingest is doing.
+
+        Deliberately narrow: it touches only this column, so a progress update
+        arriving from a worker thread can never disturb the status a completing
+        ingest has just written.
+        """
+        with self._db.write() as conn:
+            conn.execute(
+                "UPDATE documents SET progress = ? WHERE document_id = ?",
+                (progress, document_id),
             )
 
     def delete(self, document_id: str) -> bool:

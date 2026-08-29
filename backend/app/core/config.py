@@ -1,57 +1,97 @@
+import logging
+import os
+import sys
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+#: Folder name under %LOCALAPPDATA% used when the desktop shell did not pass
+#: --data-dir. Matches the Tauri bundle identifier so both processes agree on
+#: one location even if they disagree about who chose it.
+APP_IDENTIFIER = "com.callassistant.desktop"
+
+#: Identifiers this app shipped under before it was renamed. The desktop
+#: shell derives the per-user data directory from the bundle identifier, so
+#: changing the name points the app at an empty folder and every existing
+#: user silently loses their documents, session history and ~350MB of
+#: downloaded models. `migrate_legacy_data_dir` moves the old one across.
+LEGACY_APP_IDENTIFIERS = ("com.interviewcoach.desktop",)
+
+
+def default_data_dir() -> Path:
+    """Where mutable state goes when nothing overrode it.
+
+    A frozen build must never write beside its executable: a per-user NSIS
+    install can land somewhere read-only, and `./data` would then resolve
+    against whatever working directory Explorer happened to hand the process --
+    in practice `C:\\Windows\\System32`. The desktop shell normally passes
+    --data-dir; this is the fallback for when resolving that path failed, and
+    for anyone running the frozen exe directly.
+
+    Source checkouts keep the old `./data` so a developer's tree stays
+    self-contained.
+    """
+    if not getattr(sys, "frozen", False):
+        return Path("./data")
+
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if base:
+        return Path(base) / APP_IDENTIFIER
+    return Path.home() / ".call-assistant"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # `.env` is a *development* convenience and is resolved relative to the
+    # working directory. A frozen build inherits whatever directory it was
+    # launched from -- the install folder, the user's desktop, System32 -- so
+    # honouring `.env` there means the app's configuration depends on where its
+    # icon happened to be double-clicked from. Worse, it lets an unrelated
+    # `.env` sitting in that directory silently supply an API key.
+    #
+    # The packaged app is configured by its command line (from the desktop
+    # shell) and the OS credential store, both of which are unambiguous.
+    model_config = SettingsConfigDict(
+        env_file=None if getattr(sys, "frozen", False) else ".env",
+        extra="ignore",
+    )
 
-    # LLM
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
-    gemini_timeout_seconds: float = 30.0
-    gemini_fallback_models: str = ""
-    gemini_fallback_model: str = ""
-    gemini_retry_max_attempts: int = 3
-    gemini_retry_initial_delay_seconds: float = 0.5
-    gemini_retry_max_delay_seconds: float = 4.0
-    gemini_enabled: bool = True
-
+    # --- LLM (Groq is the only cloud provider) ---
     groq_api_key: str = ""
+    #: The single place a model is named. Everything else reads
+    #: `settings.groq_model`, so changing it here (or via PUT /settings) is the
+    #: whole change. Validated by app.llm.groq_client.validate_model.
     groq_model: str = "openai/gpt-oss-120b"
     groq_timeout_seconds: float = 30.0
-    groq_enabled: bool = True
-
-    # Provider routing. Order is the configured preference; a provider is
-    # only skipped when it is in cooldown or has no key. Groq leads by
-    # default only because Gemini's free tier is the one currently producing
-    # 429s here -- it is not a measured latency claim. Flip the order (or set
-    # a single name) to change it, no code change needed.
-    llm_provider_priority: str = "groq,gemini"
-    #: Cooldown after a 429 or repeated failures, when the provider sends no
-    #: Retry-After of its own.
-    llm_provider_cooldown_seconds: float = 30.0
-    #: Ceiling on a provider-supplied Retry-After, so a hostile or buggy
-    #: header can't park a provider for the rest of the session.
-    llm_provider_max_cooldown_seconds: float = 120.0
-    #: A bad key won't recover in 30s; back off harder before retrying it.
-    llm_provider_auth_cooldown_seconds: float = 300.0
-    #: Consecutive non-rate-limit failures before a provider is cooled down.
-    llm_provider_failure_threshold: int = 3
-    #: Allow a consistently faster provider to outrank configured priority.
-    llm_latency_aware_routing: bool = True
-    #: How much faster the challenger must be to displace the preferred
-    #: provider (0.8 = at least 20% faster on median first-token latency).
-    #: A margin, not a tie-break, so routing doesn't oscillate.
-    llm_latency_routing_margin: float = 0.8
+    #: Passed to the Groq SDK, which retries only connection errors, 408, 429
+    #: and 5xx. Deterministic failures (bad key, unknown model) are never
+    #: retried by the SDK and must never be retried here either.
+    groq_max_retries: int = 2
 
     # Local storage
-    data_dir: Path = Path("./data")
+    data_dir: Path = default_data_dir()
 
     # Embeddings (ONNX backend — no torch)
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimension: int = 384
     embedding_max_tokens: int = 256
+
+    # Document OCR (scanned PDFs). Runs only on pages native extraction could
+    # not read -- see app.documents.parsers.pdf.
+    #: Below this many characters, a page is treated as a picture of text rather
+    #: than text. Not zero: scanners stamp headers and page numbers onto scanned
+    #: pages, so an emptiness test would pass a page that has no real content.
+    ocr_min_chars_per_page: int = 60
+    #: Rasterisation resolution. Below ~200 recognition accuracy on body text
+    #: drops sharply; above ~300 the extra pixels cost time without helping.
+    ocr_render_dpi: int = 220
+    #: Ceiling on pages OCR'd per document. At roughly a second a page, this
+    #: bounds one upload's hold on the ingest lock to a few minutes.
+    ocr_max_pages: int = 60
+    #: Cores OCR may use. 0 picks a quarter of the machine, capped at four.
+    #: Bounded on purpose: ingestion can overlap a live interview, and OCR
+    #: saturating every core would push Whisper inference -- which is on the
+    #: critical path to an answer -- behind background document work.
+    ocr_threads: int = 0
 
     # Chunking
     chunk_size: int = 800
@@ -159,3 +199,72 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+#: Created as a side effect of the first log line, before anything the user
+#: cares about exists. Treating it as "in use" would block the migration on
+#: every install, which is exactly what it did the first time.
+_INCIDENTAL_ENTRIES = {"logs"}
+
+
+def _significant(directory: Path):
+    """Entries that mean this directory is genuinely in use."""
+    return [
+        entry for entry in directory.iterdir()
+        if entry.name not in _INCIDENTAL_ENTRIES or any(entry.iterdir())
+    ]
+
+
+def migrate_legacy_data_dir(target: Path | None = None) -> Path | None:
+    """Adopt the data directory this app used under its previous name.
+
+    The desktop shell derives `--data-dir` from the Tauri bundle identifier, so
+    renaming the product renames the folder -- and an upgraded install would
+    start against an empty one. The user would see no documents, no history, and
+    a re-download of both models, with the originals still on disk under a name
+    they have no reason to look for.
+
+    Deliberately conservative. The move happens only when the new location does
+    not exist or is empty, so it can never overwrite data the renamed app has
+    already written, and it is a no-op on every start after the first. Returns
+    the directory moved from, or None.
+    """
+    import shutil
+
+    target = target or settings.data_dir
+    if target.exists() and any(_significant(target)):
+        return None  # already in use; never merge into live data
+
+    for legacy_name in LEGACY_APP_IDENTIFIERS:
+        legacy = target.parent / legacy_name
+        if legacy == target or not legacy.is_dir():
+            continue
+        if not any(legacy.iterdir()):
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.move(str(legacy), str(target))
+            else:
+                # An empty `logs/` is already here, so the directory itself
+                # cannot be moved onto it. Move the contents instead.
+                for entry in list(legacy.iterdir()):
+                    destination = target / entry.name
+                    if destination.exists():
+                        continue  # never overwrite what is already there
+                    shutil.move(str(entry), str(destination))
+                if not any(legacy.iterdir()):
+                    legacy.rmdir()
+        except OSError:
+            # A locked file or a cross-volume failure. Losing the migration is
+            # recoverable (the old folder is untouched); crashing startup over
+            # it is not.
+            logging.getLogger(__name__).warning(
+                "data_dir_migration_failed from=%s to=%s", legacy, target
+            )
+            return None
+        logging.getLogger(__name__).info(
+            "data_dir_migrated from=%s to=%s", legacy, target
+        )
+        return legacy
+    return None

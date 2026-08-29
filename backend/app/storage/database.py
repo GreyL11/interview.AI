@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS documents (
     ingested_at    TEXT,
     status         TEXT NOT NULL,
     error          TEXT,
-    chunk_count    INTEGER NOT NULL DEFAULT 0
+    chunk_count    INTEGER NOT NULL DEFAULT 0,
+    progress       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -101,7 +102,16 @@ CREATE INDEX IF NOT EXISTS idx_transcripts_sess ON transcripts(session_id, is_fi
 CREATE INDEX IF NOT EXISTS idx_hits_turn        ON retrieval_hits(turn_id);
 """
 
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
+
+#: Columns added after the first release, applied to databases that predate
+#: them. SQLite has no "ADD COLUMN IF NOT EXISTS", and an existing install must
+#: not be recreated -- it holds the user's documents and session history.
+_ADDED_COLUMNS = {
+    # v3: what a slow ingest is currently doing, so the UI can say "reading
+    # scanned page 3 of 12" instead of an unexplained spinner.
+    "documents": [("progress", "TEXT")],
+}
 
 
 class Database:
@@ -128,12 +138,35 @@ class Database:
     def _init_schema(self) -> None:
         conn = self.connect()
         with _write_lock, conn:
+            # CREATE TABLE IF NOT EXISTS, so this is a no-op on an existing
+            # database and creates a current-shaped one from scratch otherwise.
             conn.executescript(SCHEMA)
+            self._add_missing_columns(conn)
             row = conn.execute("SELECT version FROM schema_version").fetchone()
             if row is None:
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (CURRENT_VERSION,))
+            else:
+                conn.execute("UPDATE schema_version SET version = ?", (CURRENT_VERSION,))
             if conn.execute("SELECT COUNT(*) AS n FROM vector_seq").fetchone()["n"] == 0:
                 conn.execute("INSERT INTO vector_seq (next_id) VALUES (1)")
+
+    @staticmethod
+    def _add_missing_columns(conn: sqlite3.Connection) -> None:
+        """Bring an older database up to the current shape, in place.
+
+        Driven off the live table info rather than the recorded version number,
+        so it is idempotent and stays correct even if a database was created by
+        a build whose version counter disagrees. Only ever *adds* nullable
+        columns -- nothing here can destroy a user's data.
+        """
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            for name, declaration in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                    logger.info("schema_column_added table=%s column=%s", table, name)
 
     def write(self):
         """Context manager for a serialised write transaction."""

@@ -64,6 +64,10 @@ class Document(BaseModel):
     status: DocumentStatus = DocumentStatus.UPLOADED
     error: str | None = None
     chunk_count: int = 0
+    #: What a slow ingest is currently doing, as a sentence for the user
+    #: ("Reading scanned page 3 of 12..."). Only set while PROCESSING; cleared
+    #: on the way to READY or FAILED, where `error` carries the outcome.
+    progress: str | None = None
 
 
 class NormalizedDocument(BaseModel):

@@ -46,6 +46,9 @@ export interface DocumentRecord {
   status: DocumentStatus;
   error: string | null;
   chunk_count: number;
+  /** What a slow ingest is currently doing ("Reading scanned page 3 of 12..."),
+   * or null. Only set while PROCESSING. */
+  progress: string | null;
 }
 
 export interface UploadResponse {
@@ -190,18 +193,28 @@ export interface SessionDetail {
 
 // ---------------------------------------------------------------- settings
 
-/** One LLM provider as Settings sees it. No key material, by design. */
+/** How a provider request failed, as classified by the backend. Mirrors
+ * `LLMErrorKind`. Never carries the provider's own error text. */
+export type ProviderErrorKind =
+  | "not_configured"
+  | "auth"
+  | "model_unavailable"
+  | "rate_limit"
+  | "timeout"
+  | "network"
+  | "server"
+  | "malformed"
+  | "unknown";
+
+/** The cloud LLM provider as Settings sees it. No key material, by design. */
 export interface ProviderStatus {
   name: string;
   model: string;
   configured: boolean;
-  enabled: boolean;
-  /** Wired into the router this launch. */
+  /** Wired into the running engine this launch. */
   active: boolean;
-  available: boolean;
-  cooling_down: boolean;
-  cooldown_remaining_seconds: number | null;
-  role: string | null;
+  /** How the last request failed, or null if the last one succeeded. */
+  last_error_kind: ProviderErrorKind | null;
 }
 
 /** Result of setting or removing a provider key. Carries no key material and
@@ -217,14 +230,13 @@ export interface ProviderKeyResult {
 
 export interface SettingsView {
   providers: ProviderStatus[];
-  provider_priority: string;
   /** Whether a saved key would actually survive a restart on this machine. */
   secure_storage_available: boolean;
   /** False today: changes apply to the running engine but are not written
    * back to .env. Settings says so rather than implying they survive. */
   settings_persist: boolean;
-  gemini_key_configured: boolean;
-  gemini_model: string;
+  groq_key_configured: boolean;
+  groq_model: string;
   embedding_model: string;
   stt_model: string;
   stt_device: string;
@@ -242,7 +254,6 @@ export interface SettingsView {
 /** Non-secret settings only. Keys go through setProviderKey/removeProviderKey,
  * which is the single path that also persists them. */
 export interface SettingsUpdate {
-  gemini_model?: string;
   groq_model?: string;
   stt_model?: string;
   stt_device?: string;
@@ -260,11 +271,28 @@ export interface AudioDevice {
   is_default: boolean;
 }
 
+/** Where a local model is in its download lifecycle. Mirrors the backend's
+ * `app.models.status`. */
+export const MODEL_STATES = [
+  "not_downloaded",
+  "downloading",
+  "downloaded",
+  "loading",
+  "ready",
+  "failed",
+] as const;
+export type ModelState = (typeof MODEL_STATES)[number];
+
 export interface ModelStatus {
   name: string;
   kind: string;
+  state: ModelState;
+  /** Derived from `state` by the backend. Kept because it is what older code
+   * read; `state` is the field to render. */
   downloaded: boolean;
   path: string;
+  /** Present when `state` is "failed": what went wrong and what to do. */
+  detail: string | null;
 }
 
 // ------------------------------------------------------------ ws: server->client

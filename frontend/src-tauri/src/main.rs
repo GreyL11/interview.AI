@@ -3,6 +3,7 @@
 
 mod backend;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -36,7 +37,7 @@ impl StartupState {
         Self {
             status: "starting".into(),
             stage: "launching".into(),
-            label: "Opening Interview Coach".into(),
+            label: "Opening Call Assistant".into(),
             detail: None,
             logs_dir: None,
         }
@@ -115,6 +116,27 @@ fn open_data_folder(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Excludes the window from anything capturing the screen — Meet/Zoom/Teams
+/// screen-share, OBS, etc. The window keeps rendering normally on the rep's
+/// own display; only the captured frame omits it, with no placeholder box.
+/// Windows-only: there is no equivalent OS API on macOS/Linux.
+#[cfg(windows)]
+fn hide_from_screen_capture(window: &tauri::WebviewWindow) {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+
+    match window.hwnd() {
+        Ok(hwnd) => {
+            if let Err(e) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
+                log::warn!("failed to exclude window from screen capture: {e}");
+            }
+        }
+        Err(e) => log::warn!("could not get window handle to exclude from capture: {e}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_from_screen_capture(_window: &tauri::WebviewWindow) {}
+
 /// Start (or restart) the backend and publish the outcome.
 fn start_backend(app: &tauri::AppHandle) {
     let publish = |state: StartupState| {
@@ -129,7 +151,7 @@ fn start_backend(app: &tauri::AppHandle) {
     publish(StartupState {
         status: "starting".into(),
         stage: "launching".into(),
-        label: "Opening Interview Coach".into(),
+        label: "Opening Call Assistant".into(),
         detail: None,
         logs_dir: None,
     });
@@ -141,20 +163,42 @@ fn start_backend(app: &tauri::AppHandle) {
                 token: process.handle.token.clone(),
             };
             let logs_dir = process.handle.logs_dir.clone();
-            // Injected before the page's own fetches run, so the very first
-            // request already knows the port and token.
-            if let Some(window) = app.get_webview_window("main") {
-                let script = format!(
-                    "window.__BACKEND__ = {{ port: {}, token: {:?} }};",
-                    info.port, info.token
-                );
-                let _ = window.eval(&script);
-            }
+
+            // Order matters. The state has to be published *before* READY is
+            // emitted, because `backend_info` reads it and the UI calls that
+            // the instant it sees READY. Publishing after would leave a window
+            // where the UI is told to go and has nowhere to go to.
             if let Some(slot) = app.try_state::<BackendState>() {
                 if let Ok(mut guard) = slot.0.lock() {
                     *guard = Some(process);
                 }
             }
+
+            publish(StartupState {
+                status: "starting".into(),
+                stage: "configuring_runtime".into(),
+                label: "Preparing the interface".into(),
+                detail: None,
+                logs_dir: logs_dir.clone(),
+            });
+
+            // Convenience, not the contract. `eval` reaches only the page that
+            // is loaded right now, so it does not survive a webview reload and
+            // races a page that has not finished loading. The frontend's
+            // `ensureBackendRuntime()` asks `backend_info` for the same values
+            // and is what actually guarantees they are known before the first
+            // request.
+            if let Some(window) = app.get_webview_window("main") {
+                let script = format!(
+                    "window.__BACKEND__ = {{ port: {}, token: {} }};",
+                    info.port,
+                    // serde_json, not {:?}: Rust's debug escaping is not
+                    // JavaScript's, and the token is injected as source.
+                    serde_json::to_string(&info.token).unwrap_or_else(|_| "\"\"".into()),
+                );
+                let _ = window.eval(&script);
+            }
+
             publish(StartupState {
                 status: "ready".into(),
                 stage: "ready".into(),
@@ -168,7 +212,7 @@ fn start_backend(app: &tauri::AppHandle) {
             publish(StartupState {
                 status: "failed".into(),
                 stage: "failed".into(),
-                label: "Something prevented Interview Coach from starting".into(),
+                label: "Something prevented Call Assistant from starting".into(),
                 detail: Some(message),
                 logs_dir: None,
             });
@@ -176,10 +220,28 @@ fn start_backend(app: &tauri::AppHandle) {
     }
 }
 
+/// True while a start attempt is in flight.
+///
+/// Startup takes up to 90 seconds, and the Retry button is on screen for all of
+/// it. Without this, an impatient second click spawns a second backend that
+/// fights the first over the SQLite database and the audio device -- and the
+/// losing one is never shut down, because only the last handle is stored.
+static STARTING: AtomicBool = AtomicBool::new(false);
+
 /// Retry after a failed start. Tears down any half-started process first so a
 /// second attempt cannot leave the first one orphaned.
 #[tauri::command]
 fn retry_backend(app: tauri::AppHandle) {
+    // compare_exchange, not load-then-store: two clicks can land on two threads
+    // and both would see `false`.
+    if STARTING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        log::info!("retry ignored: a start attempt is already running");
+        return;
+    }
+
     if let Some(slot) = app.try_state::<BackendState>() {
         if let Ok(mut guard) = slot.0.lock() {
             if let Some(process) = guard.as_mut() {
@@ -191,7 +253,10 @@ fn retry_backend(app: tauri::AppHandle) {
     let handle = app.clone();
     // Off the UI thread: spawn() blocks until the backend is ready, and
     // blocking here would freeze the window it is supposed to be updating.
-    std::thread::spawn(move || start_backend(&handle));
+    std::thread::spawn(move || {
+        start_backend(&handle);
+        STARTING.store(false, Ordering::SeqCst);
+    });
 }
 
 fn shutdown_backend(app: &tauri::AppHandle) {
@@ -230,9 +295,19 @@ fn main() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+
+            if let Some(window) = app.get_webview_window("main") {
+                hide_from_screen_capture(&window);
+            }
+            // Claimed here, not inside start_backend, so a Retry click during
+            // the first boot is refused rather than racing it.
+            STARTING.store(true, Ordering::SeqCst);
             // Off the setup thread so the window paints the startup screen
             // immediately instead of appearing frozen for the whole boot.
-            std::thread::spawn(move || start_backend(&handle));
+            std::thread::spawn(move || {
+                start_backend(&handle);
+                STARTING.store(false, Ordering::SeqCst);
+            });
             Ok(())
         })
         .build(tauri::generate_context!())

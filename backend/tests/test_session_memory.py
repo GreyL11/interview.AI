@@ -132,7 +132,7 @@ async def test_summarizer_survives_llm_failure(sessions, session_id):
 
     class BrokenLLM(FakeLLM):
         async def generate_answer(self, prompt):
-            raise LLMError("gemini down")
+            raise LLMError("provider down")
 
     # Degrades context quality; must never break the session.
     assert await SessionSummarizer(sessions, BrokenLLM()).summarize(session_id, 1) is None

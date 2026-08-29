@@ -240,14 +240,14 @@ async def test_a_question_produces_one_correlated_latency_trace(live, monkeypatc
     assert len(traces) == 1
     trace = traces[0]
     assert trace["question_id"] is not None
-    # STT and Gemini stage timings must all be present and non-negative.
+    # STT and LLM stage timings must all be present and non-negative.
     for field in (
         "speech_end_to_stt_final_ms",
         "stt_queue_wait_ms",
         "stt_inference_ms",
         "stt_final_to_question_detected_ms",
-        "llm_task_to_gemini_request_ms",
-        "gemini_request_to_first_text_token_ms",
+        "llm_task_to_request_ms",
+        "llm_request_to_first_text_token_ms",
         "total_question_to_first_visible_token_ms",
     ):
         assert field in trace, f"missing {field}"

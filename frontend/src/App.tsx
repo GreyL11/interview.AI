@@ -94,7 +94,7 @@ export function App() {
   if (startup === null || startup.status !== "ready") {
     return (
       <StartupScreen
-        state={startup ?? { status: "starting", stage: "launching", label: "Opening Interview Coach" }}
+        state={startup ?? { status: "starting", stage: "launching", label: "Opening Call Assistant" }}
       />
     );
   }
@@ -103,7 +103,7 @@ export function App() {
     <SessionProvider>
       <div className="app">
         <nav className="nav">
-          <span className="brand">Interview Coach</span>
+          <span className="brand">Call Assistant</span>
           {SCREENS.map((candidate) => (
             <button
               key={candidate}

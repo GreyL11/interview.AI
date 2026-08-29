@@ -7,7 +7,7 @@ _SUMMARY_KEY = re.compile(r'"summary"\s*:\s*"')
 def extract_partial_summary(buffer: str) -> str | None:
     """Pull the `summary` value out of a JSON document that is still arriving.
 
-    Gemini streams the structured answer as raw JSON text, so nothing is
+    The provider streams the structured answer as raw JSON text, so nothing is
     parseable until the final token. This reads just far enough to show the
     summary as it is typed, and returns None until the key appears. Deliberately
     a scanner rather than a tolerant JSON parser: it only ever needs one string

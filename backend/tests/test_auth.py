@@ -35,10 +35,12 @@ def test_bearer_token_is_accepted(secured):
     assert response.status_code == 200
 
 
-def test_query_token_is_accepted(secured):
-    """WebSocket clients cannot set headers, so the token also travels as a
-    query parameter."""
-    assert secured.get("/documents?token=shell-issued-token").status_code == 200
+def test_a_query_token_does_not_authenticate_an_http_request(secured):
+    """The token used to be accepted from `?token=` on any request, for the
+    WebSocket's benefit. But WebSocket scopes never reach this middleware --
+    `app.api.ws` checks them itself -- so all that fallback did was let a
+    credential travel in a URL, where it lands in history and crash reports."""
+    assert secured.get("/documents?token=shell-issued-token").status_code == 401
 
 
 def test_token_check_is_disabled_when_unset(client):

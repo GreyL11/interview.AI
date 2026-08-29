@@ -59,16 +59,16 @@ class LatencyTrace:
     cancel_wait_ms: int | None = None
     retrieval_ms: int | None = None
     prompt_build_ms: int | None = None
-    gemini_request_at: float | None = None
-    #: Gemini's first streamed chunk of any kind. In this app's configuration
+    llm_request_at: float | None = None
+    #: The provider's first streamed chunk of any kind. In this app's configuration
     #: (plain JSON text streaming, no function calling) this is the same
     #: moment as the first *text* chunk -- see the note on `stream_answer`.
-    gemini_first_response_at: float | None = None
+    llm_first_response_at: float | None = None
     #: First chunk containing text. Structurally this is *not* the same as
     #: the first useful answer token: the response is streamed JSON, so the
     #: first several chunks are usually the `{"summary": "` preamble before
     #: any of the actual summary text appears.
-    gemini_first_text_token_at: float | None = None
+    llm_first_text_token_at: float | None = None
 
     def _ms(self, start: float | None, end: float | None) -> int | None:
         if start is None or end is None:
@@ -79,8 +79,8 @@ class LatencyTrace:
         """Log the one consolidated trace line, at the moment the first
         *visible* answer token is forwarded onto the WebSocket -- the actual
         "time to first useful token" the user experiences, which can lag the
-        raw Gemini first-token time by however long the JSON preamble takes
-        to stream past (see `gemini_first_text_token_at`)."""
+        raw provider first-token time by however long the JSON preamble takes
+        to stream past (see `llm_first_text_token_at`)."""
         now = time.monotonic()
         log_metric(
             "question_latency_trace",
@@ -95,13 +95,13 @@ class LatencyTrace:
             previous_answer_cancel_wait_ms=self.cancel_wait_ms,
             retrieval_ms=self.retrieval_ms,
             prompt_build_ms=self.prompt_build_ms,
-            llm_task_to_gemini_request_ms=self._ms(self.ask_started_at, self.gemini_request_at),
-            gemini_request_to_first_response_ms=self._ms(
-                self.gemini_request_at, self.gemini_first_response_at
+            llm_task_to_request_ms=self._ms(self.ask_started_at, self.llm_request_at),
+            llm_request_to_first_response_ms=self._ms(
+                self.llm_request_at, self.llm_first_response_at
             ),
-            gemini_request_to_first_text_token_ms=self._ms(
-                self.gemini_request_at, self.gemini_first_text_token_at
+            llm_request_to_first_text_token_ms=self._ms(
+                self.llm_request_at, self.llm_first_text_token_at
             ),
-            first_token_to_websocket_send_ms=self._ms(self.gemini_first_text_token_at, now),
+            first_token_to_websocket_send_ms=self._ms(self.llm_first_text_token_at, now),
             total_question_to_first_visible_token_ms=self._ms(self.speech_end_at, now),
         )

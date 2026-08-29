@@ -5,11 +5,13 @@
  * honestly report whether the engine is up. In a plain browser (dev, `npm run
  * dev`) none of this exists, and the app falls back to assuming a
  * hand-started backend on the dev port -- which is exactly what runtime.ts
- * already does.
+ * already does. Inside the shell there is no such fallback: see runtime.ts.
  *
  * Everything here is dynamically imported and guarded: importing the Tauri API
  * eagerly would put it in the browser bundle and throw on load outside Tauri.
  */
+
+import { isPackaged, parseBackendConfig, setBackendConfig } from "./runtime.ts";
 
 export type StartupStatus = "starting" | "ready" | "failed";
 
@@ -30,10 +32,13 @@ declare global {
   }
 }
 
-/** True when running inside the packaged desktop shell. */
-export function isDesktop(): boolean {
-  return typeof window !== "undefined" && window.__TAURI_INTERNALS__ !== undefined;
-}
+/** True when running inside the packaged desktop shell.
+ *
+ * One definition, in runtime.ts, re-exported here under the name the screens
+ * already use. Two definitions of "are we in the desktop app" that could
+ * disagree is precisely how the silent dev-port fallback survived as long as
+ * it did. */
+export const isDesktop = isPackaged;
 
 async function core() {
   return await import("@tauri-apps/api/core");
@@ -63,7 +68,7 @@ export async function getStartupState(): Promise<StartupState> {
     return {
       status: "failed",
       stage: "bridge",
-      label: "Something prevented Interview Coach from starting",
+      label: "Something prevented Call Assistant from starting",
       detail: String(cause),
     };
   }
@@ -103,23 +108,31 @@ export async function retryBackend(): Promise<void> {
 /**
  * Make sure the page knows where the backend is.
  *
- * The shell injects `window.__BACKEND__` before page scripts run, which covers
- * the normal case. It does not survive a webview reload, and it is written
- * from a background thread once the backend is ready -- so a page that loaded
- * early could read it before it exists. Without this the app would silently
- * fall back to the *development* port and token and report a confusing
- * "cannot reach the backend at :8000".
+ * The shell injects `window.__BACKEND__` via `eval`, which covers the normal
+ * case but is not a guarantee: it reaches only the page loaded at that moment,
+ * so it does not survive a webview reload, and it is written from a background
+ * thread once the backend is ready — a page that loaded early can read it
+ * before it exists.
  *
- * Asking the shell is authoritative: it is the process that chose the port.
+ * Asking the shell is the authoritative answer, because the shell is the
+ * process that chose the port. The injected value is validated rather than
+ * trusted, so a malformed one is replaced here instead of becoming a `NaN` port
+ * and an unexplainable "failed to fetch" later.
  */
 export async function ensureBackendRuntime(): Promise<boolean> {
   if (!isDesktop()) return true;
-  if (window.__BACKEND__ !== undefined) return true;
+  if (parseBackendConfig(window.__BACKEND__) !== null) return true;
+
   try {
     const { invoke } = await core();
-    window.__BACKEND__ = await invoke<{ port: number; token: string }>("backend_info");
-    return true;
-  } catch {
+    const info = await invoke<unknown>("backend_info");
+    if (setBackendConfig(info)) return true;
+    console.error("backend_info returned a value this app could not read");
+    return false;
+  } catch (cause) {
+    // Expected while the backend is still starting: `backend_info` errors
+    // until the shell has a running process to describe.
+    console.error("backend_info unavailable:", cause);
     return false;
   }
 }

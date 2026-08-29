@@ -1,8 +1,8 @@
-# Interview Coach — Backend
+# Call Assistant — Backend
 
 Local-first interview practice. Everything except LLM reasoning runs on your machine:
 audio, speech-to-text, documents, embeddings, vector search, and session history never
-leave the device. Gemini receives only the current question, retrieved context, and a
+leave the device. Groq receives only the current question, retrieved context, and a
 bounded slice of conversation memory — never raw audio, never your document library.
 
 > **Product boundary.** This is for mock interviews, practice, and settings where AI
@@ -13,7 +13,7 @@ bounded slice of conversation memory — never raw audio, never your document li
 
 | Milestone | Scope | State |
 |---|---|---|
-| Phase 1 | Classifier, router, orchestrator, Gemini, validator | Complete |
+| Phase 1 | Classifier, router, orchestrator, Groq, validator | Complete |
 | M1 | Document ingestion, ONNX embeddings, FAISS, SQLite, retrieval | Complete |
 | M2 | Session persistence, bounded memory, summarization | Complete |
 | M3 | WebSocket realtime, streaming, cancellation | Complete |
@@ -31,7 +31,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Then set `GEMINI_API_KEY` in `.env`.
+Then set `GROQ_API_KEY` in `.env` (the packaged app uses the OS credential store instead).
 
 Live audio needs two extra packages that are **not** in the base install:
 
@@ -70,7 +70,7 @@ Documents ─ parse ─ chunk ─ embed ─┬─ FAISS (vectors)
                                    └─ SQLite (text, metadata, vector ids)
 
 Audio ─ VAD ─ Whisper ─ final transcript ─ classify ─ route ─┬─ retrieve
-                                                             └─ Gemini ─ validate ─ WS events
+                                                             └─ Groq ─── validate ─ WS events
 ```
 
 Key interfaces, each with one real implementation — swap without touching callers:
@@ -92,7 +92,7 @@ filtering — no soft-delete column, no index rebuild.
 the eventual installer at roughly 250–400MB instead of 1.5–2.5GB.
 
 **Only final transcripts reach the LLM.** Partial transcripts are display-only, which is
-the entire debounce strategy — no amount of interim churn can trigger a Gemini call.
+the entire debounce strategy — no amount of interim churn can trigger a provider call.
 
 **Device attribution, not diarization.** Mic and loopback are captured as separate
 streams. Question detection runs only on loopback (the interviewer); the microphone is
@@ -116,7 +116,7 @@ empty knowledge base gets flagged, which is exactly when it matters most.
 | GET/DELETE | `/documents`, `/documents/{id}` | List, fetch, delete |
 | POST/GET | `/sessions`, `/sessions/{id}` | Create, list, detail |
 | POST | `/sessions/{id}/end` | End a session |
-| GET/PUT | `/settings` | Config (Gemini key is write-only) |
+| GET/PUT | `/settings` | Config (the API key is write-only) |
 | GET | `/audio/devices`, `/models/status` | Setup screen data |
 | WS | `/ws/session/{id}?token=&since_seq=` | Live session |
 

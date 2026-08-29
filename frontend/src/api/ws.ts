@@ -51,6 +51,15 @@ export class SessionSocket {
     this.onConnection(this.lastSeq === 0 ? "connecting" : "reconnecting");
 
     const runtime = backendRuntime();
+    if (runtime.kind === "unavailable") {
+      // Opening a socket to a guessed port would fail in a way that looks like
+      // a dropped connection and would then be retried forever. Report it as
+      // the connection failure it is and let the caller decide.
+      console.error("cannot open session socket:", runtime.reason);
+      this.onConnection("closed");
+      return;
+    }
+
     const url =
       `${runtime.wsBase}/ws/session/${this.sessionId}` +
       `?token=${encodeURIComponent(runtime.token)}&since_seq=${this.lastSeq}`;

@@ -275,7 +275,7 @@ async def test_final_transcript_triggers_detection(sessions, session_id, retriev
 
 
 async def test_a_dangling_question_does_not_fire_immediately(sessions, session_id, retriever):
-    """A mid-clause question must not spend a Gemini call before its brief
+    """A mid-clause question must not spend a provider call before its brief
     stabilization window elapses."""
     live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0))
     collector = Collector()
@@ -299,7 +299,7 @@ async def test_a_quick_continuation_supersedes_the_pending_dangling_question(
     sessions, session_id, retriever
 ):
     """The continuation arrives inside the correction-coalesce window, so the
-    detector merges it into one complete question -- only that one Gemini
+    detector merges it into one complete question -- only that one provider
     call should ever happen."""
     llm = SlowStreamingLLM(chunk_delay=0)
     live = build(sessions, session_id, retriever, llm)

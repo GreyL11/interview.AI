@@ -12,7 +12,7 @@ import sys
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="interview-coach-backend")
+    parser = argparse.ArgumentParser(prog="call-assistant-backend")
     parser.add_argument("--host", default="127.0.0.1",
                         help="Bind address. Loopback only by default; this is a local app.")
     parser.add_argument("--port", type=int, default=8000)
@@ -38,6 +38,23 @@ def apply_environment(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     apply_environment(args)
+
+    # Before *any* import that logs: `app.core.logging` creates the log
+    # directory the first time a logger is built, which would make the new data
+    # directory look already-in-use and silently skip the migration.
+    # Basic logging first, so the migration's own line is not swallowed. "Where
+    # did my documents go?" is precisely the support question it answers, and it
+    # runs before the app's file handler exists.
+    import logging
+
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    from app.core.config import migrate_legacy_data_dir
+
+    migrate_legacy_data_dir()
 
     # Imported after the environment is set, not before.
     import uvicorn

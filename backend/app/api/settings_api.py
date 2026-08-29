@@ -1,4 +1,4 @@
-from pathlib import Path
+import re
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -9,14 +9,20 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.secret_config import forget_secret, persist_secret
 from app.core.secrets import SecretStoreUnavailable, secret_store
+from app.model_status import model_states
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["settings"])
 
+#: A provider path segment must map onto a `<provider>_api_key` secret name.
+#: The same shape the credential store enforces, checked here so a bad path
+#: produces a 404 rather than a 500 from deeper down.
+_PROVIDER_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,54}$")
+
 
 class ProviderStatus(BaseModel):
-    """One LLM provider as the Settings screen should see it.
+    """The cloud LLM provider as the Settings screen should see it.
 
     No key material, not even a masked prefix: the API is write-only for keys,
     and this stays that way so a screenshot of Settings can never leak one.
@@ -25,14 +31,13 @@ class ProviderStatus(BaseModel):
     name: str
     model: str
     configured: bool
-    enabled: bool
-    #: Wired into the router this launch. A provider can be configured and
-    #: enabled but absent here if the key arrived after the router was built.
+    #: Wired into the running engine. False only if the engine could not be
+    #: consulted at all, which the UI reports as needing a restart.
     active: bool
-    available: bool
-    cooling_down: bool
-    cooldown_remaining_seconds: float | None = None
-    role: str | None = None
+    #: How the last request to this provider failed, as a classification --
+    #: never the provider's own error text. None when the last request
+    #: succeeded or nothing has been asked yet.
+    last_error_kind: str | None = None
 
 
 class SettingsView(BaseModel):
@@ -43,7 +48,6 @@ class SettingsView(BaseModel):
     """
 
     providers: list[ProviderStatus]
-    provider_priority: str
     #: True when the OS credential store is usable, so a saved key survives a
     #: restart. False in environments without one -- the UI says "this session
     #: only" rather than implying it was saved.
@@ -51,8 +55,8 @@ class SettingsView(BaseModel):
     #: Mutations here apply to the running process only; nothing is written
     #: back to .env. The UI says so rather than implying they persist.
     settings_persist: bool = False
-    gemini_key_configured: bool
-    gemini_model: str
+    groq_key_configured: bool
+    groq_model: str
     embedding_model: str
     stt_model: str
     stt_device: str
@@ -76,7 +80,6 @@ class SettingsUpdate(BaseModel):
     exactly the confusion this split exists to prevent.
     """
 
-    gemini_model: str | None = None
     groq_model: str | None = None
     stt_model: str | None = None
     stt_device: str | None = None
@@ -87,73 +90,56 @@ class SettingsUpdate(BaseModel):
 
 
 class ModelStatus(BaseModel):
+    """One local model's download lifecycle.
+
+    `state` is the field to render. `downloaded` is kept because it is the one
+    thing an older client understood, and it is derived from `state` so the two
+    can never disagree.
+    """
+
     name: str
     kind: str
+    state: str
     downloaded: bool
     path: str
+    detail: str | None = None
 
 
 def _provider_statuses() -> list[ProviderStatus]:
-    """Static config joined with the router's live health.
+    """Static configuration joined with the running client's own view.
 
-    The router is the only thing that knows about cooldowns, so its view wins
-    where the two overlap. It is read defensively: a Settings screen must not
-    fail to render because the LLM layer is unhappy.
+    Read defensively: a Settings screen must not fail to render because the LLM
+    layer is unhappy.
     """
-    configured = {
-        "groq": (bool(settings.groq_api_key), settings.groq_enabled, settings.groq_model),
-        "gemini": (
-            bool(settings.gemini_api_key),
-            settings.gemini_enabled,
-            settings.gemini_model,
-        ),
-    }
-
-    live: dict[str, dict] = {}
+    active = False
+    last_error: str | None = None
     try:
         from app.core.deps import get_llm_client
 
         client = get_llm_client()
-        if hasattr(client, "provider_status"):
-            live = {entry["name"]: entry for entry in client.provider_status()}
+        active = True
+        kind = getattr(client, "last_error_kind", None)
+        last_error = kind.value if kind is not None else None
     except Exception as exc:
-        logger.warning("provider_status_unavailable error=%s", exc)
-
-    order = [name.strip().lower() for name in settings.llm_provider_priority.split(",")]
-    ordered = [name for name in order if name in configured]
-    ordered += [name for name in configured if name not in ordered]
+        logger.warning("provider_status_unavailable error=%s", type(exc).__name__)
 
     return [
         ProviderStatus(
-            name=name,
-            model=configured[name][2],
-            configured=configured[name][0],
-            enabled=configured[name][1],
-            active=name in live,
-            # build_router() deliberately wires Gemini even with no key, so its
-            # existing "not configured" message is what the user sees on the
-            # first question. That must not surface here as "available" -- a
-            # provider with no key is never usable, whatever the router says.
-            available=(
-                configured[name][0]
-                and configured[name][1]
-                and live.get(name, {}).get("available", False)
-            ),
-            cooling_down=live.get(name, {}).get("cooling_down", False),
-            cooldown_remaining_seconds=live.get(name, {}).get("cooldown_remaining_seconds"),
-            role=live.get(name, {}).get("role"),
+            name="groq",
+            model=settings.groq_model,
+            configured=bool(settings.groq_api_key),
+            active=active,
+            last_error_kind=last_error,
         )
-        for name in ordered
     ]
 
 
 def _view() -> SettingsView:
     return SettingsView(
         providers=_provider_statuses(),
-        provider_priority=settings.llm_provider_priority,
         secure_storage_available=secret_store().available,
-        gemini_key_configured=bool(settings.gemini_api_key),
-        gemini_model=settings.gemini_model,
+        groq_key_configured=bool(settings.groq_api_key),
+        groq_model=settings.groq_model,
         embedding_model=settings.embedding_model,
         stt_model=settings.stt_model,
         stt_device=settings.stt_device,
@@ -177,16 +163,24 @@ async def get_settings() -> SettingsView:
 @router.put("/settings", response_model=SettingsView)
 async def update_settings(update: SettingsUpdate) -> SettingsView:
     changed = update.model_dump(exclude_none=True)
+
+    if "groq_model" in changed:
+        # Rejected here rather than discovered on the next question: a blank or
+        # malformed model would otherwise take the provider down silently.
+        from app.llm.groq_client import GroqConfigError, validate_model
+
+        try:
+            changed["groq_model"] = validate_model(changed["groq_model"])
+        except GroqConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     for key, value in changed.items():
         setattr(settings, key, value)
 
-    # Never log the key itself, only that it was set.
-    logger.info(
-        "settings_updated fields=%s",
-        sorted(changed),
-    )
+    # Never log a value, only which fields moved.
+    logger.info("settings_updated fields=%s", sorted(changed))
 
-    if changed.keys() & {"gemini_model", "groq_model"}:
+    if "groq_model" in changed:
         from app.core.deps import get_llm_client, get_summarizer
 
         get_llm_client.cache_clear()
@@ -216,29 +210,9 @@ async def get_audio_devices() -> list[DeviceInfo]:
 
 @router.get("/models/status", response_model=list[ModelStatus])
 async def models_status() -> list[ModelStatus]:
-    """Which local models are already on disk. Drives the first-run download UI."""
-    embedding_dir = settings.data_dir / "models" / "hf"
-    whisper_dir = settings.data_dir / "models" / "whisper"
-    return [
-        ModelStatus(
-            name=settings.embedding_model,
-            kind="embedding",
-            downloaded=_has_files(embedding_dir),
-            path=str(embedding_dir),
-        ),
-        ModelStatus(
-            name=settings.stt_model,
-            kind="stt",
-            downloaded=_has_files(whisper_dir),
-            path=str(whisper_dir),
-        ),
-    ]
-
-
-def _has_files(directory: Path) -> bool:
-    return directory.exists() and any(directory.rglob("*.onnx")) or (
-        directory.exists() and any(directory.rglob("*.bin"))
-    )
+    """Where each local model is in its download lifecycle. Drives the
+    first-run download UI."""
+    return [ModelStatus(**state) for state in model_states()]
 
 
 @router.get("/audio/channels")
@@ -275,22 +249,24 @@ class ProviderKeyResult(BaseModel):
     detail: str
 
 
-_KEY_FIELDS = {"groq": "groq_api_key", "gemini": "gemini_api_key"}
-
-
 def _key_field(provider: str) -> str:
-    field = _KEY_FIELDS.get(provider.lower())
-    if field is None:
+    """Map a provider path segment onto its secret name.
+
+    Generic rather than a fixed table: the credential store accepts any
+    `<name>_api_key`, so a provider does not need a code change to be storable.
+    """
+    name = provider.strip().lower()
+    if not _PROVIDER_PATTERN.match(name):
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
-    return field
+    return f"{name}_api_key"
 
 
-def _refresh_router() -> None:
-    """Rebuild the router so the change takes effect without a restart.
+def _refresh_engine() -> None:
+    """Rebuild the LLM client so the change takes effect without a restart.
 
-    `get_llm_client` is lru_cached, so clearing it swaps the router for
+    `get_llm_client` is lru_cached, so clearing it swaps the client for
     *future* callers only: a request already holding a reference finishes on
-    the router it started with. That is the atomic swap -- no lock needed,
+    the client it started with. That is the atomic swap -- no lock needed,
     because nothing mutates the old instance.
     """
     from app.core.deps import get_llm_client, get_summarizer
@@ -309,15 +285,20 @@ async def set_provider_key(provider: str, update: ProviderKeyUpdate) -> Provider
     try:
         persist_secret(field, value)
         persisted = True
-        detail = "Saved. It will still be here after you restart Interview Coach."
+        detail = "Saved. It will still be here after you restart Call Assistant."
     except SecretStoreUnavailable:
         # Honest fallback: apply it now, but do not claim it was saved and do
         # not write it to a file to make the claim true.
-        setattr(settings, field, value)
+        if field in type(settings).model_fields:
+            setattr(settings, field, value)
         persisted = False
-        detail = "Applied for this session. It cannot be saved on this machine."
+        detail = (
+            "Applied for this session. This machine has no credential store, so "
+            "it cannot be saved and will be gone after a restart."
+        )
 
-    _refresh_router()
+    _refresh_engine()
+    # provider and outcome only -- never the key, its length, or a prefix.
     logger.info("provider_key_set provider=%s persisted=%s", provider, persisted)
     return ProviderKeyResult(
         provider=provider, configured=True, persisted=persisted, detail=detail
@@ -334,14 +315,14 @@ async def delete_provider_key(provider: str) -> ProviderKeyResult:
 
     from_environment = env_supplied(field)
     forget_secret(field)
-    _refresh_router()
+    _refresh_engine()
 
     # An environment-supplied key returns on the next start; this app cannot
     # unset a variable its parent process set, and saying otherwise would be a
     # lie the user discovers later.
     detail = (
         "Removed for this session. It is set in this machine's environment, so it "
-        "will come back when Interview Coach restarts."
+        "will come back when Call Assistant restarts."
         if from_environment
         else "Removed."
     )

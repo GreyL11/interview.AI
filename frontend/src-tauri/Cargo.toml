@@ -1,8 +1,8 @@
 [package]
-name = "interview-coach"
+name = "call-assistant"
 version = "0.1.0"
-description = "Local-first interview practice coach"
-authors = ["Interview Coach"]
+description = "Local-first call assistant"
+authors = ["Grey"]
 edition = "2021"
 rust-version = "1.77"
 
@@ -34,6 +34,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+if let Some(window) = app.get_webview_window("main") {
+                hide_from_screen_capture(&window);
+            }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

@@ -15,9 +15,27 @@ to the credential store as intended.
 
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.core.secrets import SECRET_KEYS, SecretStore, secret_store
+from app.core.secrets import (
+    SecretStore,
+    purge_obsolete_secrets,
+    secret_field_names,
+    secret_store,
+)
 
 logger = get_logger(__name__)
+
+
+def _apply(name: str, value: str) -> bool:
+    """Push a secret into the live configuration, if it has a home there.
+
+    Any `*_api_key` name can be *stored*; only names that are actual Settings
+    fields can be applied. Setting an undeclared attribute on the pydantic
+    settings object would raise, so this reports rather than assumes.
+    """
+    if name not in type(settings).model_fields:
+        return False
+    setattr(settings, name, value)
+    return True
 
 
 def env_supplied(name: str) -> bool:
@@ -45,15 +63,20 @@ def load_persisted_secrets(store: SecretStore | None = None) -> dict[str, str]:
     # reports that their key did not survive a restart.
     logger.info("secret_store_available=%s", store.available)
 
+    # Migration: an install upgraded from a build that still had a second
+    # provider carries a credential this app will never read again.
+    purged = purge_obsolete_secrets(store)
+    if purged:
+        logger.info("obsolete_secrets_purged names=%s", sorted(purged))
+
     sources: dict[str, str] = {}
 
-    for name in sorted(SECRET_KEYS):
+    for name in sorted(secret_field_names()):
         if env_supplied(name):
             sources[name] = "environment"
             continue
         value = store.get(name)
-        if value:
-            setattr(settings, name, value)
+        if value and _apply(name, value):
             sources[name] = "credential store"
         else:
             sources[name] = "unset"
@@ -74,7 +97,7 @@ def persist_secret(name: str, value: str, store: SecretStore | None = None) -> N
     """
     store = store if store is not None else secret_store()
     store.set(name, value)
-    setattr(settings, name, value)
+    _apply(name, value)
 
 
 def forget_secret(name: str, store: SecretStore | None = None) -> None:
@@ -87,4 +110,4 @@ def forget_secret(name: str, store: SecretStore | None = None) -> None:
     """
     store = store if store is not None else secret_store()
     store.delete(name)
-    setattr(settings, name, "")
+    _apply(name, "")

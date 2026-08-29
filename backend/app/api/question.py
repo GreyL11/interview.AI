@@ -1,9 +1,7 @@
-from functools import lru_cache
-
 from fastapi import APIRouter, Depends
 
+from app.core.deps import get_llm_client
 from app.intelligence.orchestrator import Orchestrator
-from app.llm.gemini_client import GeminiClient
 from app.retrieval.mock_retriever import MockRetriever
 from app.schemas.answer import StructuredResponse
 from app.schemas.question import QuestionRequest
@@ -11,13 +9,13 @@ from app.schemas.question import QuestionRequest
 router = APIRouter()
 
 
-@lru_cache
 def get_orchestrator() -> Orchestrator:
-    # Lazy + cached: constructing GeminiClient reads GEMINI_API_KEY, and we
-    # want a clear error at request time (handled by the app-level LLMError
-    # handler) rather than an import-time crash when the key isn't set yet
-    # (e.g. running tests).
-    return Orchestrator(retriever=MockRetriever(), llm=GeminiClient())
+    # Built per request, deliberately: it holds nothing expensive (the LLM
+    # client and retriever are themselves cached), and caching it here would
+    # pin the *old* LLM client after Settings saves a new key -- the settings
+    # API can only clear `get_llm_client`, not every object holding a reference
+    # to what it returned.
+    return Orchestrator(retriever=MockRetriever(), llm=get_llm_client())
 
 
 @router.post("/question", response_model=StructuredResponse)

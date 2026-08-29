@@ -1,21 +1,14 @@
 """Per-stage latency benchmark for representative interview scenarios.
 
-Two clearly separate modes:
-
-MOCKED (default, always runs): exercises the real question-detection,
-retrieval-routing, and prompt-construction code with a fake, near-zero-delay
-LLM. This measures application-controlled overhead ONLY. It does not and
-cannot represent real Gemini network/model latency -- do not read the
-"first_token_ms" column here as a production latency estimate.
-
-LIVE (opt-in): if GEMINI_API_KEY is set and --live is passed, additionally
-runs GeminiClient.benchmark_stream_latency() -- the existing app-vs-minimal
-prompt comparison -- against the real API, reported separately. This is the
-only number in this script that reflects real network/model latency.
+Exercises the real question-detection, retrieval-routing and
+prompt-construction code with a fake, near-zero-delay LLM, so what it measures
+is application-controlled overhead ONLY. It does not and cannot represent real
+provider network or model latency -- do not read the "first_token_ms" column
+here as a production estimate. For that, run the app and read the
+`question_latency_trace` metric line from the log.
 
 Usage:
-    .venv/Scripts/python.exe scripts/benchmark_pipeline.py
-    .venv/Scripts/python.exe scripts/benchmark_pipeline.py --live
+    venv/Scripts/python.exe scripts/benchmark_pipeline.py
 """
 
 import asyncio
@@ -138,7 +131,7 @@ async def run_scenario(scenario: Scenario) -> dict[str, float | None]:
             "question_detection_ms": last.get("stt_final_to_question_detected_ms"),
             "retrieval_ms": last.get("retrieval_ms"),
             "prompt_build_ms": last.get("prompt_build_ms"),
-            "first_token_ms": last.get("gemini_request_to_first_text_token_ms"),
+            "first_token_ms": last.get("llm_request_to_first_text_token_ms"),
             "total_ms": last.get("total_question_to_first_visible_token_ms"),
         }
     finally:
@@ -153,7 +146,7 @@ def _fmt(value) -> str:
 async def run_mocked_benchmark() -> None:
     print(
         "\nMOCKED benchmark -- application overhead only "
-        "(near-zero-delay fake LLM, no network). Not a Gemini latency estimate.\n"
+        "(near-zero-delay fake LLM, no network). Not a provider latency estimate.\n"
     )
     header = f"{'Scenario':<24} {'Detection':>10} {'Retrieval':>10} {'Prompt':>8} {'1st Token':>10} {'Total':>8}"
     print(header)
@@ -167,32 +160,8 @@ async def run_mocked_benchmark() -> None:
         )
 
 
-async def run_live_benchmark() -> None:
-    from app.core.config import settings
-    from app.llm.gemini_client import GeminiClient
-
-    if not settings.gemini_api_key:
-        print("\nLIVE benchmark skipped: GEMINI_API_KEY is not configured.")
-        return
-
-    print("\nLIVE benchmark -- real Gemini network + model latency.\n")
-    client = GeminiClient()
-    app_prompt = (
-        "You are an interview coach. Respond with a JSON object with a 'summary' field.\n\n"
-        "Interview question: Explain caching?"
-    )
-    minimal_prompt = "Explain caching in one sentence."
-    results = await client.benchmark_stream_latency(app_prompt, minimal_prompt)
-    for label, timings in results.items():
-        print(f"  {label}: {timings}")
-
-
 async def main() -> None:
     await run_mocked_benchmark()
-    if "--live" in sys.argv:
-        await run_live_benchmark()
-    else:
-        print("\n(pass --live with GEMINI_API_KEY set to also measure real Gemini latency)")
 
 
 if __name__ == "__main__":

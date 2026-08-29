@@ -5,6 +5,7 @@ import numpy as np
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.embeddings.base import EmbeddingError, EmbeddingProvider
+from app.model_status import tracker
 
 logger = get_logger(__name__)
 
@@ -45,7 +46,13 @@ class OnnxEmbedder(EmbeddingProvider):
             except ImportError as exc:  # pragma: no cover - dependency guard
                 raise EmbeddingError(f"Embedding backend unavailable: {exc}") from exc
 
+            # A previous failure must not colour this attempt's reporting.
+            tracker.reset("embedding")
+            tracker.downloading("embedding")
             try:
+                # Resolved from the local cache without network when the files
+                # are already there, so this is the download step only on a
+                # first run.
                 model_path = hf_hub_download(
                     self._model_name, "onnx/model.onnx", cache_dir=self._cache_dir
                 )
@@ -53,24 +60,40 @@ class OnnxEmbedder(EmbeddingProvider):
                     self._model_name, "tokenizer.json", cache_dir=self._cache_dir
                 )
             except Exception as exc:
-                raise EmbeddingError(
-                    f"Could not obtain embedding model '{self._model_name}'. "
-                    f"First run needs network access to download it. Cause: {exc}"
-                ) from exc
+                message = (
+                    f"Could not download the document search model "
+                    f"'{self._model_name}'. The first run needs internet access. "
+                    f"Cause: {exc}"
+                )
+                tracker.failed("embedding", message)
+                raise EmbeddingError(message) from exc
 
-            tokenizer = Tokenizer.from_file(tokenizer_path)
-            tokenizer.enable_truncation(max_length=settings.embedding_max_tokens)
-            tokenizer.enable_padding()
+            tracker.loading("embedding")
+            try:
+                tokenizer = Tokenizer.from_file(tokenizer_path)
+                tokenizer.enable_truncation(max_length=settings.embedding_max_tokens)
+                tokenizer.enable_padding()
 
-            options = ort.SessionOptions()
-            options.intra_op_num_threads = 0  # let ORT pick based on the CPU
-            session = ort.InferenceSession(
-                model_path, options, providers=["CPUExecutionProvider"]
-            )
+                options = ort.SessionOptions()
+                options.intra_op_num_threads = 0  # let ORT pick based on the CPU
+                session = ort.InferenceSession(
+                    model_path, options, providers=["CPUExecutionProvider"]
+                )
+            except Exception as exc:
+                # Files present but unreadable: a truncated or corrupted cache.
+                # Say which directory to delete, because that is the fix.
+                message = (
+                    f"The document search model files are unreadable and are "
+                    f"probably incomplete. Delete '{self._cache_dir}' and try "
+                    f"again to re-download them. Cause: {exc}"
+                )
+                tracker.failed("embedding", message)
+                raise EmbeddingError(message) from exc
 
             self._tokenizer = tokenizer
             self._session = session
             self._input_names = {i.name for i in session.get_inputs()}
+            tracker.ready("embedding")
             logger.info("embedding_model_loaded model=%s", self._model_name)
 
     def embed(self, texts: list[str]) -> np.ndarray:

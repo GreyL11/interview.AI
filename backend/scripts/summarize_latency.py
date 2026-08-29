@@ -38,9 +38,9 @@ METRICS = [
     "previous_answer_cancel_wait_ms",
     "retrieval_ms",
     "prompt_build_ms",
-    "llm_task_to_gemini_request_ms",
-    "gemini_request_to_first_response_ms",
-    "gemini_request_to_first_text_token_ms",
+    "llm_task_to_request_ms",
+    "llm_request_to_first_response_ms",
+    "llm_request_to_first_text_token_ms",
     "first_token_to_websocket_send_ms",
     "total_question_to_first_visible_token_ms",
 ]

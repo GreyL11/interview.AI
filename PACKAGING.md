@@ -1,8 +1,7 @@
-# Building and packaging Interview Coach (Windows)
+# Building and packaging Call Assistant (Windows)
 
-> None of this has been executed. It was written against the official Tauri v2,
-> Vite and PyInstaller project layouts, and the parts that could be verified
-> without installing anything were verified — see "What is already proven".
+> The backend half has now been built and exercised as a packaged executable.
+> The Rust shell still has not been compiled — see "What is NOT proven".
 
 ## Prerequisites
 
@@ -60,14 +59,14 @@ npm run desktop:build
 
 That runs the three steps in the only order that works -- the backend must be
 frozen *before* Tauri bundles it, because `tauri.conf.json` lists
-`backend/dist/interview-coach-backend` as a bundled resource, so a stale or
+`backend/dist/call-assistant-backend` as a bundled resource, so a stale or
 missing tree silently produces an installer with no backend inside it:
 
 ```bash
 # 1. Freeze the backend into a onedir tree
 cd backend
-pyinstaller --noconfirm packaging/interview-coach-backend.spec
-#   -> backend/dist/interview-coach-backend/
+pyinstaller --noconfirm packaging/call-assistant-backend.spec
+#   -> backend/dist/call-assistant-backend/
 
 # 2. Typecheck + bundle the frontend
 cd ..rontend
@@ -76,7 +75,7 @@ npm run build
 
 # 3. Build the shell and the installer
 npm run tauri:build
-#   -> frontend/src-tauri/target/release/bundle/nsis/Interview Coach_0.1.0_x64-setup.exe
+#   -> frontend/src-tauri/target/release/bundle/nsis/Call Assistant_0.1.0_x64-setup.exe
 ```
 
 ## How the two processes fit together
@@ -120,7 +119,7 @@ self-terminated 3.4s after its parent was killed.
 
 ## Data and model layout
 
-Everything user-specific lives under `%LOCALAPPDATA%\com.interviewcoach.desktop\`,
+Everything user-specific lives under `%LOCALAPPDATA%\com.callassistant.desktop\`,
 passed to the backend as `--data-dir`:
 
 ```
@@ -129,7 +128,7 @@ faiss/index.faiss
 metadata/app.db
 models/hf/        ONNX embedding model   (~87MB, first use)
 models/whisper/   CTranslate2 STT model  (~250MB, first live session)
-logs/interview-coach.log   rotating, 2MB x 3 -- what "Open Logs Folder" opens
+logs/call-assistant.log   rotating, 2MB x 3 -- what "Open Logs Folder" opens
 ```
 
 **Models are not bundled.** They download on first use. That keeps the installer
@@ -159,6 +158,23 @@ Related notes:
 - First launch may be slow while Defender scans the freshly installed tree. The
   readiness timeout is 90s for this reason.
 
+## Verified against the packaged executable
+
+Run here on the frozen backend (`backend/dist/call-assistant-backend/`), not
+just in the dev tree:
+
+- `keyring` resolves `WinVaultKeyring`; `secret_store_available=True`
+- Saving a Groq key returns `persisted: true`, and a **restarted process with
+  no `.env` present** reads it back (`groq_api_key=credential_store`)
+- `/health` answers a browser-style request with `Access-Control-Allow-Origin`
+- `OPTIONS /settings` preflight from `http://tauri.localhost` returns 200 and
+  allows the `Authorization` header
+- Unauthenticated request 401, authenticated request 200
+- A plain-text document ingests to `READY` (this was failing on every document
+  before — see the msvcp140 note in the spec)
+- A genuinely image-only PDF ingests to `READY` via OCR
+- `/models/status` reports `embedding -> ready` only after the model loaded
+
 ## What is already proven
 
 Run on this machine (an office laptop, so no audio and no provider calls):
@@ -182,10 +198,9 @@ compiler. Expect to fix compile errors on the first `npm run desktop:build`.
 
 Also unproven here, by design (office laptop):
 
-- PyInstaller has never been run; the spec's hidden imports and data files are
-  the usual set for this stack but are unverified
-- No NSIS installer has been produced or installed
+- No NSIS installer has been produced or installed, because that step needs the
+  Rust toolchain
 - The startup screen has never rendered against a real Tauri event stream —
   only the browser fallback path (which skips it) was exercised
 - WASAPI loopback capture and real Whisper transcription
-- Groq / Gemini provider calls from the packaged app
+- Groq provider calls from the packaged app (no API key was used here)

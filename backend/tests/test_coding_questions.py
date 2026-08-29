@@ -59,11 +59,11 @@ async def drain(live):
         await asyncio.gather(live._task, return_exceptions=True)
 
 
-async def test_multi_utterance_coding_problem_reaches_gemini_complete(
+async def test_multi_utterance_coding_problem_reaches_the_llm_complete(
     sessions, session_id, retriever
 ):
     """'Given an array, find two numbers...' [pause] '...whose sum equals a
-    target value.' must reach Gemini as one complete problem, not two."""
+    target value.' must reach the LLM as one complete problem, not two."""
     llm = SlowStreamingLLM(chunk_delay=0)
     live = build(sessions, session_id, retriever, llm)
     collector = Collector()
@@ -84,7 +84,7 @@ async def test_multi_utterance_coding_problem_reaches_gemini_complete(
     assert "sum equals a target value" in final_prompt
 
 
-async def test_constraint_added_immediately_reaches_gemini(sessions, session_id, retriever):
+async def test_constraint_added_immediately_reaches_the_llm(sessions, session_id, retriever):
     llm = SlowStreamingLLM(chunk_delay=0)
     live = build(sessions, session_id, retriever, llm)
 

@@ -7,8 +7,17 @@ import type {
   SettingsView,
 } from "../api/contracts.ts";
 import { appVersion, isDesktop, openDataFolder, openLogsFolder } from "../api/desktop.ts";
-import { describeProvider, formatPriority, providerLabel } from "../api/providers.ts";
+import {
+  anyModelBusy,
+  describeModel,
+  describeProvider,
+  providerLabel,
+} from "../api/providers.ts";
 import { SettingsRow, SettingsSection, StatusBadge } from "../components/Settings.tsx";
+
+/** How often to re-check a model download. Slow enough to be invisible, fast
+ * enough that "Ready" appears promptly once it lands. */
+const MODEL_POLL_MS = 2_000;
 
 export function SetupScreen() {
   const [settings, setSettings] = useState<SettingsView | null>(null);
@@ -43,6 +52,25 @@ export function SetupScreen() {
     void refresh();
     void appVersion().then(setVersion);
   }, [refresh]);
+
+  // A model download runs on the backend with no channel back to this screen,
+  // so while one is in flight the screen asks again. Polling only while
+  // something is actually happening: an idle Settings screen that re-fetches
+  // forever is a battery drain for no information.
+  const busy = anyModelBusy(models);
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(() => {
+      void api
+        .modelStatus()
+        .then(setModels)
+        .catch(() => {
+          // A failed poll is not worth surfacing: the next one usually works,
+          // and the engine being down is already reported elsewhere.
+        });
+    }, MODEL_POLL_MS);
+    return () => clearInterval(timer);
+  }, [busy]);
 
   const save = useCallback(
     async (update: Parameters<typeof api.updateSettings>[0], note: string) => {
@@ -103,7 +131,6 @@ export function SetupScreen() {
   // `providers`, and Settings failing to render is a far worse outcome than
   // one section being empty.
   const providers = Array.isArray(settings.providers) ? settings.providers : [];
-  const priority = settings.provider_priority ?? "";
   // Prefer the default device. Windows reports several inputs per channel and
   // the first one is often not the one that will actually be captured.
   const pick = (channel: "LOOPBACK" | "MIC"): AudioDevice | undefined => {
@@ -120,7 +147,7 @@ export function SetupScreen() {
       {settings.settings_persist === false && (
         <p className="settings-notice" role="note">
           API keys are saved on this machine. Other settings here apply immediately but
-          are not saved — they return to their defaults when you restart Interview Coach.
+          are not saved — they return to their defaults when you restart Call Assistant.
         </p>
       )}
 
@@ -151,23 +178,13 @@ export function SetupScreen() {
             control={<StatusBadge label="Unknown" tone="idle" />}
           />
         )}
-        <SettingsRow
-          label="Provider order"
-          hint="The first available provider answers; the next takes over if it is rate limited."
-          control={
-            <span className="settings-value">{formatPriority(priority)}</span>
-          }
+        <ProviderKeyRow
+          provider="groq"
+          label={providerLabel("groq")}
+          configured={settings.groq_key_configured}
+          secureStorage={settings.secure_storage_available}
+          onChanged={refresh}
         />
-        {["groq", "gemini"].map((name) => (
-          <ProviderKeyRow
-            key={name}
-            provider={name}
-            label={providerLabel(name)}
-            configured={providers.some((p) => p.name === name && p.configured)}
-            secureStorage={settings.secure_storage_available}
-            onChanged={refresh}
-          />
-        ))}
       </SettingsSection>
 
       <SettingsSection
@@ -249,15 +266,11 @@ export function SetupScreen() {
       >
         <SettingsRow
           label="Speech model"
-          hint={
-            sttModel?.downloaded === true
-              ? "Ready to use."
-              : "Downloads the first time you start live audio."
-          }
+          hint={describeModel(sttModel, "stt").sentence}
           control={
             <StatusBadge
-              label={sttModel?.downloaded === true ? "Ready" : "Not downloaded"}
-              tone={sttModel?.downloaded === true ? "ok" : "warn"}
+              label={describeModel(sttModel, "stt").label}
+              tone={describeModel(sttModel, "stt").tone}
             />
           }
         >
@@ -278,15 +291,11 @@ export function SetupScreen() {
         </SettingsRow>
         <SettingsRow
           label="Document search model"
-          hint={
-            embeddingModel?.downloaded === true
-              ? "Ready to use."
-              : "Downloads the first time you add a document."
-          }
+          hint={describeModel(embeddingModel, "embedding").sentence}
           control={
             <StatusBadge
-              label={embeddingModel?.downloaded === true ? "Ready" : "Not downloaded"}
-              tone={embeddingModel?.downloaded === true ? "ok" : "warn"}
+              label={describeModel(embeddingModel, "embedding").label}
+              tone={describeModel(embeddingModel, "embedding").tone}
             />
           }
         />
@@ -315,7 +324,7 @@ export function SetupScreen() {
           hint="Audio is transcribed as it is captured and is never written to disk."
           control={<StatusBadge label="Not stored" tone="ok" />}
         />
-        <SettingsRow label="Storage location" hint="Everything Interview Coach keeps lives here.">
+        <SettingsRow label="Storage location" hint="Everything Call Assistant keeps lives here.">
           <span className="settings-mono settings-path">{settings.data_dir}</span>
         </SettingsRow>
         {isDesktop() && (
@@ -334,7 +343,7 @@ export function SetupScreen() {
 
       <SettingsSection title="About">
         <SettingsRow
-          label="Interview Coach"
+          label="Call Assistant"
           hint={isDesktop() ? "Desktop application" : "Running in a browser (development)"}
           control={
             <span className="settings-value">{version !== null ? `Version ${version}` : "—"}</span>

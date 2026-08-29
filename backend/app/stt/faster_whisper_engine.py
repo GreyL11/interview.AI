@@ -7,6 +7,7 @@ from app.audio.base import SAMPLE_RATE
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import elapsed_ms, log_metric
+from app.model_status import tracker
 from app.stt.base import SttEngine, SttError, Transcript
 
 logger = get_logger(__name__)
@@ -51,6 +52,13 @@ class FasterWhisperEngine(SttEngine):
                 ) from exc
 
             device, compute_type = self._resolve_device()
+            # WhisperModel downloads and loads in one call, so the UI is told
+            # "downloading" for the whole of it. That is honest on a first run
+            # and briefly pessimistic afterwards, which is the right way round:
+            # the long wait is the download, and it is the one the user needs
+            # explained.
+            tracker.reset("stt")
+            tracker.downloading("stt")
             try:
                 self._model = WhisperModel(
                     self._model_name,
@@ -66,17 +74,23 @@ class FasterWhisperEngine(SttEngine):
                 )
             except Exception as exc:
                 if device == "cuda":
-                    raise SttError(
+                    message = (
                         "CUDA STT was explicitly selected but could not start. "
                         "Install a compatible NVIDIA CUDA runtime with cuBLAS/cuDNN "
                         "libraries, or set STT_DEVICE=cpu and STT_COMPUTE_TYPE=int8. "
                         f"Cause: {exc}"
-                    ) from exc
-                raise SttError(
-                    f"Could not load STT model '{self._model_name}'. First run needs "
-                    f"network access to download it. Cause: {exc}"
-                ) from exc
+                    )
+                else:
+                    message = (
+                        f"Could not load the speech model '{self._model_name}'. The "
+                        f"first run needs internet access to download it. If it was "
+                        f"downloaded before, delete '{self._download_root}' and try "
+                        f"again to repair an incomplete copy. Cause: {exc}"
+                    )
+                tracker.failed("stt", message)
+                raise SttError(message) from exc
 
+            tracker.ready("stt")
             logger.info(
                 "stt_model_loaded model=%s device=%s compute=%s",
                 self._model_name, device, compute_type,

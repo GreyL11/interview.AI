@@ -26,7 +26,10 @@ from app.core.secrets import (
 
 #: Obvious fakes. Asserted absent from every public payload and captured log.
 GROQ_SECRET = "TEST_GROQ_SECRET_DO_NOT_LEAK_123"
-GEMINI_SECRET = "TEST_GEMINI_SECRET_DO_NOT_LEAK_456"
+#: A provider this app has no code for. Used to prove the credential store
+#: accepts any `<name>_api_key`, not just the one provider that ships today.
+OTHER_SECRET = "TEST_OTHER_SECRET_DO_NOT_LEAK_456"
+OTHER_KEY_NAME = "someprovider_api_key"
 
 
 @pytest.fixture
@@ -80,10 +83,10 @@ def test_an_environment_value_wins_over_a_persisted_secret(store):
 
 
 def test_no_key_anywhere_is_reported_as_unset(store):
-    settings.gemini_api_key = ""
+    settings.groq_api_key = ""
     sources = load_persisted_secrets()
-    assert settings.gemini_api_key == ""
-    assert sources["gemini_api_key"] == "unset"
+    assert settings.groq_api_key == ""
+    assert sources["groq_api_key"] == "unset"
 
 
 def test_restart_reloads_what_was_saved(store):
@@ -98,15 +101,15 @@ def test_restart_reloads_what_was_saved(store):
 
 
 def test_removing_a_secret_deletes_it_from_the_store(store):
-    persist_secret("gemini_api_key", GEMINI_SECRET)
-    forget_secret("gemini_api_key")
+    persist_secret("groq_api_key", GROQ_SECRET)
+    forget_secret("groq_api_key")
 
-    assert store.get("gemini_api_key") is None
-    assert settings.gemini_api_key == ""
+    assert store.get("groq_api_key") is None
+    assert settings.groq_api_key == ""
 
-    settings.gemini_api_key = ""
+    settings.groq_api_key = ""
     load_persisted_secrets()
-    assert settings.gemini_api_key == ""  # stays gone across a restart
+    assert settings.groq_api_key == ""  # stays gone across a restart
 
 
 def test_env_supplied_reflects_the_effective_configuration(store):
@@ -130,10 +133,40 @@ def test_an_unavailable_store_reads_nothing_rather_than_failing(unavailable_stor
     assert sources["groq_api_key"] == "unset"
 
 
-def test_only_known_secrets_may_be_stored(store):
-    """The credential store is not a general key-value bucket."""
-    with pytest.raises(ValueError):
-        store.set("something_else", "value")
+def test_any_provider_key_name_may_be_stored(store):
+    """The store is keyed by shape, not by an allowlist of providers, so a key
+    for a provider this build has no code for is still storable and readable."""
+    store.set(OTHER_KEY_NAME, OTHER_SECRET)
+    assert store.get(OTHER_KEY_NAME) == OTHER_SECRET
+
+
+def test_a_name_that_is_not_an_api_key_is_rejected(store):
+    """Still not a general key-value bucket: the name becomes an entry in the
+    user's credential manager, so it has to be recognisably ours."""
+    for rejected in ("something_else", "", "Groq_API_KEY", "../etc/passwd", "groq_api_key_"):
+        with pytest.raises(ValueError):
+            store.set(rejected, "value")
+
+
+def test_an_unknown_provider_key_is_stored_but_not_applied_to_settings(store):
+    """It has nowhere to go in the running configuration, and saying otherwise
+    would imply a provider that does not exist had been enabled."""
+    persist_secret(OTHER_KEY_NAME, OTHER_SECRET)
+
+    assert store.get(OTHER_KEY_NAME) == OTHER_SECRET
+    assert not hasattr(settings, OTHER_KEY_NAME)
+    # ...and it is not reported as a loadable secret at startup.
+    assert OTHER_KEY_NAME not in load_persisted_secrets()
+
+
+def test_an_obsolete_gemini_credential_is_purged_on_startup(store):
+    """Migration: an install upgraded from a build that still had a second
+    provider must not leave an orphaned entry in Credential Manager."""
+    store.set("gemini_api_key", "TEST_LEFTOVER_GEMINI_KEY")
+
+    load_persisted_secrets()
+
+    assert store.get("gemini_api_key") is None
 
 
 # --------------------------------------------------------------- leakage
@@ -151,12 +184,12 @@ def test_saving_a_key_returns_status_only(client, store):
 
 def test_settings_never_expose_a_saved_key(client, store):
     client.put("/providers/groq/key", json={"api_key": GROQ_SECRET})
-    client.put("/providers/gemini/key", json={"api_key": GEMINI_SECRET})
+    client.put("/providers/someprovider/key", json={"api_key": OTHER_SECRET})
 
     serialised = json.dumps(client.get("/settings").json())
 
     assert GROQ_SECRET not in serialised
-    assert GEMINI_SECRET not in serialised
+    assert OTHER_SECRET not in serialised
     # Not even a fragment: no prefix, suffix, length or hash.
     assert GROQ_SECRET[:8] not in serialised
     assert str(len(GROQ_SECRET)) not in serialised.replace("chunk_size", "")
@@ -205,17 +238,18 @@ def test_removing_a_key_updates_provider_status(client, store):
     assert body["configured"] is False
     assert body["persisted"] is False
     assert _provider(client, "groq")["configured"] is False
-    assert _provider(client, "groq")["available"] is False
 
 
-def test_saving_a_key_makes_the_provider_available_without_a_restart(client, store):
+def test_saving_a_key_makes_the_provider_usable_without_a_restart(client, store):
     assert _provider(client, "groq")["configured"] is False
 
     client.put("/providers/groq/key", json={"api_key": GROQ_SECRET})
 
     groq = _provider(client, "groq")
     assert groq["configured"] is True
-    assert groq["available"] is True  # router was rebuilt, not left stale
+    # `active` proves the cached LLM client was rebuilt rather than left stale
+    # holding the old (absent) key.
+    assert groq["active"] is True
 
 
 def test_the_api_admits_when_a_key_could_not_be_saved(client, unavailable_store):
@@ -232,9 +266,22 @@ def test_settings_report_whether_secure_storage_exists(client, unavailable_store
     assert client.get("/settings").json()["secure_storage_available"] is False
 
 
-def test_an_unknown_provider_is_rejected(client, store):
-    assert client.put("/providers/nope/key", json={"api_key": "x"}).status_code == 404
-    assert client.delete("/providers/nope/key").status_code == 404
+def test_a_key_for_an_unknown_provider_is_still_storable(client, store):
+    """Keys are stored by name shape, not against an allowlist of providers, so
+    a provider this build has no code for can still have its key saved."""
+    assert client.put("/providers/nope/key", json={"api_key": "x"}).status_code == 200
+    assert store.get("nope_api_key") == "x"
+
+
+def test_a_malformed_provider_name_is_rejected(client, store):
+    """The name becomes an entry in the user's credential manager, so it is
+    still constrained -- just by shape rather than by membership."""
+    # Case is normalised rather than rejected -- "Groq" and "groq" are the
+    # same provider -- so only genuinely malformed names are refused.
+    assert client.put("/providers/NOPE/key", json={"api_key": "x"}).status_code == 200
+    for bad in ("no pe", "9nope", "a" * 60, "nope-x"):
+        assert client.put(f"/providers/{bad}/key", json={"api_key": "x"}).status_code == 404
+        assert client.delete(f"/providers/{bad}/key").status_code == 404
 
 
 def test_an_empty_key_is_rejected(client, store):
@@ -281,3 +328,62 @@ def test_a_machine_with_no_backend_at_all_reports_unavailable(monkeypatch):
     monkeypatch.setattr(secrets_module, "_platform_backend", lambda: None)
 
     assert secrets_module.KeyringSecretStore().available is False
+
+
+# --------------------------------------------- renamed product, kept credentials
+
+
+def test_a_key_saved_under_the_previous_product_name_is_adopted(monkeypatch):
+    """The app was renamed from "Interview Coach" to "Call Assistant".
+
+    Credential Manager files an entry under the service name that was current
+    when it was saved, so without this every existing user opens Settings after
+    upgrading, sees "not configured", and has to find and re-enter their key.
+    """
+    from app.core.secrets import LEGACY_SERVICE_NAMES, SERVICE_NAME, KeyringSecretStore
+
+    class FakeBackend:
+        def __init__(self):
+            self.entries = {(LEGACY_SERVICE_NAMES[0], "groq_api_key"): GROQ_SECRET}
+
+        def get_password(self, service, name):
+            return self.entries.get((service, name))
+
+        def set_password(self, service, name, value):
+            self.entries[(service, name)] = value
+
+        def delete_password(self, service, name):
+            del self.entries[(service, name)]
+
+    store = KeyringSecretStore()
+    backend = FakeBackend()
+    monkeypatch.setattr(store, "_resolve", lambda: backend)
+
+    assert store.get("groq_api_key") == GROQ_SECRET
+    # Moved, not copied: the old entry must not linger in Credential Manager.
+    assert (SERVICE_NAME, "groq_api_key") in backend.entries
+    assert (LEGACY_SERVICE_NAMES[0], "groq_api_key") not in backend.entries
+
+
+def test_the_current_name_wins_over_a_stale_legacy_entry(monkeypatch):
+    """A key saved since the rename must never be shadowed by an older one."""
+    from app.core.secrets import LEGACY_SERVICE_NAMES, SERVICE_NAME, KeyringSecretStore
+
+    class FakeBackend:
+        entries = {
+            (SERVICE_NAME, "groq_api_key"): "current",
+            (LEGACY_SERVICE_NAMES[0], "groq_api_key"): "stale",
+        }
+
+        def get_password(self, service, name):
+            return self.entries.get((service, name))
+
+        def set_password(self, service, name, value):
+            self.entries[(service, name)] = value
+
+        def delete_password(self, service, name):
+            self.entries.pop((service, name), None)
+
+    store = KeyringSecretStore()
+    monkeypatch.setattr(store, "_resolve", lambda: FakeBackend())
+    assert store.get("groq_api_key") == "current"
