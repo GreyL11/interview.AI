@@ -16,6 +16,12 @@ class TurnStatus(StrEnum):
     PENDING = "PENDING"
     ANSWERED = "ANSWERED"
     CANCELLED = "CANCELLED"
+    #: Superseded *after* useful text had already streamed. Distinct from
+    #: CANCELLED (nothing to keep) so the partial can be shown in history --
+    #: and, critically, so it stays out of get_answered_turns() and therefore
+    #: out of the conversation memory fed back to the LLM. A truncated answer
+    #: is useful to a human reading history and misleading to a model.
+    INTERRUPTED = "INTERRUPTED"
     FAILED = "FAILED"
 
 

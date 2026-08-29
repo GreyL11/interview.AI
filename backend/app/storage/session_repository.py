@@ -198,6 +198,21 @@ class SessionRepository:
         with self._db.write() as conn:
             conn.execute("UPDATE turns SET status = ? WHERE turn_id = ?", (status.value, turn_id))
 
+    def interrupt_turn(self, turn_id: int, partial_summary: str) -> None:
+        """Record a turn superseded after it had already streamed useful text.
+
+        The partial goes in the existing `answer` column as a normal Answer
+        with only `summary` filled, so nothing about reading turns back has to
+        change. Status INTERRUPTED keeps it out of get_answered_turns(), which
+        is what stops a half-finished sentence reaching conversation memory.
+        """
+        partial = Answer(summary=partial_summary)
+        with self._db.write() as conn:
+            conn.execute(
+                "UPDATE turns SET answer = ?, status = ? WHERE turn_id = ?",
+                (partial.model_dump_json(), TurnStatus.INTERRUPTED.value, turn_id),
+            )
+
     def get_turns(self, session_id: str) -> list[Turn]:
         rows = self._db.connect().execute(
             "SELECT * FROM turns WHERE session_id = ? ORDER BY seq", (session_id,)

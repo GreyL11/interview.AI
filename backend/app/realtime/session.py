@@ -60,6 +60,9 @@ class LiveSession:
 
         self._seq = 0
         self._current_turn_id: int | None = None
+        #: Newest summary text streamed for the in-flight turn, so that a
+        #: supersede can preserve it instead of discarding it.
+        self._current_partial: str = ""
         self._task: asyncio.Task | None = None
         #: A question detected as mid-clause waits here briefly for a
         #: continuation to supersede it -- see `consider` / `_delayed_ask`.
@@ -263,6 +266,7 @@ class LiveSession:
                 )
             )
             self._current_turn_id = turn.turn_id
+            self._current_partial = ""
             log_metric(
                 "question_detected",
                 session_id=self.session_id,
@@ -291,7 +295,9 @@ class LiveSession:
 
     async def _cancel_current(self, reason: CancelReason) -> None:
         task, turn_id = self._task, self._current_turn_id
+        partial = self._current_partial
         self._task, self._current_turn_id = None, None
+        self._current_partial = ""
         if task is None or task.done():
             return
 
@@ -301,11 +307,40 @@ class LiveSession:
         except (asyncio.CancelledError, Exception):
             pass
 
-        if turn_id is not None:
-            self._sessions.mark_turn(turn_id, TurnStatus.CANCELLED)
-            await self.emit(
-                event(EventType.ANSWER_CANCELLED, turn_id=turn_id, reason=reason.value)
+        if turn_id is None:
+            return
+
+        # An answer that already put text on screen is worth keeping: the
+        # candidate may have been mid-read when the interviewer moved on.
+        # One that produced nothing is just noise in the history.
+        if partial.strip():
+            self._sessions.interrupt_turn(turn_id, partial)
+            log_metric(
+                "answer_interrupted_with_partial",
+                session_id=self.session_id,
+                question_id=turn_id,
+                reason=reason.value,
+                answer_partial_chars=len(partial),
             )
+        else:
+            self._sessions.mark_turn(turn_id, TurnStatus.CANCELLED)
+            log_metric(
+                "answer_cancelled_before_content",
+                session_id=self.session_id,
+                question_id=turn_id,
+                reason=reason.value,
+            )
+
+        await self.emit(
+            event(
+                EventType.ANSWER_CANCELLED,
+                turn_id=turn_id,
+                reason=reason.value,
+                # Additive, optional fields: existing clients ignore them.
+                interrupted=bool(partial.strip()),
+                partial_summary=partial or None,
+            )
+        )
 
     def _is_current(self, turn_id: int) -> bool:
         return self._current_turn_id == turn_id
@@ -446,6 +481,9 @@ class LiveSession:
             if partial and partial != last_summary:
                 is_first_visible = last_summary == ""
                 last_summary = partial
+                # Mirrored onto the session so a supersede can preserve
+                # exactly what the user had already been shown.
+                self._current_partial = partial
                 await self.emit(event(EventType.ANSWER_DELTA, turn_id=turn_id, summary=partial))
                 if is_first_visible and trace is not None:
                     trace.emit_first_token(turn_id)
