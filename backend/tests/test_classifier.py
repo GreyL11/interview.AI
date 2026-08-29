@@ -68,3 +68,114 @@ def test_a_positive_why_does_this_work_question_is_not_misclassified_as_debuggin
     debugging -- is not swept in by a generic "why does...work" match."""
     result = classify("Why does event-driven architecture work well for this?")
     assert result.category != Category.DEBUGGING
+
+
+# --------------------------------------------------------------------- SQL
+# Measured gaps: each of these was TECHNICAL_KNOWLEDGE or UNKNOWN before the
+# _SQL pattern was widened. "Find the second highest salary." was the worst --
+# UNKNOWN means is_question=False, so it was dropped without an answer at all.
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How would you find the second highest salary?",
+        "Find the second highest salary.",
+        "Find customers who never placed an order.",
+        "What's the difference between WHERE and HAVING?",
+        "When would you use a window function?",
+        "How would you rank employees by salary?",
+        "Write SQL to calculate a running total.",
+        "How do you join these two tables?",
+        "Can you rewrite that with row_number?",
+    ],
+)
+def test_sql_phrasings_are_classified_as_sql(question):
+    assert classify(question).category == Category.SQL
+
+
+def test_a_bare_find_query_is_a_question_not_unknown():
+    """UNKNOWN carries is_question=False, which drops the utterance before it
+    ever reaches the LLM -- the failure mode this pattern exists to prevent."""
+    result = classify("Find the second highest salary.")
+    assert result.is_question is True
+    assert result.requires_code is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How does database indexing work?",
+        "What is a database index?",
+        "What is a hash table?",
+        "How do you query an API?",
+        "How would you scale the database layer?",
+    ],
+)
+def test_database_topic_questions_are_not_classified_as_sql(question):
+    """SQL means "produce or reason about a query". A question that merely
+    mentions a table/index/database/query is technical knowledge; the DATABASE
+    signal belongs on the Domain axis, which these still carry."""
+    assert classify(question).category != Category.SQL
+
+
+# -------------------------------------------------------------- behavioral
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Tell me about a challenging project.",
+        "Describe a time you disagreed with your manager.",
+        "Tell me about a failure.",
+        "What's the biggest challenge you've faced?",
+        "Have you ever had a conflict with a teammate?",
+        "How did you handle a difficult stakeholder?",
+        "Give me an example of when something went wrong.",
+        "What would you say was your biggest achievement?",
+        "Tell me about a time you took ownership.",
+        "How have you influenced a team without authority?",
+        "Describe a situation where you led a project.",
+        "Tell me about a difficult problem you solved.",
+        "Tell me about a difficult technical problem you solved.",
+    ],
+)
+def test_behavioral_phrasings_are_classified_as_behavioral(question):
+    assert classify(question).category == Category.BEHAVIORAL
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the biggest challenge in distributed systems?",
+        "Describe a situation where a cache would help.",
+        "How would you solve a performance problem in production?",
+        "How does a team of microservices communicate?",
+    ],
+)
+def test_technical_questions_are_not_classified_as_behavioral(question):
+    """challenge/problem/team/situation are ordinary technical vocabulary. The
+    pattern requires a personal-past marker ("...you"), not just the noun."""
+    assert classify(question).category != Category.BEHAVIORAL
+
+
+def test_a_personal_narrative_outranks_a_topic_keyword():
+    """"tell me about a time you..." is a request for the candidate's story.
+    The "bug" keyword must not pull it into DEBUGGING."""
+    assert classify("Tell me about a time you fixed a production bug.").category == (
+        Category.BEHAVIORAL
+    )
+
+
+def test_behavioral_followups_stay_narrow_rather_than_becoming_behavioral():
+    """A follow-up must not re-trigger the full STAR schema -- "What did you
+    learn?" should answer the learning, not generate a fresh story. Keeping
+    these off Category.BEHAVIORAL is what makes that happen (see
+    _SCHEMA_BY_CATEGORY), so it is asserted rather than left implicit."""
+    for followup in (
+        "What did you learn from that?",
+        "What would you do differently?",
+        "Why did you choose that approach?",
+        "What was the outcome?",
+    ):
+        assert classify(followup).category != Category.BEHAVIORAL, followup

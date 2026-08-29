@@ -224,3 +224,187 @@ async def test_acknowledgement_after_coding_answer_is_rejected_not_answered(
 
     assert len(collector.of(EventType.QUESTION_DETECTED)) == 1
     assert collector.of(EventType.QUESTION_REJECTED)
+
+
+# ---------------------------------------------------- coding follow-up chains
+# The mechanism under test is the one that already exists: SqliteSessionMemory
+# threads previous ANSWERED turns into every prompt, and a narrow follow-up
+# classifies away from Category.CODING so it gets the generic schema rather
+# than being told to regenerate approach + code + complexity + edge cases.
+
+
+async def _ask(live, text):
+    await live.on_transcript(text, TranscriptSource.LOOPBACK, is_final=True)
+    await drain(live)
+
+
+@pytest.mark.parametrize(
+    "problem,followups",
+    [
+        (
+            "Find two numbers in an array whose sum equals a target.",
+            ["What is the time complexity?", "What about space complexity?",
+             "Can we improve the complexity?"],
+        ),
+        ("Find duplicates in an array.", ["Can you optimize it?"]),
+        (
+            "Reverse a linked list.",
+            ["What happens if the list is empty?", "What about a single node?",
+             "What edge cases should we consider?"],
+        ),
+        (
+            "Find the longest substring without repeating characters.",
+            ["Is there another approach?", "What if we use a sliding window?"],
+        ),
+        (
+            "Write a function for two sum.",
+            ["Explain the code.", "Why are we using a hash map?"],
+        ),
+        (
+            "Find two numbers whose sum equals target.",
+            ["What if the array is sorted?", "What if duplicates are allowed?",
+             "What if we cannot use extra memory?"],
+        ),
+    ],
+)
+async def test_coding_followups_keep_the_original_problem_in_context(
+    sessions, session_id, retriever, problem, followups
+):
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm, memory=SqliteSessionMemory(sessions))
+    collector = Collector()
+    live.subscribe(collector)
+
+    await _ask(live, problem)
+    for followup in followups:
+        await _ask(live, followup)
+
+    detected = collector.of(EventType.QUESTION_DETECTED)
+    assert len(detected) == 1 + len(followups)
+
+    # Every follow-up prompt carries the original problem via conversation
+    # history, and asks only its own narrow question.
+    anchor = problem.rstrip(".").split()[-1]
+    for followup, prompt in zip(followups, llm.prompts[1:]):
+        assert anchor in prompt, followup
+        # The detector normalises terminal punctuation, so compare on the stem.
+        assert followup.rstrip(".?") in prompt, followup
+
+
+async def test_a_coding_followup_does_not_request_the_full_coding_schema(
+    sessions, session_id, retriever
+):
+    """"What is the time complexity?" must not be handed the CODING schema --
+    that hint instructs the model to emit approach + code + complexity + edge
+    cases, i.e. to restate the whole solution the candidate already has."""
+    from app.llm.prompts import CODING_SCHEMA_HINT
+
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm, memory=SqliteSessionMemory(sessions))
+
+    await _ask(live, "Find two numbers in an array whose sum equals a target.")
+    assert CODING_SCHEMA_HINT in llm.prompts[0]
+
+    await _ask(live, "What is the time complexity?")
+    assert CODING_SCHEMA_HINT not in llm.prompts[-1]
+
+
+async def test_rapid_followup_chain_keeps_one_answer_per_question(
+    sessions, session_id, retriever
+):
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm, memory=SqliteSessionMemory(sessions))
+    collector = Collector()
+    live.subscribe(collector)
+
+    for text in ("Find two sum.", "What's the complexity?", "Can we optimize it?",
+                 "What if the array is sorted?"):
+        await _ask(live, text)
+
+    assert len(collector.of(EventType.ANSWER_COMPLETED)) == 4
+    answered = [t for t in sessions.get_turns(session_id) if t.status == TurnStatus.ANSWERED]
+    assert len(answered) == 4
+    # Last prompt sees the whole chain, not just the immediately previous turn.
+    assert "two sum" in llm.prompts[-1]
+    assert "sorted" in llm.prompts[-1]
+
+
+@pytest.mark.parametrize(
+    "switch",
+    [
+        "Actually, let's solve longest palindromic substring.",
+        "Actually, let's do longest palindromic substring instead.",
+        "Actually, let's switch to longest palindromic substring.",
+    ],
+)
+async def test_topic_change_phrasings_do_not_carry_the_old_problem(
+    sessions, session_id, retriever, switch
+):
+    """Measured gap: only the "let's do ... instead" phrasing dropped the
+    previous problem; "let's solve"/"let's switch to" merged it in."""
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm)
+
+    await live.on_transcript("Find two sum.", TranscriptSource.LOOPBACK, is_final=True)
+    await live.on_transcript(switch, TranscriptSource.LOOPBACK, is_final=True)
+    await drain(live)
+
+    answered = [t for t in sessions.get_turns(session_id) if t.status == TurnStatus.ANSWERED]
+    assert len(answered) == 1
+    assert "palindromic" in answered[0].question
+    assert "two sum" not in answered[0].question.lower()
+
+
+async def test_followups_after_a_topic_change_reference_the_new_topic(
+    sessions, session_id, retriever
+):
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm, memory=SqliteSessionMemory(sessions))
+
+    await _ask(live, "Find two sum.")
+    await _ask(live, "Actually, let's solve longest palindromic substring.")
+    await _ask(live, "What is the time complexity?")
+
+    assert "palindromic" in llm.prompts[-1]
+
+
+@pytest.mark.parametrize("ack", ["Okay.", "Got it.", "That makes sense."])
+async def test_acknowledgements_after_a_coding_answer_never_reach_the_llm(
+    sessions, session_id, retriever, ack
+):
+    llm = SlowStreamingLLM(chunk_delay=0)
+    live = build(sessions, session_id, retriever, llm)
+    collector = Collector()
+    live.subscribe(collector)
+
+    await _ask(live, "Find two numbers whose sum equals a target.")
+    prompts_before = len(llm.prompts)
+    await _ask(live, ack)
+
+    assert len(llm.prompts) == prompts_before
+    assert len(collector.of(EventType.QUESTION_DETECTED)) == 1
+    assert collector.of(EventType.QUESTION_REJECTED)
+
+
+async def test_an_interrupted_turn_is_excluded_from_followup_context(
+    sessions, session_id, retriever
+):
+    """A superseded answer is INTERRUPTED, and SqliteSessionMemory reads only
+    ANSWERED turns -- so a half-finished answer must not leak into the prompt
+    for the question that replaced it."""
+    llm = SlowStreamingLLM(chunk_delay=0.05)
+    live = build(sessions, session_id, retriever, llm, memory=SqliteSessionMemory(sessions))
+
+    await live.on_transcript(
+        "Find the longest substring without repeating characters.",
+        TranscriptSource.LOOPBACK, is_final=True,
+    )
+    await live.on_transcript(
+        "Actually, let's solve merge intervals.", TranscriptSource.LOOPBACK, is_final=True
+    )
+    await drain(live)
+    await _ask(live, "What is the time complexity?")
+
+    statuses = {t.status for t in sessions.get_turns(session_id)}
+    assert TurnStatus.ANSWERED in statuses
+    assert "repeating characters" not in llm.prompts[-1]

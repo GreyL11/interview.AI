@@ -18,10 +18,42 @@ _FOLLOW_UP = re.compile(r"^(and |what about|how about)\b", re.IGNORECASE)
 _CODING = re.compile(
     r"\b(write a function|write code|implement|leetcode|reverse a|"
     r"given an array|write a program|two sum|linked list|binary tree|"
-    r"character count|count.{0,15}character|palindrom\w*|longest substring)\b",
+    r"character count|count.{0,15}character|palindrom\w*|longest substring|"
+    # Spoken phrasings that carry no "write a function" preamble.
+    r"in an array|of integers|sums? to|sum equals|"
+    r"find duplicates?|duplicate elements|merge intervals|sliding window)\b",
     re.IGNORECASE,
 )
-_SQL = re.compile(r"\b(sql|select \*|join|group by|database schema|write a query)\b", re.IGNORECASE)
+# SQL means "produce or reason about a query", not "mentions a database".
+# Bare topic words (table, index, database, query) are deliberately absent:
+# "How does database indexing work?" is technical knowledge, and DATABASE is
+# already carried by the Domain axis rather than the Category.
+_SQL = re.compile(
+    r"""(?:
+        \b(?:sql|select\s+\*|join|group\s+by|database\s+schema|write\s+a\s+query)\b
+        # "when would you use a window function", "do it with row_number"
+      | \bwindow\s+function
+      | \b(?:row_number|dense_rank|partition\s+by|correlated\s+subquery)\b
+        # "the difference between WHERE and HAVING" -- HAVING alone is too
+        # common an English word, so it only counts next to its SQL partner.
+      | \b(?:where|group\s+by|select)\b[^.?!]{0,25}\bhaving\b
+      | \bhaving\b[^.?!]{0,25}\b(?:where|group\s+by|select)\b
+        # "second highest salary", "third largest order"
+      | \b(?:second|third|fourth|fifth|nth|2nd|3rd)[\s-]+(?:highest|lowest|largest|smallest)\b
+      | \brunning\s+total\b
+        # "rank employees by salary"
+      | \brank\s+\w+\s+by\b
+        # Anti-join phrasing over a data entity: "customers who never placed
+        # an order". Both halves are required so ordinary speech about people
+        # ("a teammate who never replied") does not read as SQL.
+      | \b(?:customers?|clients?|users?|employees?|students?|accounts?|orders?|
+             products?|records?|rows?|transactions?|payments?)\b
+        [^.?!]{0,40}?
+        \b(?:who|that|which)\s+
+        (?:never|no\s+longer|ha(?:ve|s)\s+not|have?n'?t|has\s?n'?t|did\s?n'?t|did\s+not|do\s?n'?t)\b
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
 _DEBUGGING = re.compile(
     r"\bbug\b|\bdebug\b|\bnot working\b|\bisn'?t working\b|\bcrash(?:ing)?\b|"
     r"\bstack trace\b|\bwhy is this failing\b|\bthrows an error\b|"
@@ -31,7 +63,50 @@ _DEBUGGING = re.compile(
 )
 _SYSTEM_DESIGN = re.compile(r"\b(design a system|design an?|scale (this|to)|architecture for|how would you design)\b", re.IGNORECASE)
 _ARCHITECTURE = re.compile(r"\b(microservices|monolith|architecture)\b", re.IGNORECASE)
-_BEHAVIORAL = re.compile(r"\b(tell me about a time|describe a situation|biggest (weakness|strength)|handle conflict|team conflict)\b", re.IGNORECASE)
+# A behavioral question asks for a *past personal narrative*. Two signals must
+# line up: a narrative request ("tell me about", "describe", "give me an
+# example") and a personal-past marker ("a time you...", "you've faced", "your
+# biggest failure"). Requiring both is what keeps "Describe a situation where a
+# cache would help" (technical) out while letting "Describe a situation where
+# you had limited information" (behavioral) in.
+_BEHAVIORAL = re.compile(
+    r"""(?:
+        # "tell me about a time", "describe a time you disagreed with..."
+        \b(?:a|an|the)\s+time\s+(?:when\s+|that\s+)?you\b
+      | \btell\s+(?:me|us)\s+about\s+a\s+time\b
+        # "a situation where you led a project" -- the trailing "you" is what
+        # separates it from "a situation where a cache would help".
+      | \ba\s+situation\s+(?:where|when|in\s+which)\s+you\b
+        # Narrative opener + an experience noun.
+      | \b(?:tell\s+(?:me|us)\s+about|describe|share|
+             give\s+(?:me|us)\s+an?\s+example\s+of|walk\s+(?:me|us)\s+through)\b
+        [^.?!]{0,40}?
+        \b(?:challenge|challenging|difficult|failure|failed|mistake|conflict|
+             disagreement|setback|achievement|accomplishment|proud|
+             went\s+wrong|fell\s+short)\b
+        # "have you ever had a conflict", "how did you handle a difficult..."
+      | \b(?:have\s+you\s+ever|did\s+you\s+ever|how\s+did\s+you)\b
+        [^.?!]{0,40}?
+        \b(?:conflict|disagree\w*|challenge|challenging|difficult|failure|
+             mistake|stakeholder|teammate|manager|pushback|went\s+wrong)\b
+        # "your biggest achievement"; and "the biggest challenge you've faced",
+        # which needs the "you" so "the biggest challenge in distributed
+        # systems" stays technical.
+      | \byour\s+biggest\s+
+        (?:challenge|failure|mistake|achievement|accomplishment|weakness|strength|success|regret)\b
+      | \bbiggest\s+
+        (?:challenge|failure|mistake|achievement|accomplishment|success|regret)\b
+        [^.?!]{0,25}\byou(?:'ve|'re|\s+have)?\b
+        # Leadership / ownership phrasings.
+      | \byou\s+(?:took|take)\s+ownership\b
+      | \bhow\s+have\s+you\s+(?:influenced|handled|dealt|managed|led|motivated|persuaded)\b
+        # Retained from the original pattern.
+      | \bbiggest\s+(?:weakness|strength)\b
+      | \bhandle\s+conflict\b
+      | \bteam\s+conflict\b
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
 _PERSONAL = re.compile(r"\b(have you ever|did you|your experience)\b", re.IGNORECASE)
 _PROJECT = re.compile(r"\b(your project|a project you|walk me through a project)\b", re.IGNORECASE)
 _RESUME = re.compile(r"\b(your resume|on your resume|your background)\b", re.IGNORECASE)
@@ -66,11 +141,17 @@ def _looks_like_question(text: str) -> bool:
 def _detect_category(text: str) -> tuple[Category, float]:
     checks: list[tuple[re.Pattern, Category]] = [
         (_FOLLOW_UP, Category.FOLLOW_UP),
-        (_CODING, Category.CODING),
+        # SQL before CODING: "write a query to find duplicate records" carries
+        # an unambiguous SQL marker, while CODING's array/duplicate phrasings
+        # are ambiguous. _SQL does not match plain array problems, so this
+        # ordering costs the coding path nothing.
         (_SQL, Category.SQL),
+        (_CODING, Category.CODING),
+        # Before DEBUGGING/SYSTEM_DESIGN: "tell me about a time you fixed a
+        # production bug" is a story about the candidate, not a debugging task.
+        (_BEHAVIORAL, Category.BEHAVIORAL),
         (_DEBUGGING, Category.DEBUGGING),
         (_SYSTEM_DESIGN, Category.SYSTEM_DESIGN),
-        (_BEHAVIORAL, Category.BEHAVIORAL),
         (_PROJECT, Category.PROJECT),
         (_RESUME, Category.RESUME),
         (_PERSONAL, Category.PERSONAL_EXPERIENCE),

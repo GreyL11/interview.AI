@@ -10,6 +10,7 @@ from app.intelligence.classifier import classify
 from app.realtime.events import RejectionReason
 from app.realtime.prompt_detector import (
     REASON_IMPERATIVE_TASK,
+    is_acknowledgement,
     REASON_NO_PATTERN,
     extract_interview_prompt,
 )
@@ -186,6 +187,10 @@ class QuestionDetector:
         supersedes = False
         if (
             not followup_eligible
+            # An acknowledgement is not a continuation. Merging "That makes
+            # sense." onto the imperative task before it rebuilds that task as
+            # a fresh question and pays for a duplicate answer.
+            and not is_acknowledgement(text)
             and self._last_accepted_at is not None
             and (now - self._last_accepted_at) * 1000 <= merge_window_ms
         ):

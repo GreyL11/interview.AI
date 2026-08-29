@@ -1,80 +1,554 @@
 {
   "_comment": "Curated regression dataset for QuestionDetector, evaluated by evaluate_detector.py. Each case replays `utterances` in order through one fresh QuestionDetector instance (so multi-turn context/correction/follow-up cases are real, not flattened). Expectations apply to the LAST utterance. `gap_ms` is the synthetic time since the previous utterance (or since t=0 for the first), fed to QuestionDetector.inspect(now=...) so window/stabilization logic is exercised deterministically, with no real sleeping.",
   "cases": [
-    {"id": "real_q_01", "group": "real_question", "utterances": [{"text": "What is caching?"}], "expect_detected": true, "expect_category": "TECHNICAL_KNOWLEDGE"},
-    {"id": "real_q_02", "group": "real_question", "utterances": [{"text": "Explain database indexing."}], "expect_detected": true, "expect_category": "TECHNICAL_KNOWLEDGE"},
-    {"id": "real_q_03", "group": "real_question", "utterances": [{"text": "Why does Redis use memory?"}], "expect_detected": true},
-    {"id": "real_q_04", "group": "real_question", "utterances": [{"text": "How would you design this system?"}], "expect_detected": true, "expect_category": "SYSTEM_DESIGN"},
-    {"id": "real_q_05", "group": "real_question", "utterances": [{"text": "Can you explain dependency injection?"}], "expect_detected": true},
-
-    {"id": "statement_01", "group": "statement", "utterances": [{"text": "I worked on caching last year."}], "expect_detected": false},
-    {"id": "statement_02", "group": "statement", "utterances": [{"text": "Redis is commonly used as a cache."}], "expect_detected": false},
-    {"id": "statement_03", "group": "statement", "utterances": [{"text": "I think indexes improve performance."}], "expect_detected": false},
-
-    {"id": "ack_01", "group": "acknowledgement", "utterances": [{"text": "Okay."}], "expect_detected": false},
-    {"id": "ack_02", "group": "acknowledgement", "utterances": [{"text": "Right."}], "expect_detected": false},
-    {"id": "ack_03", "group": "acknowledgement", "utterances": [{"text": "Got it."}], "expect_detected": false},
-    {"id": "ack_04", "group": "acknowledgement", "utterances": [{"text": "Makes sense."}], "expect_detected": false},
-    {"id": "ack_after_question", "group": "acknowledgement", "utterances": [
-      {"text": "Write a function to reverse a linked list."},
-      {"text": "Okay.", "gap_ms": 500}
-    ], "expect_detected": false, "notes": "must not be swept up as a coalesce/follow-up merge"},
-
-    {"id": "partial_01", "group": "partial", "utterances": [{"text": "Can you explain what happens when"}], "expect_detected": true, "notes": "accepted (interrogative), but must be flagged unstable so it isn't asked immediately"},
-    {"id": "partial_02", "group": "partial", "utterances": [{"text": "Given an array where"}], "expect_detected": true, "notes": "accepted (imperative 'given'), but must be flagged unstable -- trails off on a subordinator"},
-    {"id": "partial_03", "group": "partial", "utterances": [{"text": "How would you design"}], "expect_detected": true, "notes": "interrogative accepted on the words present; completeness is a separate (stable=False) signal, not rejection"},
-
-    {"id": "followup_why_with_context", "group": "followup", "utterances": [
-      {"text": "What is a hash map?"},
-      {"text": "Why?", "gap_ms": 2000}
-    ], "expect_detected": true, "notes": "bypasses min_words only because a recent question exists"},
-    {"id": "followup_why_no_context", "group": "followup", "utterances": [{"text": "Why?"}], "expect_detected": false},
-    {"id": "followup_how_with_context", "group": "followup", "utterances": [
-      {"text": "What is a hash map?"},
-      {"text": "How?", "gap_ms": 2000}
-    ], "expect_detected": true},
-    {"id": "followup_ttl_with_context", "group": "followup", "utterances": [
-      {"text": "Explain Redis caching."},
-      {"text": "What about TTL?", "gap_ms": 1500}
-    ], "expect_detected": true, "notes": "long enough that it stands on its own via '?' anyway"},
-    {"id": "followup_optimize_with_context", "group": "followup", "utterances": [
-      {"text": "How would you solve two sum?"},
-      {"text": "Can we optimize it?", "gap_ms": 1500}
-    ], "expect_detected": true},
-    {"id": "followup_complexity_no_context", "group": "followup", "utterances": [{"text": "What's the complexity?"}], "expect_detected": true, "notes": "ends in '?' so it stands alone regardless of context"},
-
-    {"id": "coding_01", "group": "coding", "utterances": [{"text": "Write a character count program."}], "expect_detected": true, "expect_category": "CODING"},
-    {"id": "coding_02", "group": "coding", "utterances": [{"text": "Given an array, find two numbers whose sum equals a target."}], "expect_detected": true, "expect_category": "CODING"},
-    {"id": "coding_03", "group": "coding", "utterances": [{"text": "Find the longest palindromic substring."}], "expect_detected": true, "expect_category": "CODING"},
-    {"id": "coding_04_followup", "group": "coding", "utterances": [
-      {"text": "Given an array, find two numbers whose sum equals a target."},
-      {"text": "What's the time complexity?", "gap_ms": 1500}
-    ], "expect_detected": true},
-    {"id": "coding_05_followup", "group": "coding", "utterances": [
-      {"text": "Given an array, find two numbers whose sum equals a target."},
-      {"text": "Can you optimize it?", "gap_ms": 1500}
-    ], "expect_detected": true},
-    {"id": "coding_06_setup_split", "group": "coding", "utterances": [
-      {"text": "Given an array of integers, I want you to find two numbers"},
-      {"text": "whose sum equals a target value", "gap_ms": 2500}
-    ], "expect_detected": true, "expect_category": "CODING", "notes": "must merge across a realistic VAD-boundary pause, not just the short coalesce window"},
-
-    {"id": "correction_01", "group": "correction", "utterances": [
-      {"text": "Explain caching."},
-      {"text": "No, explain Redis caching.", "gap_ms": 300}
-    ], "expect_detected": true, "notes": "the corrected text, not the original, must be what's detected"},
-    {"id": "correction_02_lets_do", "group": "correction", "utterances": [
-      {"text": "Find the longest substring without repeating characters."},
-      {"text": "Actually, let's do longest palindromic substring.", "gap_ms": 300}
-    ], "expect_detected": true, "expect_category": "CODING"},
-    {"id": "correction_03_how_about", "group": "correction", "utterances": [
-      {"text": "Find the longest palindromic substring."},
-      {"text": "How about using a hash map instead?", "gap_ms": 300}
-    ], "expect_detected": true},
-
-    {"id": "noisy_01_no_punct", "group": "noisy_stt", "utterances": [{"text": "what is caching"}], "expect_detected": true},
-    {"id": "noisy_02_repeated_word", "group": "noisy_stt", "utterances": [{"text": "can you explain explain indexing"}], "expect_detected": true},
-    {"id": "noisy_03_filler_prefix", "group": "noisy_stt", "utterances": [{"text": "so how does redis cache work"}], "expect_detected": true},
-    {"id": "noisy_04_word_substitution", "group": "noisy_stt", "utterances": [{"text": "explain catching strategies"}], "expect_detected": true, "notes": "'catching' for 'caching' -- detector doesn't need to know the correct word, only that this is a prompt-shaped sentence"}
+    {
+      "id": "real_q_01",
+      "group": "real_question",
+      "utterances": [
+        {
+          "text": "What is caching?"
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "TECHNICAL_KNOWLEDGE"
+    },
+    {
+      "id": "real_q_02",
+      "group": "real_question",
+      "utterances": [
+        {
+          "text": "Explain database indexing."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "TECHNICAL_KNOWLEDGE"
+    },
+    {
+      "id": "real_q_03",
+      "group": "real_question",
+      "utterances": [
+        {
+          "text": "Why does Redis use memory?"
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "real_q_04",
+      "group": "real_question",
+      "utterances": [
+        {
+          "text": "How would you design this system?"
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "SYSTEM_DESIGN"
+    },
+    {
+      "id": "real_q_05",
+      "group": "real_question",
+      "utterances": [
+        {
+          "text": "Can you explain dependency injection?"
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "statement_01",
+      "group": "statement",
+      "utterances": [
+        {
+          "text": "I worked on caching last year."
+        }
+      ],
+      "expect_detected": false
+    },
+    {
+      "id": "statement_02",
+      "group": "statement",
+      "utterances": [
+        {
+          "text": "Redis is commonly used as a cache."
+        }
+      ],
+      "expect_detected": false
+    },
+    {
+      "id": "statement_03",
+      "group": "statement",
+      "utterances": [
+        {
+          "text": "I think indexes improve performance."
+        }
+      ],
+      "expect_detected": false
+    },
+    {
+      "id": "ack_01",
+      "group": "acknowledgement",
+      "utterances": [
+        {
+          "text": "Okay."
+        }
+      ],
+      "expect_detected": false
+    },
+    {
+      "id": "ack_02",
+      "group": "acknowledgement",
+      "utterances": [
+        {
+          "text": "Right."
+        }
+      ],
+      "expect_detected": false
+    },
+    {
+      "id": "ack_03",
+      "group": "acknowledgement",
+      "utterances": [
+        {
+          "text": "Got it."
+        }
+      ],
+      "expect_detected": false
+    },
+    {
+      "id": "ack_04",
+      "group": "acknowledgement",
+      "utterances": [
+        {
+          "text": "Makes sense."
+        }
+      ],
+      "expect_detected": false
+    },
+    {
+      "id": "ack_after_question",
+      "group": "acknowledgement",
+      "utterances": [
+        {
+          "text": "Write a function to reverse a linked list."
+        },
+        {
+          "text": "Okay.",
+          "gap_ms": 500
+        }
+      ],
+      "expect_detected": false,
+      "notes": "must not be swept up as a coalesce/follow-up merge"
+    },
+    {
+      "id": "partial_01",
+      "group": "partial",
+      "utterances": [
+        {
+          "text": "Can you explain what happens when"
+        }
+      ],
+      "expect_detected": true,
+      "notes": "accepted (interrogative), but must be flagged unstable so it isn't asked immediately"
+    },
+    {
+      "id": "partial_02",
+      "group": "partial",
+      "utterances": [
+        {
+          "text": "Given an array where"
+        }
+      ],
+      "expect_detected": true,
+      "notes": "accepted (imperative 'given'), but must be flagged unstable -- trails off on a subordinator"
+    },
+    {
+      "id": "partial_03",
+      "group": "partial",
+      "utterances": [
+        {
+          "text": "How would you design"
+        }
+      ],
+      "expect_detected": true,
+      "notes": "interrogative accepted on the words present; completeness is a separate (stable=False) signal, not rejection"
+    },
+    {
+      "id": "followup_why_with_context",
+      "group": "followup",
+      "utterances": [
+        {
+          "text": "What is a hash map?"
+        },
+        {
+          "text": "Why?",
+          "gap_ms": 2000
+        }
+      ],
+      "expect_detected": true,
+      "notes": "bypasses min_words only because a recent question exists"
+    },
+    {
+      "id": "followup_why_no_context",
+      "group": "followup",
+      "utterances": [
+        {
+          "text": "Why?"
+        }
+      ],
+      "expect_detected": false
+    },
+    {
+      "id": "followup_how_with_context",
+      "group": "followup",
+      "utterances": [
+        {
+          "text": "What is a hash map?"
+        },
+        {
+          "text": "How?",
+          "gap_ms": 2000
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "followup_ttl_with_context",
+      "group": "followup",
+      "utterances": [
+        {
+          "text": "Explain Redis caching."
+        },
+        {
+          "text": "What about TTL?",
+          "gap_ms": 1500
+        }
+      ],
+      "expect_detected": true,
+      "notes": "long enough that it stands on its own via '?' anyway"
+    },
+    {
+      "id": "followup_optimize_with_context",
+      "group": "followup",
+      "utterances": [
+        {
+          "text": "How would you solve two sum?"
+        },
+        {
+          "text": "Can we optimize it?",
+          "gap_ms": 1500
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "followup_complexity_no_context",
+      "group": "followup",
+      "utterances": [
+        {
+          "text": "What's the complexity?"
+        }
+      ],
+      "expect_detected": true,
+      "notes": "ends in '?' so it stands alone regardless of context"
+    },
+    {
+      "id": "coding_01",
+      "group": "coding",
+      "utterances": [
+        {
+          "text": "Write a character count program."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "CODING"
+    },
+    {
+      "id": "coding_02",
+      "group": "coding",
+      "utterances": [
+        {
+          "text": "Given an array, find two numbers whose sum equals a target."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "CODING"
+    },
+    {
+      "id": "coding_03",
+      "group": "coding",
+      "utterances": [
+        {
+          "text": "Find the longest palindromic substring."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "CODING"
+    },
+    {
+      "id": "coding_04_followup",
+      "group": "coding",
+      "utterances": [
+        {
+          "text": "Given an array, find two numbers whose sum equals a target."
+        },
+        {
+          "text": "What's the time complexity?",
+          "gap_ms": 1500
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "coding_05_followup",
+      "group": "coding",
+      "utterances": [
+        {
+          "text": "Given an array, find two numbers whose sum equals a target."
+        },
+        {
+          "text": "Can you optimize it?",
+          "gap_ms": 1500
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "coding_06_setup_split",
+      "group": "coding",
+      "utterances": [
+        {
+          "text": "Given an array of integers, I want you to find two numbers"
+        },
+        {
+          "text": "whose sum equals a target value",
+          "gap_ms": 2500
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "CODING",
+      "notes": "must merge across a realistic VAD-boundary pause, not just the short coalesce window"
+    },
+    {
+      "id": "correction_01",
+      "group": "correction",
+      "utterances": [
+        {
+          "text": "Explain caching."
+        },
+        {
+          "text": "No, explain Redis caching.",
+          "gap_ms": 300
+        }
+      ],
+      "expect_detected": true,
+      "notes": "the corrected text, not the original, must be what's detected"
+    },
+    {
+      "id": "correction_02_lets_do",
+      "group": "correction",
+      "utterances": [
+        {
+          "text": "Find the longest substring without repeating characters."
+        },
+        {
+          "text": "Actually, let's do longest palindromic substring.",
+          "gap_ms": 300
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "CODING"
+    },
+    {
+      "id": "correction_03_how_about",
+      "group": "correction",
+      "utterances": [
+        {
+          "text": "Find the longest palindromic substring."
+        },
+        {
+          "text": "How about using a hash map instead?",
+          "gap_ms": 300
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "noisy_01_no_punct",
+      "group": "noisy_stt",
+      "utterances": [
+        {
+          "text": "what is caching"
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "noisy_02_repeated_word",
+      "group": "noisy_stt",
+      "utterances": [
+        {
+          "text": "can you explain explain indexing"
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "noisy_03_filler_prefix",
+      "group": "noisy_stt",
+      "utterances": [
+        {
+          "text": "so how does redis cache work"
+        }
+      ],
+      "expect_detected": true
+    },
+    {
+      "id": "noisy_04_word_substitution",
+      "group": "noisy_stt",
+      "utterances": [
+        {
+          "text": "explain catching strategies"
+        }
+      ],
+      "expect_detected": true,
+      "notes": "'catching' for 'caching' -- detector doesn't need to know the correct word, only that this is a prompt-shaped sentence"
+    },
+    {
+      "id": "sql_01",
+      "group": "sql",
+      "utterances": [
+        {
+          "text": "Find the second highest salary."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "SQL"
+    },
+    {
+      "id": "sql_02",
+      "group": "sql",
+      "utterances": [
+        {
+          "text": "Find customers who never placed an order."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "SQL"
+    },
+    {
+      "id": "sql_03",
+      "group": "sql",
+      "utterances": [
+        {
+          "text": "Rank employees by salary."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "SQL"
+    },
+    {
+      "id": "sql_04",
+      "group": "sql",
+      "utterances": [
+        {
+          "text": "Write a query to find duplicate records."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "SQL"
+    },
+    {
+      "id": "sql_05",
+      "group": "sql",
+      "utterances": [
+        {
+          "text": "When would you use a window function?"
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "SQL"
+    },
+    {
+      "id": "sql_06",
+      "group": "sql",
+      "utterances": [
+        {
+          "text": "How does database indexing work?"
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "TECHNICAL_KNOWLEDGE"
+    },
+    {
+      "id": "beh_01",
+      "group": "behavioral",
+      "utterances": [
+        {
+          "text": "Tell me about a challenging project."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "BEHAVIORAL"
+    },
+    {
+      "id": "beh_02",
+      "group": "behavioral",
+      "utterances": [
+        {
+          "text": "Describe a time you failed."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "BEHAVIORAL"
+    },
+    {
+      "id": "beh_03",
+      "group": "behavioral",
+      "utterances": [
+        {
+          "text": "Tell me about a disagreement with your manager."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "BEHAVIORAL"
+    },
+    {
+      "id": "beh_04",
+      "group": "behavioral",
+      "utterances": [
+        {
+          "text": "Tell me about a time you took ownership."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "BEHAVIORAL"
+    },
+    {
+      "id": "beh_05",
+      "group": "behavioral",
+      "utterances": [
+        {
+          "text": "Describe a situation where a cache would help."
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "TECHNICAL_KNOWLEDGE"
+    },
+    {
+      "id": "beh_06",
+      "group": "behavioral",
+      "utterances": [
+        {
+          "text": "Tell me about a challenging project.",
+          "gap_ms": 300
+        },
+        {
+          "text": "What did you learn from that?",
+          "gap_ms": 2000
+        }
+      ],
+      "expect_detected": true,
+      "expect_category": "PERSONAL_EXPERIENCE"
+    }
   ]
 }

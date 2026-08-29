@@ -63,7 +63,7 @@ _ACK_ONLY = re.compile(
       | (?:o?k(?:ay)?|alright|all\s+right|sure|yeah|yep|yes|no|nope|hmm+|mm+[\s-]*hmm+|uh[\s-]*huh|right)
       | thank(?:s|\s+you)(?:\s+very\s+much)?
       | i\s+(?:see|understand|agree)
-      | understood | got\s+it | makes\s+sense | sounds\s+good | fair\s+enough
+      | understood | got\s+it | (?:that\s+)?makes\s+sense | sounds\s+good | fair\s+enough
       | no\s+problem | of\s+course | absolutely | exactly | indeed
       | let(?:'s|s|\s+us)\s+(?:continue|move\s+on|proceed|go\s+on|carry\s+on)
       | moving\s+on | next | continue | done | good\s+to\s+know
@@ -71,6 +71,16 @@ _ACK_ONLY = re.compile(
     [\s.,!?]*$""",
     re.IGNORECASE | re.VERBOSE,
 )
+
+def is_acknowledgement(text: str) -> bool:
+    """True if the whole utterance is filler -- "Okay.", "That makes sense."
+
+    Exposed because the merge step needs it: folding an acknowledgement onto
+    the question it follows re-asks that question and bills a second answer
+    for it.
+    """
+    return bool(_ACK_ONLY.match(text.strip()))
+
 
 # LAYER 3 — interview prompt phrases. Safe to match anywhere in a sentence:
 # these are multi-word or distinctive enough that an incidental occurrence is
@@ -104,7 +114,11 @@ _PROMPT_ANYWHERE = re.compile(
       | i\s+wan(?:t|na)\s+to\s+(?:know|hear|understand)
       | curious\s+(?:about|how|why|what)
       | your\s+thoughts\s+on
-      | let'?s\s+(?:do|try|build|use|instead\s+do)
+      # A "let's ..." topic switch starts a new prompt, so the previous
+      # problem is not carried into it. Measured gap: "let's solve X" and
+      # "let's switch to X" were merging with the question they replaced.
+      | let'?s\s+(?:do|try|build|use|solve|tackle|instead\s+do|
+                   switch\s+to|move\s+(?:on\s+)?to|go\s+with|look\s+at|work\s+on|jump\s+to)
       | how\s+about
       | what\s+about\s+(?:doing|using|trying)
     )\b""",
@@ -129,7 +143,7 @@ _CLAUSE_INITIAL = re.compile(
         )
       | (?P<imperative>
             (?:write|implement|code|build|design|create|solve|reverse|sort|return|find|given|
-               list|name|discuss)\b
+               list|name|discuss|rank|count|group|select|calculate|compute)\b
         )
         # Deliberately absent: assume, suppose, imagine, consider, take, walk.
         # Those are scenario qualifiers that accompany a question rather than

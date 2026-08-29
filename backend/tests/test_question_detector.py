@@ -480,3 +480,48 @@ def test_acknowledgements_are_not_accepted_even_with_recent_coding_context():
     for filler, now in (("Okay.", 100.2), ("Yeah.", 100.4), ("Right.", 100.6)):
         detection = detector.inspect(filler, now=now)
         assert not detection.accepted, filler
+
+
+@pytest.mark.parametrize(
+    "switch",
+    [
+        "Actually, let's solve longest palindromic substring.",
+        "Actually, let's switch to longest palindromic substring.",
+        "Let's move on to longest palindromic substring.",
+        "Actually, let's tackle longest palindromic substring.",
+    ],
+)
+def test_lets_topic_switch_phrasings_drop_the_previous_problem(switch):
+    """Measured gap: only "let's do X instead" started a fresh prompt. "let's
+    solve X" / "let's switch to X" folded the replaced problem in with it."""
+    detector = QuestionDetector()
+    detector.inspect("Find two sum.", now=100.0)
+
+    changed = detector.inspect(switch, now=100.3)
+    assert changed.accepted
+    assert "palindromic" in changed.text
+    assert "two sum" not in changed.text.lower()
+
+
+@pytest.mark.parametrize("ack", ["Okay.", "Got it.", "That makes sense.", "Right."])
+def test_an_acknowledgement_is_never_merged_into_the_question_before_it(ack):
+    """Measured gap: a >= min_words acknowledgement inside the merge window was
+    folded onto the preceding imperative task, rebuilding it as a new question
+    and paying for a duplicate answer."""
+    detector = QuestionDetector()
+    detector.inspect("Find two numbers whose sum equals a target.", now=100.0)
+
+    detection = detector.inspect(ack, now=100.2)
+    assert not detection.accepted, ack
+    assert "sum equals" not in detection.text
+
+
+def test_a_genuine_continuation_still_merges_after_the_ack_guard():
+    """The ack guard must not cost the multi-utterance coding merge."""
+    detector = QuestionDetector(coalesce_ms=1000, context_window_ms=4000)
+    detector.inspect("Given an array of integers, I want you to find two numbers", now=100.0)
+
+    second = detector.inspect("whose sum equals a target value", now=102.5)
+    assert second.accepted and second.supersedes
+    assert "find two numbers" in second.text
+    assert "sum equals a target value" in second.text
