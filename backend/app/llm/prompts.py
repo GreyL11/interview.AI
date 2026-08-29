@@ -40,10 +40,32 @@ Rules:
     fences, no commentary outside the JSON.
 """
 
+# MEASURED (openai/gpt-oss-120b, 2026-08-29): making the field available is
+# what unlocked "can you show the optimized version?", which now returns a
+# snippet. Phrasings the model still judges conceptual -- "can you optimize
+# it?", "without extra space?", "what's the brute force approach?" -- return
+# prose regardless of how the instruction is worded; two separate prompt
+# strengthenings changed nothing. Treat further prompt-only attempts here as
+# already tried.
+#
+# `code` is optional here on purpose. A narrow follow-up to a coding or SQL
+# question ("can we do it without extra space?", "can we avoid NOT IN?") lands
+# on this schema rather than the full CODING/SQL one -- that is what keeps the
+# answer from regenerating approach + complexity + edge cases the candidate
+# already has. But without a code field the model had no way to show the one
+# thing such a follow-up is actually asking for. Measured: those follow-ups
+# came back with key_points only and no snippet.
 GENERIC_SCHEMA_HINT = """{
   "summary": "one or two sentence answer",
   "key_points": ["short bullet", "short bullet"],
-  "detailed_answer": "full explanation"
+  "detailed_answer": "full explanation",
+  "code": "REQUIRED whenever the question asks to see, write, show, optimize or
+           rewrite an implementation or query -- 'can you optimize it', 'show the
+           optimized version', 'do it without extra space', 'what is the brute
+           force approach', 'rewrite it without NOT IN', 'do it with a window
+           function'. In those cases put the actual code/query here and keep
+           key_points short. OMIT this field entirely when the question only asks
+           ABOUT something -- complexity, edge cases, trade-offs, what you learned."
 }"""
 
 CODING_SCHEMA_HINT = """{

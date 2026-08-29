@@ -77,3 +77,26 @@ def test_background_context_is_labeled_as_background_only():
 def test_no_background_section_when_nothing_to_include():
     prompt = build_prompt("What is a hash map?", Category.TECHNICAL_KNOWLEDGE, [], [])
     assert "INTERVIEW CONTEXT" not in prompt
+
+
+def test_a_narrow_followup_keeps_the_generic_schema_but_can_carry_code():
+    """A follow-up must not be handed the CODING schema (that regenerates the
+    whole solution), yet must still be *able* to return a snippet -- which is
+    what makes "can you show the optimized version?" work."""
+    prompt = build_prompt(
+        "Can you show the optimized version?", Category.TECHNICAL_KNOWLEDGE, [], []
+    )
+    assert _schema_used(prompt) == GENERIC_SCHEMA_HINT
+    assert '"code"' in prompt
+
+
+def test_ask_about_followups_are_told_to_omit_code():
+    """The field being available must not turn complexity/learning follow-ups
+    into code dumps."""
+    prompt = build_prompt("What is the time complexity?", Category.TECHNICAL_KNOWLEDGE, [], [])
+    assert "OMIT this field" in prompt
+
+
+def test_a_coding_question_itself_still_gets_the_full_coding_schema():
+    prompt = build_prompt("Reverse a linked list", Category.CODING, [], [])
+    assert _schema_used(prompt) == CODING_SCHEMA_HINT

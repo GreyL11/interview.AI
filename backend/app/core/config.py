@@ -15,6 +15,35 @@ class Settings(BaseSettings):
     gemini_retry_max_attempts: int = 3
     gemini_retry_initial_delay_seconds: float = 0.5
     gemini_retry_max_delay_seconds: float = 4.0
+    gemini_enabled: bool = True
+
+    groq_api_key: str = ""
+    groq_model: str = "openai/gpt-oss-120b"
+    groq_timeout_seconds: float = 30.0
+    groq_enabled: bool = True
+
+    # Provider routing. Order is the configured preference; a provider is
+    # only skipped when it is in cooldown or has no key. Groq leads by
+    # default only because Gemini's free tier is the one currently producing
+    # 429s here -- it is not a measured latency claim. Flip the order (or set
+    # a single name) to change it, no code change needed.
+    llm_provider_priority: str = "groq,gemini"
+    #: Cooldown after a 429 or repeated failures, when the provider sends no
+    #: Retry-After of its own.
+    llm_provider_cooldown_seconds: float = 30.0
+    #: Ceiling on a provider-supplied Retry-After, so a hostile or buggy
+    #: header can't park a provider for the rest of the session.
+    llm_provider_max_cooldown_seconds: float = 120.0
+    #: A bad key won't recover in 30s; back off harder before retrying it.
+    llm_provider_auth_cooldown_seconds: float = 300.0
+    #: Consecutive non-rate-limit failures before a provider is cooled down.
+    llm_provider_failure_threshold: int = 3
+    #: Allow a consistently faster provider to outrank configured priority.
+    llm_latency_aware_routing: bool = True
+    #: How much faster the challenger must be to displace the preferred
+    #: provider (0.8 = at least 20% faster on median first-token latency).
+    #: A margin, not a tie-break, so routing doesn't oscillate.
+    llm_latency_routing_margin: float = 0.8
 
     # Local storage
     data_dir: Path = Path("./data")
@@ -120,6 +149,13 @@ class Settings(BaseSettings):
     @property
     def db_path(self) -> Path:
         return self.data_dir / "metadata" / "app.db"
+
+    @property
+    def logs_dir(self) -> Path:
+        """Where the rotating log lives. Under data_dir so the packaged app
+        writes to LOCALAPPDATA rather than Program Files, and so the desktop
+        shell's "Open Logs Folder" has one place to point at."""
+        return self.data_dir / "logs"
 
 
 settings = Settings()

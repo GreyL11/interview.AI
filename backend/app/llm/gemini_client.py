@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import elapsed_ms, log_metric
-from app.llm.base import LLMClient, LLMError
+from app.llm.base import LLMClient, LLMError, LLMErrorKind
 from app.llm.streaming import parse_answer_payload
 from app.schemas.answer import Answer
 
@@ -38,6 +38,12 @@ class GeminiClient(LLMClient):
         "TimeoutError",
         "TimeoutException",
     }
+
+    def warmup(self) -> None:
+        try:
+            self._ensure_client()
+        except LLMError:
+            pass  # no key: still reported per-answer, as before
 
     def _ensure_client(self):
         if self._client is not None:
@@ -191,6 +197,55 @@ class GeminiClient(LLMClient):
             return True
         return exc.__class__.__name__ in self._TRANSIENT_ERROR_NAMES
 
+    def _is_rate_limit(self, exc: Exception) -> bool:
+        return self._status_code_from_error(exc) == 429
+
+    def _retry_after_seconds(self, exc: Exception) -> float | None:
+        """Honour the provider's own Retry-After hint when it sends one."""
+        for source in (exc, getattr(exc, "response", None)):
+            headers = getattr(source, "headers", None)
+            if not headers:
+                continue
+            for key in ("retry-after", "Retry-After"):
+                try:
+                    raw = headers.get(key)
+                except AttributeError:
+                    continue
+                if raw is None:
+                    continue
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _classify(self, exc: Exception) -> LLMErrorKind:
+        """Map an SDK exception onto the router's shared taxonomy. Rate limit
+        is checked before transient: 429 is in _TRANSIENT_STATUS_CODES, but
+        the router must treat it as "cool this provider down", not "retry"."""
+        if self._is_rate_limit(exc):
+            return LLMErrorKind.RATE_LIMIT
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return LLMErrorKind.TIMEOUT
+        if self._status_code_from_error(exc) in (401, 403):
+            return LLMErrorKind.AUTH
+        if self._is_transient_error(exc):
+            return LLMErrorKind.TRANSIENT
+        return LLMErrorKind.UNKNOWN
+
+    def _as_llm_error(self, exc: Exception, message: str) -> LLMError:
+        return LLMError(
+            message,
+            kind=self._classify(exc),
+            retry_after_seconds=self._retry_after_seconds(exc),
+        )
+
+    def _should_retry_locally(self, exc: Exception) -> bool:
+        """Retry inside this provider only for failures a retry can plausibly
+        fix. A 429 cannot be: burning the local retry budget on it just delays
+        the failover that will actually produce an answer."""
+        return self._is_transient_error(exc) and not self._is_rate_limit(exc)
+
     def _retry_delay_seconds(self, retry_index: int) -> float:
         base = settings.gemini_retry_initial_delay_seconds * (2**retry_index)
         capped = min(base, settings.gemini_retry_max_delay_seconds)
@@ -274,7 +329,7 @@ class GeminiClient(LLMClient):
                         exc=exc,
                         before_first_text_token=True,
                     )
-                    if not self._is_transient_error(exc):
+                    if not self._should_retry_locally(exc):
                         log_metric(
                             "llm_request_failed",
                             **self._attempt_fields(
@@ -285,7 +340,9 @@ class GeminiClient(LLMClient):
                                 before_first_text_token=True,
                             ),
                         )
-                        raise LLMError(self._request_failure_message(exc, streamed_text=False)) from exc
+                        raise self._as_llm_error(
+                            exc, self._request_failure_message(exc, streamed_text=False)
+                        ) from exc
                     if attempt < max_attempts:
                         delay_seconds = self._retry_delay_seconds(attempt - 1)
                         log_metric(
@@ -376,7 +433,7 @@ class GeminiClient(LLMClient):
                         exc=exc,
                         before_first_text_token=before_first_text,
                     )
-                    if yielded_any or not self._is_transient_error(exc):
+                    if yielded_any or not self._should_retry_locally(exc):
                         log_metric(
                             "llm_request_failed",
                             **self._attempt_fields(
@@ -387,10 +444,11 @@ class GeminiClient(LLMClient):
                                 before_first_text_token=before_first_text,
                             ),
                         )
-                        raise LLMError(
+                        raise self._as_llm_error(
+                            exc,
                             self._request_failure_message(
                                 exc, streamed_text=yielded_any or first_text_seen
-                            )
+                            ),
                         ) from exc
                     if attempt < max_attempts:
                         delay_seconds = self._retry_delay_seconds(attempt - 1)
@@ -451,8 +509,10 @@ class GeminiClient(LLMClient):
                 ),
             )
             if self._is_transient_error(last_exc):
-                raise LLMError("AI service is temporarily unavailable. Please try again.") from last_exc
-            raise LLMError("AI service request failed.") from last_exc
+                raise self._as_llm_error(
+                    last_exc, "AI service is temporarily unavailable. Please try again."
+                ) from last_exc
+            raise self._as_llm_error(last_exc, "AI service request failed.") from last_exc
         raise LLMError("AI service is temporarily unavailable. Please try again.")
 
     async def benchmark_stream_latency(
@@ -548,7 +608,7 @@ class GeminiClient(LLMClient):
                         exc=exc,
                         before_first_text_token=True,
                     )
-                    if not self._is_transient_error(exc):
+                    if not self._should_retry_locally(exc):
                         log_metric(
                             "llm_request_failed",
                             **self._attempt_fields(
@@ -559,7 +619,9 @@ class GeminiClient(LLMClient):
                                 before_first_text_token=True,
                             ),
                         )
-                        raise LLMError(self._request_failure_message(exc, streamed_text=False)) from exc
+                        raise self._as_llm_error(
+                            exc, self._request_failure_message(exc, streamed_text=False)
+                        ) from exc
                     if attempt < max_attempts:
                         delay_seconds = self._retry_delay_seconds(attempt - 1)
                         log_metric(
@@ -635,8 +697,10 @@ class GeminiClient(LLMClient):
                 ),
             )
             if self._is_transient_error(last_exc):
-                raise LLMError("AI service is temporarily unavailable. Please try again.") from last_exc
-            raise LLMError("AI service request failed.") from last_exc
+                raise self._as_llm_error(
+                    last_exc, "AI service is temporarily unavailable. Please try again."
+                ) from last_exc
+            raise self._as_llm_error(last_exc, "AI service request failed.") from last_exc
 
     async def stream_answer(self, prompt: str) -> AsyncIterator[str]:
         started = time.monotonic()

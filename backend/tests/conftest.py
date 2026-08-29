@@ -1,7 +1,19 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.question import get_orchestrator
+from app.core.config import Settings, settings as _settings
+
+# Tests assert against the code's own defaults, so they must not inherit the
+# developer's .env -- otherwise a stale local value (an old STT priority, a
+# different QUESTION_MIN_WORDS) fails tests that have nothing to do with the
+# change being made, and a real regression can hide behind a local override.
+# The singleton is mutated in place because modules already hold a reference
+# to it; rebinding the name here would not reach them.
+_pristine = Settings(_env_file=None)
+for _name in type(_pristine).model_fields:
+    setattr(_settings, _name, getattr(_pristine, _name))
+
+from app.api.question import get_orchestrator  # noqa: E402
 from app.chunking.semantic_chunker import SemanticChunker
 from app.core.deps import get_document_service
 from app.documents.parsers.base import ParserRegistry

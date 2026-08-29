@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -22,7 +23,11 @@ async def lifespan(app: FastAPI):
 
     # Crash recovery: anything still PROCESSING or ACTIVE means the process died
     # partway through. Surface it as a terminal state rather than leaving it stuck.
-    from app.core.deps import get_document_repository, get_session_repository
+    from app.core.deps import (
+        get_document_repository,
+        get_llm_client,
+        get_session_repository,
+    )
 
     stuck = get_document_repository().reset_stuck_processing()
     if stuck:
@@ -32,7 +37,14 @@ async def lifespan(app: FastAPI):
     if orphaned:
         logger.warning("closed_orphaned_sessions count=%d", orphaned)
 
+    # Provider SDK import and client construction were measured at ~2.4s, paid
+    # lazily on the first question of a session. Move it here, in a thread so
+    # startup does not block on it.
+    warm = asyncio.create_task(asyncio.to_thread(get_llm_client().warmup))
+
     yield
+
+    warm.cancel()
 
     from app.realtime.manager import session_manager
 
