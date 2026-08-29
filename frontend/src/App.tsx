@@ -23,7 +23,7 @@ const LABELS: Record<Screen, string> = {
   practice: "Practice",
   knowledge: "Knowledge",
   history: "History",
-  setup: "Setup",
+  setup: "Settings",
 };
 
 /** Health poll interval once the app is up. Slow on purpose: this is a

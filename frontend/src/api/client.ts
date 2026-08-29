@@ -6,6 +6,7 @@ import type {
   IngestResponse,
   KnowledgeType,
   ModelStatus,
+  ProviderKeyResult,
   SessionDetail,
   SessionListItem,
   SettingsUpdate,
@@ -116,6 +117,18 @@ export const api = {
       body: JSON.stringify(update),
       headers: { "Content-Type": "application/json" },
     }),
+
+  /** Save or replace a provider key. The key is sent once and never read back;
+   * the response reports status only. */
+  setProviderKey: (provider: string, apiKey: string) =>
+    request<ProviderKeyResult>(`/providers/${provider}/key`, {
+      method: "PUT",
+      body: JSON.stringify({ api_key: apiKey }),
+      headers: { "Content-Type": "application/json" },
+    }),
+
+  removeProviderKey: (provider: string) =>
+    request<ProviderKeyResult>(`/providers/${provider}/key`, { method: "DELETE" }),
 
   audioDevices: () => request<AudioDevice[]>("/audio/devices"),
 

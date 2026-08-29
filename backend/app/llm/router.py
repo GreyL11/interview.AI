@@ -106,6 +106,39 @@ class RoutingLLMClient(LLMClient):
 
     # ------------------------------------------------------------ selection
 
+    def provider_status(self) -> list[dict]:
+        """Safe, structured health for the Settings screen.
+
+        Deliberately derived from the same ProviderState the routing decisions
+        use, so what the user is shown cannot drift from what actually happens.
+        Never includes a key or any part of one -- only whether one is present.
+        """
+        now = time.monotonic()
+        order = self._priority_order()
+        eligible = self._eligible(now)
+        statuses: list[dict] = []
+        for index, name in enumerate(order):
+            state = self._state[name]
+            cooling = state.in_cooldown(now)
+            statuses.append(
+                {
+                    "name": name,
+                    "model": self._providers[name].model_name,
+                    "configured": True,  # unconfigured providers are never wired up
+                    "available": name in eligible,
+                    "cooling_down": cooling,
+                    "cooldown_remaining_seconds": (
+                        round(max(0.0, state.cooldown_until - now), 1) if cooling else None
+                    ),
+                    "role": "primary" if index == 0 else "backup",
+                    "last_failure_kind": (
+                        state.last_failure_kind.value if state.last_failure_kind else None
+                    ),
+                    "median_first_token_ms": state.median_first_token_ms(),
+                }
+            )
+        return statuses
+
     @property
     def model_name(self) -> str:
         selected = self._last_selected

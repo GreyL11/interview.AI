@@ -106,3 +106,26 @@ export async function openLogsFolder(): Promise<void> {
   const { invoke } = await core();
   await invoke("open_logs_folder");
 }
+
+/** Reveal the per-user data directory. No-op outside the desktop shell. */
+export async function openDataFolder(): Promise<void> {
+  if (!isDesktop()) return;
+  const { invoke } = await core();
+  await invoke("open_data_folder");
+}
+
+/**
+ * Installed application version, or null in a browser.
+ *
+ * Read from the shell rather than hardcoded in the bundle so it can never
+ * disagree with what the installer actually put on disk.
+ */
+export async function appVersion(): Promise<string | null> {
+  if (!isDesktop()) return null;
+  try {
+    const { getVersion } = await import("@tauri-apps/api/app");
+    return await getVersion();
+  } catch {
+    return null;
+  }
+}

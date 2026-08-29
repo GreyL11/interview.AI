@@ -102,6 +102,19 @@ fn open_logs_folder(app: tauri::AppHandle, state: tauri::State<'_, BackendState>
         .map_err(|e| e.to_string())
 }
 
+/// Reveal the per-user data directory: documents, session history, the vector
+/// index and downloaded models all live here.
+#[tauri::command]
+fn open_data_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::create_dir_all(&path);
+    tauri_plugin_opener::open_path(path.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// Start (or restart) the backend and publish the outcome.
 fn start_backend(app: &tauri::AppHandle) {
     let publish = |state: StartupState| {
@@ -213,6 +226,7 @@ fn main() {
             startup_status,
             retry_backend,
             open_logs_folder,
+            open_data_folder,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

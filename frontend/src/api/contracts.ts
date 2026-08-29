@@ -190,7 +190,39 @@ export interface SessionDetail {
 
 // ---------------------------------------------------------------- settings
 
+/** One LLM provider as Settings sees it. No key material, by design. */
+export interface ProviderStatus {
+  name: string;
+  model: string;
+  configured: boolean;
+  enabled: boolean;
+  /** Wired into the router this launch. */
+  active: boolean;
+  available: boolean;
+  cooling_down: boolean;
+  cooldown_remaining_seconds: number | null;
+  role: string | null;
+}
+
+/** Result of setting or removing a provider key. Carries no key material and
+ * nothing derived from it. */
+export interface ProviderKeyResult {
+  provider: string;
+  configured: boolean;
+  /** False when the machine has no OS credential store: the key works now but
+   * will not survive a restart. Never assume true. */
+  persisted: boolean;
+  detail: string;
+}
+
 export interface SettingsView {
+  providers: ProviderStatus[];
+  provider_priority: string;
+  /** Whether a saved key would actually survive a restart on this machine. */
+  secure_storage_available: boolean;
+  /** False today: changes apply to the running engine but are not written
+   * back to .env. Settings says so rather than implying they survive. */
+  settings_persist: boolean;
   gemini_key_configured: boolean;
   gemini_model: string;
   embedding_model: string;
@@ -207,9 +239,11 @@ export interface SettingsView {
   audio_available: boolean;
 }
 
+/** Non-secret settings only. Keys go through setProviderKey/removeProviderKey,
+ * which is the single path that also persists them. */
 export interface SettingsUpdate {
-  gemini_api_key?: string;
   gemini_model?: string;
+  groq_model?: string;
   stt_model?: string;
   stt_device?: string;
   rag_top_k?: number;
