@@ -1,73 +1,86 @@
-import type { SessionState } from "../state/sessionReducer.ts";
-import { Pill } from "./Common.tsx";
+import { liveStatus, type LiveStatus, type SessionState } from "../state/sessionReducer.ts";
 
-/** Connection, audio, and channel indicators. Deliberately explicit: during a
- * live session the user needs to know at a glance whether the app is actually
- * listening, and to which device. */
+/**
+ * The single "what is happening right now" indicator, plus per-channel audio.
+ *
+ * Every state carries a word as well as a colour and a dot shape, so nothing
+ * here is communicated by colour alone.
+ */
+const STATUS_TEXT: Record<LiveStatus, string> = {
+  idle: "Ready",
+  listening: "Listening",
+  question_detected: "Question detected",
+  thinking: "Thinking",
+  answering: "Answering",
+  connecting: "Reconnecting to local engine…",
+  disconnected: "Disconnected",
+  error: "Answer failed",
+};
+
+const STATUS_TONE: Record<LiveStatus, string> = {
+  idle: "idle",
+  listening: "live",
+  question_detected: "ok",
+  thinking: "busy",
+  answering: "busy",
+  connecting: "warn",
+  disconnected: "warn",
+  error: "bad",
+};
+
 export function StatusPills({ state }: { state: SessionState }) {
+  const status = liveStatus(state);
   return (
-    <div className="pills">
-      <Pill
-        label={connectionLabel(state)}
-        tone={
-          state.connection === "open" ? "ok" : state.connection === "closed" ? "idle" : "warn"
-        }
-        title="WebSocket connection to the local backend"
-      />
-      <Pill
-        label={audioLabel(state)}
-        tone={audioTone(state)}
-        title={state.audioMessage ?? "Local audio capture"}
-      />
-      {state.channels.map((channel) => (
-        <Pill
-          key={channel}
-          label={channel === "LOOPBACK" ? "interviewer" : "you"}
-          tone="ok"
-          title={
-            channel === "LOOPBACK"
-              ? "System audio — questions are detected on this channel"
-              : "Microphone — recorded for review, never answered"
-          }
-        />
-      ))}
+    <div className="pills" role="status" aria-live="polite">
+      <span className={`status status-${STATUS_TONE[status]}`}>
+        <span className="status-dot" aria-hidden="true" />
+        {STATUS_TEXT[status]}
+      </span>
+      <AudioChannels state={state} />
     </div>
   );
 }
 
-function connectionLabel(state: SessionState): string {
-  switch (state.connection) {
-    case "open":
-      return "connected";
-    case "connecting":
-      return "connecting…";
-    case "reconnecting":
-      return "reconnecting…";
-    case "closed":
-      return "disconnected";
-    default:
-      return "idle";
-  }
-}
+/**
+ * Interviewer and microphone reported separately.
+ *
+ * The backend deliberately keeps running on loopback alone when the mic cannot
+ * be opened, so an unavailable microphone must read as one channel being off,
+ * never as the app being broken. Losing loopback is the serious case, because
+ * that is the channel question detection runs on.
+ */
+function AudioChannels({ state }: { state: SessionState }) {
+  if (state.audio === "off" || state.audio === "stopped") return null;
 
-function audioLabel(state: SessionState): string {
-  switch (state.audio) {
-    case "ok":
-      return "listening";
-    case "starting":
-      return "starting audio…";
-    case "error":
-      return "audio unavailable";
-    case "stopped":
-      return "audio stopped";
-    default:
-      return "audio off";
-  }
-}
+  const interviewer = state.channels.includes("LOOPBACK");
+  const microphone = state.channels.includes("MIC");
 
-function audioTone(state: SessionState): "ok" | "warn" | "bad" | "idle" {
-  if (state.audio === "ok") return "ok";
-  if (state.audio === "error") return "bad";
-  if (state.audio === "starting") return "warn";
-  return "idle";
+  if (state.audio === "starting") {
+    return <span className="channel channel-pending">Starting audio…</span>;
+  }
+
+  return (
+    <>
+      <span
+        className={`channel ${interviewer ? "channel-on" : "channel-off"}`}
+        title={
+          interviewer
+            ? "System audio — questions are detected on this channel"
+            : "Without system audio, questions cannot be detected automatically"
+        }
+      >
+        Interviewer {interviewer ? "· listening" : "· unavailable"}
+      </span>
+      <span
+        className={`channel ${microphone ? "channel-on" : "channel-muted"}`}
+        title={
+          microphone
+            ? "Microphone — recorded for review, never answered"
+            : "No microphone. Question detection is unaffected."
+        }
+      >
+        Microphone {microphone ? "· on" : "· unavailable"}
+      </span>
+    </>
+  );
 }

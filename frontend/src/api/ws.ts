@@ -30,11 +30,21 @@ export class SessionSocket {
   private pendingQuestionTurnId: number | null = null;
   private pendingQuestionAt: number | null = null;
 
+  // Explicit fields rather than constructor parameter properties: the latter
+  // are not erasable type syntax, which `erasableSyntaxOnly` rejects.
+  private readonly sessionId: string;
+  private readonly onEvent: (event: ServerEvent) => void;
+  private readonly onConnection: ConnectionListener;
+
   constructor(
-    private readonly sessionId: string,
-    private readonly onEvent: (event: ServerEvent) => void,
-    private readonly onConnection: ConnectionListener,
-  ) {}
+    sessionId: string,
+    onEvent: (event: ServerEvent) => void,
+    onConnection: ConnectionListener,
+  ) {
+    this.sessionId = sessionId;
+    this.onEvent = onEvent;
+    this.onConnection = onConnection;
+  }
 
   connect(): void {
     this.closedByUs = false;

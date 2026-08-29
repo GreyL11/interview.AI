@@ -9,15 +9,19 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "node --test src/**/*.test.ts",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "tauri build",
+    "desktop:build": "npm run backend:package && npm run build && npm run tauri:build",
+    "backend:package": "cd ../backend && pyinstaller --noconfirm packaging/interview-coach-backend.spec"
   },
   "dependencies": {
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "@tauri-apps/api": "^2.1.1"
   },
   "devDependencies": {
-    "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/cli": "^2.1.0",
+    "@types/node": "^26.4.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",

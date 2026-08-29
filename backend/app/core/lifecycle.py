@@ -19,7 +19,17 @@ def announce_ready(port: int, extra: dict[str, Any] | None = None) -> None:
     number of seconds: model loading and antivirus scanning make startup time
     unpredictable, and a fixed sleep is either too slow or occasionally wrong.
     """
-    payload = {"ready": True, "port": port, "pid": os.getpid()}
+    from app.core.config import settings
+
+    payload = {
+        "ready": True,
+        "port": port,
+        "pid": os.getpid(),
+        # The shell shows an "Open Logs Folder" action on startup failure and
+        # in diagnostics; it should not have to re-derive this path.
+        "logs_dir": str(settings.logs_dir),
+        "data_dir": str(settings.data_dir),
+    }
     if extra:
         payload.update(extra)
     print(json.dumps(payload), flush=True)

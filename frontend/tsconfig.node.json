@@ -7,7 +7,13 @@
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,
     "strict": true,
-    "noEmit": true
+    // A referenced project must be composite and must emit (even if only
+    // declarations); with noEmit the root config fails TS6306/TS6310 and
+    // `tsc --noEmit` -- i.e. the whole build -- cannot run at all.
+    "composite": true,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "outDir": "./node_modules/.tmp/tsconfig.node"
   },
   "include": ["vite.config.ts"]
 }

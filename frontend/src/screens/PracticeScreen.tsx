@@ -1,6 +1,11 @@
 import { useState } from "react";
 
-import { AnswerPanel, DetectedQuestion, RejectedNote } from "../components/AnswerPanel.tsx";
+import {
+  AnswerPanel,
+  DetectedQuestion,
+  HistoryTurn,
+  RejectedNote,
+} from "../components/AnswerPanel.tsx";
 import { ErrorNote, Panel } from "../components/Common.tsx";
 import { StatusPills } from "../components/StatusPills.tsx";
 import { TranscriptPane } from "../components/TranscriptPane.tsx";
@@ -93,8 +98,7 @@ export function PracticeScreen() {
           <ul className="turn-list">
             {turns.slice(1).map((turn) => (
               <li key={turn.turnId}>
-                <span className="turn-q">{turn.question}</span>
-                <span className={`turn-phase phase-${turn.phase}`}>{turn.phase}</span>
+                <HistoryTurn turn={turn} />
               </li>
             ))}
           </ul>

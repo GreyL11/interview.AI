@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -27,6 +27,9 @@ use tauri::{AppHandle, Manager};
 /// ONNX model and may be fighting an antivirus scan of a freshly extracted
 /// PyInstaller directory.
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long /health may take to answer once the socket is up. Short: by this
+/// point the process has already loaded its models and bound its port.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Grace period between asking the backend to stop and killing it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -43,6 +46,10 @@ pub struct BackendHandle {
     /// Production spawns the PyInstaller exe directly and the two match, but
     /// dev mode needs this to shut down reliably.
     pub reported_pid: Option<u32>,
+    /// Where the backend is writing its rotating log, as the backend itself
+    /// reports it. Read from the readiness line rather than re-derived here,
+    /// so the two can never disagree about which directory to open.
+    pub logs_dir: Option<String>,
 }
 
 pub struct BackendProcess {
@@ -59,6 +66,8 @@ struct ReadyLine {
     port: u16,
     #[serde(default)]
     pid: Option<u32>,
+    #[serde(default)]
+    logs_dir: Option<String>,
 }
 
 /// Ask the OS for a free port, then release it.
@@ -166,36 +175,139 @@ pub fn spawn(app: &AppHandle) -> Result<BackendProcess, String> {
     #[cfg(windows)]
     job_object::assign_current_process_job(&child);
 
-    let reported_pid = wait_until_ready(&mut child)?;
+    // stderr MUST be drained. It is a piped handle with a fixed OS buffer, so a
+    // backend that logs enough to fill it blocks on write and never reaches
+    // readiness -- a hang indistinguishable from a slow model load. Draining
+    // into a bounded tail also gives the failure screen something concrete to
+    // show instead of "did not become ready in time".
+    let stderr_tail = drain_stderr(&mut child);
+
+    progress(app, "starting_engine", "Starting local AI engine");
+    let ready = wait_until_ready(&mut child, &stderr_tail)?;
+
+    // The readiness line is printed once uvicorn's socket accepts, but the
+    // shell's contract with the UI is the HTTP API -- so confirm the API really
+    // answers before declaring the backend up.
+    progress(app, "connecting", "Connecting to interview session");
+    confirm_health(port, &token, &mut child, &stderr_tail)?;
 
     Ok(BackendProcess {
         child: Some(child),
         handle: BackendHandle {
             port,
             token,
-            reported_pid,
+            reported_pid: ready.pid,
+            logs_dir: ready.logs_dir,
         },
     })
+}
+
+/// Emit a startup stage to the UI. Named stages, never a fabricated
+/// percentage: the shell genuinely cannot know how long model loading takes.
+fn progress(app: &AppHandle, stage: &str, label: &str) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "backend://startup",
+        serde_json::json!({ "stage": stage, "label": label }),
+    );
+}
+
+/// Last few stderr lines, kept for the failure screen.
+type StderrTail = Arc<Mutex<Vec<String>>>;
+const STDERR_TAIL_LINES: usize = 40;
+
+fn drain_stderr(child: &mut Child) -> StderrTail {
+    let tail: StderrTail = Arc::new(Mutex::new(Vec::new()));
+    let Some(stderr) = child.stderr.take() else {
+        return tail;
+    };
+    let sink = Arc::clone(&tail);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            log::warn!("backend stderr: {line}");
+            if let Ok(mut buffer) = sink.lock() {
+                if buffer.len() == STDERR_TAIL_LINES {
+                    buffer.remove(0);
+                }
+                buffer.push(line);
+            }
+        }
+    });
+    tail
+}
+
+fn tail_text(tail: &StderrTail) -> String {
+    tail.lock()
+        .map(|buffer| buffer.join("\n"))
+        .unwrap_or_default()
+}
+
+fn with_tail(message: String, tail: &StderrTail) -> String {
+    let text = tail_text(tail);
+    if text.is_empty() {
+        message
+    } else {
+        format!("{message}\n\n{text}")
+    }
+}
+
+/// Poll `/health` until it answers. The readiness line already said the socket
+/// is open; this proves the app behind it is actually serving.
+fn confirm_health(
+    port: u16,
+    token: &str,
+    child: &mut Child,
+    tail: &StderrTail,
+) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let deadline = Instant::now() + HEALTH_TIMEOUT;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(with_tail(
+                format!("backend exited during startup with {status}"),
+                tail,
+            ));
+        }
+        let responded = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .timeout(Duration::from_secs(2))
+            .call()
+            .is_ok();
+        if responded {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(with_tail(
+                "backend started but its API never answered".to_string(),
+                tail,
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }
 
 /// Block until the backend prints its readiness line.
 ///
 /// Reading stdout rather than sleeping or polling: startup time depends on
 /// model loading and antivirus, so any fixed delay is either wasteful or wrong.
-fn wait_until_ready(child: &mut Child) -> Result<Option<u32>, String> {
+fn wait_until_ready(child: &mut Child, tail: &StderrTail) -> Result<Ready, String> {
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "backend stdout unavailable".to_string())?;
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<Option<u32>, String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Ready, String>>();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let Ok(line) = line else { break };
             if let Ok(parsed) = serde_json::from_str::<ReadyLine>(&line) {
                 if parsed.ready {
-                    let _ = tx.send(Ok(parsed.pid));
+                    let _ = tx.send(Ok(Ready {
+                        pid: parsed.pid,
+                        logs_dir: parsed.logs_dir,
+                    }));
                     // Keep draining: a full stdout pipe would block the backend.
                     continue;
                 }
@@ -208,22 +320,34 @@ fn wait_until_ready(child: &mut Child) -> Result<Option<u32>, String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            return Err(format!("backend exited during startup with {status}"));
+            return Err(with_tail(
+                format!("backend exited during startup with {status}"),
+                tail,
+            ));
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(pid)) => return Ok(pid),
-            Ok(Err(message)) => return Err(message),
+            Ok(Ok(ready)) => return Ok(ready),
+            Ok(Err(message)) => return Err(with_tail(message, tail)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("backend stdout closed".into())
+                return Err(with_tail("backend stdout closed".into(), tail))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if Instant::now() > deadline {
                     let _ = child.kill();
-                    return Err("backend did not become ready in time".into());
+                    return Err(with_tail(
+                        "backend did not become ready in time".into(),
+                        tail,
+                    ));
                 }
             }
         }
     }
+}
+
+/// What the readiness line told us about the running backend.
+struct Ready {
+    pid: Option<u32>,
+    logs_dir: Option<String>,
 }
 
 impl BackendProcess {

@@ -1,4 +1,10 @@
-import { displaySummary, type TurnView } from "../state/sessionReducer.ts";
+import {
+  displaySummary,
+  hasExpandableAnswer,
+  historyStatus,
+  type TurnView,
+} from "../state/sessionReducer.ts";
+import { CodeBlock } from "./CodeBlock.tsx";
 import { Empty, Pill, Spinner } from "./Common.tsx";
 
 const REJECTION_TEXT: Record<string, string> = {
@@ -61,9 +67,11 @@ export function AnswerPanel({ turn }: { turn: TurnView | null }) {
       {turn.phase === "failed" && <p className="error-note">{turn.errorMessage}</p>}
       {turn.phase === "cancelled" && (
         <p className="muted">
-          {turn.cancelReason === "superseded"
-            ? "Superseded by a newer question."
-            : "Cancelled."}
+          {turn.interrupted
+            ? "Interrupted — partial answer, incomplete."
+            : turn.cancelReason === "superseded"
+              ? "Superseded by a newer question."
+              : "Cancelled."}
         </p>
       )}
 
@@ -107,9 +115,7 @@ export function AnswerPanel({ turn }: { turn: TurnView | null }) {
           )}
 
           {answer.code !== null && answer.code !== "" && (
-            <pre className="code">
-              <code>{answer.code}</code>
-            </pre>
+            <CodeBlock code={answer.code} />
           )}
 
           {answer.complexity !== null && (
@@ -146,8 +152,17 @@ export function AnswerPanel({ turn }: { turn: TurnView | null }) {
                   : "No personal context was found; treat first-person claims as illustrative"
               }
             />
+            {/* Lead with time-to-first-answer: a bare total reads as "you
+                waited this long", which is wrong once text streams. */}
+            {turn.firstTokenMs !== null && (
+              <span className="muted" title="Time until the answer started appearing">
+                {(turn.firstTokenMs / 1000).toFixed(1)}s to first words
+              </span>
+            )}
             {turn.latencyMs !== null && (
-              <span className="muted">{(turn.latencyMs / 1000).toFixed(1)}s</span>
+              <span className="muted" title="Time until the full answer finished generating">
+                {(turn.latencyMs / 1000).toFixed(1)}s total
+              </span>
             )}
             {turn.hits.map((hit) => (
               <span key={hit.chunk_id} className="hit" title={`score ${hit.score.toFixed(3)}`}>
@@ -158,5 +173,46 @@ export function AnswerPanel({ turn }: { turn: TurnView | null }) {
         </>
       )}
     </div>
+  );
+}
+
+const HISTORY_TONE = {
+  answered: "ok",
+  interrupted: "warn",
+  cancelled: "idle",
+  failed: "warn",
+  active: "ok",
+} as const;
+
+/**
+ * One row in "Earlier this session".
+ *
+ * Uses a native <details> rather than lifting open/closed into the reducer:
+ * expanding old answers is per-row view state that must never touch the live
+ * turn, and the element keeps its own state through re-renders while a new
+ * answer streams. Rows with nothing to show render as plain text, so a turn
+ * cancelled before any content never offers an expander that opens onto
+ * nothing.
+ */
+export function HistoryTurn({ turn }: { turn: TurnView }) {
+  const status = historyStatus(turn);
+  const label = (
+    <>
+      <span className="turn-q">{turn.question}</span>
+      <Pill label={status} tone={HISTORY_TONE[status]} />
+    </>
+  );
+
+  if (!hasExpandableAnswer(turn)) {
+    return <div className="turn-row">{label}</div>;
+  }
+
+  return (
+    <details className="turn-row">
+      <summary>{label}</summary>
+      {/* AnswerPanel already prints the "Interrupted — partial answer" note
+          for a cancelled turn, so this row does not repeat it. */}
+      <AnswerPanel turn={turn} />
+    </details>
   );
 }

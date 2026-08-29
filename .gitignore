@@ -28,6 +28,9 @@ index.pkl
 models/
 .cache/
 
+# PyInstaller intermediate output (dist/ is already covered above)
+backend/build/
+
 # Node / Tauri (later phases)
 node_modules/
 dist/

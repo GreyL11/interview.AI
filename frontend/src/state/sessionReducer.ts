@@ -53,8 +53,21 @@ export interface TurnView {
   answer: Answer | null;
   contextFound: boolean;
   hits: RetrievalHitView[];
+  /** Server time from question.detected to the first answer.delta -- how long
+   * the candidate actually stared at nothing. This, not `latencyMs`, is the
+   * number that matters live. */
+  firstTokenMs: number | null;
+  /** Server time from question.detected to answer.completed, i.e. the whole
+   * generation including text the user was already reading. Always >=
+   * `firstTokenMs`; on its own it overstates the perceived wait. */
   latencyMs: number | null;
+  /** question.detected `ts`, kept only to derive `firstTokenMs`. */
+  detectedTs: string | null;
   cancelReason: CancelReason | null;
+  /** Superseded *after* useful text had already streamed, so
+   * `streamingSummary` holds a partial answer worth showing in history.
+   * A plain cancellation (nothing streamed yet) leaves this false. */
+  interrupted: boolean;
   errorMessage: string | null;
 }
 
@@ -116,6 +129,17 @@ function classificationOf(event: ServerEvent): Classification | null {
   return typeof raw === "object" && raw !== null ? (raw as Classification) : null;
 }
 
+/** Milliseconds between two server event timestamps, or null if either is
+ * missing or unparseable. Server-stamped on purpose: the reducer stays pure
+ * and the tests stay deterministic. */
+function elapsedMs(from: string | null | undefined, to: string): number | null {
+  if (!from) return null;
+  const start = Date.parse(from);
+  const end = Date.parse(to);
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  return Math.max(0, end - start);
+}
+
 function newTurn(event: ServerEvent, turnId: number): TurnView {
   return {
     turnId,
@@ -126,8 +150,11 @@ function newTurn(event: ServerEvent, turnId: number): TurnView {
     answer: null,
     contextFound: false,
     hits: [],
+    firstTokenMs: null,
     latencyMs: null,
+    detectedTs: event.ts,
     cancelReason: null,
+    interrupted: false,
     errorMessage: null,
   };
 }
@@ -241,7 +268,10 @@ function applyEvent(state: SessionState, event: ServerEvent): SessionState {
       const history =
         base.current !== null && !isTerminal(base.current.phase)
           ? [...base.history, { ...base.current, phase: "cancelled" as TurnPhase,
-              cancelReason: "superseded" as CancelReason }]
+              cancelReason: "superseded" as CancelReason,
+              // No answer.cancelled arrived, so infer it: text already on
+              // screen means this was an interruption, not a bare cancel.
+              interrupted: base.current.streamingSummary.trim() !== "" }]
           : base.history;
       return {
         ...base,
@@ -266,6 +296,9 @@ function applyEvent(state: SessionState, event: ServerEvent): SessionState {
       return withCurrent(base, {
         phase: "streaming",
         streamingSummary: str(event.data, "summary"),
+        // First delta only -- later ones are just more of the same answer.
+        firstTokenMs:
+          base.current?.firstTokenMs ?? elapsedMs(base.current?.detectedTs, event.ts),
       });
 
     case "answer.completed": {
@@ -287,6 +320,11 @@ function applyEvent(state: SessionState, event: ServerEvent): SessionState {
       return retire(base, {
         phase: "cancelled",
         cancelReason: (str(event.data, "reason") || null) as CancelReason | null,
+        // Optional backend field; fall back to whether anything streamed so
+        // an older backend still renders history correctly.
+        interrupted:
+          bool(event.data, "interrupted") ||
+          (base.current?.streamingSummary ?? "").trim() !== "",
       });
 
     case "answer.error":
@@ -354,4 +392,68 @@ export function isAnswering(state: SessionState): boolean {
  * partial text still streaming in. */
 export function displaySummary(turn: TurnView): string {
   return turn.answer?.summary ?? turn.streamingSummary;
+}
+
+/**
+ * One word for "what is the app doing right now", derived from state the
+ * reducer already holds. A selector rather than a stored field: a second copy
+ * of this could disagree with the events it was derived from, and this is
+ * exactly the thing the user must be able to trust at a glance.
+ */
+export type LiveStatus =
+  | "disconnected"
+  | "connecting"
+  | "error"
+  | "thinking"
+  | "answering"
+  | "question_detected"
+  | "listening"
+  | "idle";
+
+export function liveStatus(state: SessionState): LiveStatus {
+  if (state.connection === "closed" || state.connection === "idle") {
+    return state.sessionId === null ? "idle" : "disconnected";
+  }
+  if (state.connection === "connecting" || state.connection === "reconnecting") {
+    return "connecting";
+  }
+  const current = state.current;
+  if (current !== null) {
+    if (current.phase === "failed") return "error";
+    // Retrieving and streaming-with-no-text-yet both read as "working on it";
+    // splitting them would flicker the indicator for no informational gain.
+    if (current.phase === "retrieving") return "thinking";
+    if (current.phase === "streaming") {
+      return displaySummary(current) === "" ? "thinking" : "answering";
+    }
+    if (current.phase === "detected") return "question_detected";
+  }
+  return state.audio === "ok" ? "listening" : "idle";
+}
+
+/** How a finished turn should read in the history list. Separate from
+ * `TurnPhase` because "cancelled" covers two outcomes the user experiences
+ * very differently: text they were mid-read of, versus nothing at all. */
+export type HistoryStatus = "answered" | "interrupted" | "cancelled" | "failed" | "active";
+
+export function historyStatus(turn: TurnView): HistoryStatus {
+  if (!isTerminal(turn.phase)) return "active";
+  if (turn.phase === "answered") return "answered";
+  if (turn.phase === "failed") return "failed";
+  return turn.interrupted && turn.streamingSummary.trim() !== ""
+    ? "interrupted"
+    : "cancelled";
+}
+
+/** Whether a history row has anything worth expanding.
+ *
+ * A turn cancelled before any useful text produced no answer, so offering an
+ * expander there would promise content that does not exist. Reads the same
+ * TurnView the active panel reads -- there is deliberately no second answer
+ * store to keep in sync. */
+export function hasExpandableAnswer(turn: TurnView): boolean {
+  const status = historyStatus(turn);
+  if (status === "answered") return turn.answer !== null;
+  if (status === "interrupted") return turn.streamingSummary.trim() !== "";
+  return false;
 }

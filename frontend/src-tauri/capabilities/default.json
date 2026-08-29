@@ -1,11 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimum capability set. The UI talks to the local backend over plain HTTP and WebSocket, so it needs no filesystem, no HTTP plugin, and no shell access of its own.",
-  "windows": ["main"],
+  "description": "Minimum capability set. The UI talks to the local backend over plain HTTP and WebSocket, so it needs no filesystem and no shell access of its own. `opener:allow-open-path` exists solely for the startup-failure screen's \"Open Logs Folder\" action, whose path comes from the backend itself.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "opener:allow-open-path"
   ]
 }

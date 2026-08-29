@@ -13,6 +13,11 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
+# Single instance: two copies would each spawn a backend and fight over the
+# SQLite database and the audio device.
+tauri-plugin-single-instance = "2"
+# Opens the log folder in Explorer for the startup-failure screen.
+tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
