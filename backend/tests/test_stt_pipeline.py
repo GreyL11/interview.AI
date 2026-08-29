@@ -5,10 +5,11 @@ import time
 import numpy as np
 import pytest
 
-from app.audio.base import AudioChannel
+from app.audio.base import AudioChannel, AudioError
 from app.sessions.schemas import TranscriptSource
 from app.stt.base import SttError, Transcript
 from app.stt.pipeline import AudioPipeline, TranscriptionWorker
+from app.stt.scheduler import InferenceScheduler
 from app.stt.vad import FRAME_MS
 from tests.fakes import (
     FakeAudioSource,
@@ -379,3 +380,252 @@ async def test_a_final_matching_its_partial_is_not_flagged(monkeypatch):
     await run_worker(probabilities, frames, engine=FakeSttEngine(), partial_interval_ms=200)
 
     assert not [f for e, f in events if e == "stt_final_diverges_from_partial"]
+
+
+# --------------------------------------------- partial capture-device failure
+
+
+class UnopenableAudioSource(RecordingAudioSource):
+    """Enumerates fine, fails when the stream is actually opened -- a device
+    that is disabled in the OS or held by another process. Reproduced on real
+    hardware: a laptop whose mic raised PaErrorCode -9996 at open time."""
+
+    def start(self):
+        raise AudioError("Error opening InputStream: Invalid device")
+
+
+async def test_a_channel_that_fails_to_open_does_not_take_down_the_others():
+    """Loopback is the channel that hears the interviewer and drives question
+    detection. A broken mic must cost the mic only -- audio_binding already
+    applies this policy at describe() time, and open() must match it."""
+    loop = asyncio.get_running_loop()
+    loopback = RecordingAudioSource(silence_frames(5), channel=AudioChannel.LOOPBACK)
+    mic = UnopenableAudioSource(silence_frames(5), channel=AudioChannel.MIC)
+
+    def worker_for(source):
+        return TranscriptionWorker(
+            source=source,
+            detector=ScriptedSpeechDetector([0.0] * 5),
+            engine=FakeSttEngine(),
+            loop=loop,
+            on_transcript=Recorder(),
+        )
+
+    pipeline = AudioPipeline([worker_for(loopback), worker_for(mic)])
+    await asyncio.to_thread(pipeline.start)
+
+    assert loopback.started.is_set()
+    assert pipeline.channels == [TranscriptSource.LOOPBACK]
+    pipeline.stop()
+
+
+async def test_every_channel_failing_to_open_is_still_an_error():
+    loop = asyncio.get_running_loop()
+    mic = UnopenableAudioSource(silence_frames(5), channel=AudioChannel.MIC)
+    worker = TranscriptionWorker(
+        source=mic,
+        detector=ScriptedSpeechDetector([0.0] * 5),
+        engine=FakeSttEngine(),
+        loop=loop,
+        on_transcript=Recorder(),
+    )
+    pipeline = AudioPipeline([worker])
+
+    with pytest.raises(AudioError, match="No capture device could be opened"):
+        await asyncio.to_thread(pipeline.start)
+
+
+# ------------------------------------ stale-partial handling (measured issue)
+#
+# The scheduler already cancels *queued* partials when a final is scheduled
+# (_cancel_stale_partials_locked) and suppresses stale partial *results* at
+# emission. What it cannot do is preempt a partial that is already running --
+# CTranslate2 inference is not interruptible. The measured 1608ms of final
+# queue wait came from exactly that case, so these tests pin the one lever that
+# is actually available: not starting a doomed partial in the first place.
+
+
+def _worker(source, engine, detector, loop):
+    """A worker with its OWN scheduler.
+
+    Not the shared singleton: acquire/release on it is refcounted and its
+    shutdown sentinels live in a process-wide queue, so a test that leaves it
+    even slightly unbalanced silently starves a *later* test of inference
+    workers. That was reproducible here as an intermittent failure in
+    test_partials_are_emitted_during_a_long_utterance. The scheduler's own
+    docstring calls for tests to inject an instance; this does.
+    """
+    return TranscriptionWorker(
+        source=source,
+        detector=detector,
+        engine=engine,
+        loop=loop,
+        on_transcript=Recorder(),
+        scheduler=InferenceScheduler(workers=1),
+    )
+
+
+async def test_final_cancels_a_queued_partial_without_running_inference():
+    """FINAL arrives while a PARTIAL is still queued: the partial must be
+    skipped before Whisper is ever called, and the final must still run."""
+    loop = asyncio.get_running_loop()
+    engine = FakeSttEngine()
+    worker = _worker(RecordingAudioSource(silence_frames(1)), engine,
+                     ScriptedSpeechDetector([0.0]), loop)
+    scheduler = worker._scheduler
+    scheduler.acquire()
+    blocker = threading.Event()
+    try:
+        # Occupy the single inference worker so the partial provably stays
+        # QUEUED -- otherwise this races the pool and tests nothing.
+        scheduler.submit(lambda: blocker.wait(5), channel=AudioChannel.LOOPBACK)
+        audio = np.concatenate(speech_frames(20))
+        worker._submit_partial_locked(1, audio)
+        queued = worker._partial_job
+        assert queued is not None
+        worker._cancel_stale_partials_locked(1)
+
+        assert queued.cancelled
+        assert worker.partials_cancelled == 1
+        # The decisive assertion: no inference was performed for the partial.
+        assert engine.calls == []
+    finally:
+        blocker.set()
+        scheduler.release()
+
+
+async def test_a_partial_is_not_started_when_the_final_is_provably_closer():
+    """The one real lever for the *running* case: don't start the partial.
+
+    Reproduces the measured trace -- a partial scheduled part-way into the
+    trailing silence run, whose measured cost exceeds the remaining silence
+    budget, so it could only ever delay the final."""
+    loop = asyncio.get_running_loop()
+    engine = FakeSttEngine()
+    worker = _worker(RecordingAudioSource(silence_frames(1)), engine,
+                     ScriptedSpeechDetector([0.0]), loop)
+
+    # Speech is open and 224ms into its trailing silence run (7 frames).
+    worker._segmenter.in_speech = True
+    worker._segmenter._silence_run = 7
+    # The last partial measurably took longer than the remaining silence
+    # budget (700 - 224 = 476ms), so this one cannot finish first.
+    worker._last_partial_inference_ms = 2092.0
+
+    assert worker._final_beats_partial() is True
+    worker._schedule_partial(1, speech_frames(40), buffered_ms=1280)
+
+    assert worker.partials_skipped_near_final == 1
+    assert worker.partials_scheduled == 0
+    assert engine.calls == []
+
+
+async def test_a_partial_still_runs_while_speech_is_active():
+    """The guard must be inert during real speech, or live transcript
+    responsiveness is lost for no latency gain."""
+    loop = asyncio.get_running_loop()
+    engine = FakeSttEngine()
+    worker = _worker(RecordingAudioSource(silence_frames(1)), engine,
+                     ScriptedSpeechDetector([0.0]), loop)
+    scheduler = worker._scheduler
+    scheduler.acquire()
+    try:
+        worker._segmenter.in_speech = True
+        worker._segmenter._silence_run = 0  # still talking
+        worker._last_partial_inference_ms = 2092.0
+
+        assert worker._final_beats_partial() is False
+        worker._schedule_partial(1, speech_frames(40), buffered_ms=1280)
+
+        assert worker.partials_skipped_near_final == 0
+        assert worker.partials_scheduled == 1
+    finally:
+        scheduler.release()
+
+
+@pytest.mark.parametrize("measured", [0.0, 1.0, FRAME_MS - 1])
+async def test_a_partial_cheaper_than_one_frame_is_never_skipped(measured):
+    """Two cases in one predicate. Nothing measured yet: a cold worker must
+    still produce its first partial, or it never learns a cost. Measured but
+    trivial (a fast model, or a fake engine in tests): it cannot meaningfully
+    delay the final, so suppressing it would cost live-transcript text for no
+    latency gain."""
+    loop = asyncio.get_running_loop()
+    worker = _worker(RecordingAudioSource(silence_frames(1)), FakeSttEngine(),
+                     ScriptedSpeechDetector([0.0]), loop)
+    worker._segmenter.in_speech = True
+    worker._segmenter._silence_run = 21  # deep into the silence run
+    worker._last_partial_inference_ms = measured
+
+    assert worker._final_beats_partial() is False
+
+
+async def test_a_cheap_partial_still_runs_late_in_the_silence_run():
+    """The guard is a comparison against measured cost, not a blanket ban on
+    partials during silence: a fast model should still get its partial."""
+    loop = asyncio.get_running_loop()
+    worker = _worker(RecordingAudioSource(silence_frames(1)), FakeSttEngine(),
+                     ScriptedSpeechDetector([0.0]), loop)
+    worker._segmenter.in_speech = True
+    worker._segmenter._silence_run = 7          # 224ms in, 476ms of budget left
+    worker._last_partial_inference_ms = 120.0   # comfortably finishes first
+
+    assert worker._final_beats_partial() is False
+
+
+async def test_a_final_is_never_skipped_by_partial_invalidation():
+    """Invalidation must only ever touch partials."""
+    loop = asyncio.get_running_loop()
+    engine = FakeSttEngine()
+    worker = _worker(RecordingAudioSource(silence_frames(1)), engine,
+                     ScriptedSpeechDetector([0.0]), loop)
+    scheduler = worker._scheduler
+    scheduler.acquire()
+    try:
+        worker._schedule_final(1, speech_frames(20))
+        final = next(j for j in worker._outstanding if j.is_final)
+        # A later final for the same utterance must not cancel the first.
+        worker._cancel_stale_partials_locked(1)
+        assert not final.cancelled
+        final.wait(timeout=5)
+        assert any(is_final for _, is_final in engine.calls)
+    finally:
+        scheduler.release()
+
+
+async def test_a_partial_for_a_newer_utterance_is_not_cancelled():
+    """Utterance ids are the generation token; a final for utterance 1 must
+    leave utterance 2's partial alone."""
+    loop = asyncio.get_running_loop()
+    worker = _worker(RecordingAudioSource(silence_frames(1)), FakeSttEngine(),
+                     ScriptedSpeechDetector([0.0]), loop)
+    scheduler = worker._scheduler
+    scheduler.acquire()
+    try:
+        worker._submit_partial_locked(2, np.concatenate(speech_frames(20)))
+        newer = worker._partial_job
+        worker._cancel_stale_partials_locked(1)
+        assert newer is not None and not newer.cancelled
+        newer.cancel()
+    finally:
+        scheduler.release()
+
+
+async def test_a_partial_result_arriving_after_its_final_is_suppressed():
+    """PARTIAL running when FINAL lands: no preemption is claimed, but the
+    stale text must never reach the UI."""
+    loop = asyncio.get_running_loop()
+    recorder = Recorder()
+    worker = TranscriptionWorker(
+        source=RecordingAudioSource(silence_frames(1)),
+        detector=ScriptedSpeechDetector([0.0]),
+        engine=FakeSttEngine(),
+        loop=loop,
+        on_transcript=recorder,
+    )
+    worker._published_final_utterance_id = 1  # final already published
+
+    await asyncio.to_thread(worker._transcribe, np.concatenate(speech_frames(20)), False, 1)
+    await asyncio.sleep(0.05)
+
+    assert recorder.calls == []

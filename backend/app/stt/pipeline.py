@@ -4,7 +4,7 @@ import time
 
 import numpy as np
 
-from app.audio.base import SAMPLE_RATE, AudioChannel, AudioSource
+from app.audio.base import SAMPLE_RATE, AudioChannel, AudioError, AudioSource
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import LatencyTrace, elapsed_ms, log_metric
@@ -104,6 +104,10 @@ class TranscriptionWorker:
         self.partials_coalesced = 0
         self.partials_skipped = 0
         self.partials_cancelled = 0
+        #: Partials not started because a final was provably closer than the
+        #: measured cost of running them. Counted separately from
+        #: `partials_skipped` so the two policies stay tellable apart.
+        self.partials_skipped_near_final = 0
         self.errors = 0
 
     @property
@@ -189,12 +193,14 @@ class TranscriptionWorker:
 
         logger.info(
             "transcription_worker_metrics channel=%s frames=%d partials_scheduled=%d "
-            "partials_coalesced=%d partials_skipped=%d partials_cancelled=%d errors=%d",
+            "partials_coalesced=%d partials_skipped=%d partials_skipped_near_final=%d "
+            "partials_cancelled=%d errors=%d",
             self._source.channel.value,
             self.frames_consumed,
             self.partials_scheduled,
             self.partials_coalesced,
             self.partials_skipped,
+            self.partials_skipped_near_final,
             self.partials_cancelled,
             self.errors,
         )
@@ -332,12 +338,55 @@ class TranscriptionWorker:
             if self._partials_this_utterance >= settings.stt_max_partials_per_utterance:
                 self.partials_skipped += 1
                 return
+            if self._final_beats_partial():
+                self.partials_skipped_near_final += 1
+                log_metric(
+                    "stt_partial_skipped_near_final",
+                    channel=self._source.channel.value,
+                    utterance_id=utterance_id,
+                    silence_run_ms=self._segmenter.silence_run_ms,
+                    remaining_silence_ms=max(
+                        0, settings.vad_silence_ms - self._segmenter.silence_run_ms
+                    ),
+                    expected_partial_ms=round(self._last_partial_inference_ms),
+                )
+                return
             audio = np.concatenate(buffer)
             if self._partial_job is not None and not self._partial_job.finished:
                 self._pending_partial = (utterance_id, audio)
                 self.partials_coalesced += 1
                 return
             self._submit_partial_locked(utterance_id, audio)
+
+    def _final_beats_partial(self) -> bool:
+        """True when starting a partial now would only delay the final.
+
+        Inference is not preemptible, so a partial started here runs to
+        completion and the final queues behind it. Once the speaker has gone
+        quiet the final is at most `vad_silence_ms - silence_run_ms` away; if
+        the last partial measurably took longer than that, this one cannot
+        finish first and its only effect is to push the final back by the
+        difference. Measured on this machine: a partial started 220ms into the
+        silence run cost the final 1608ms of queue wait.
+
+        Deliberately inert while speech is active (`silence_run_ms == 0`
+        makes the comparison use the full silence budget) and until a partial
+        has actually been timed, so live-transcript responsiveness during real
+        speech is unchanged.
+        """
+        measured = self._last_partial_inference_ms
+        # A partial that runs in less than one audio frame cannot meaningfully
+        # delay anything, so there is nothing to protect the final from. The
+        # floor also keeps the guard from firing at the very end of the silence
+        # run, where `remaining` approaches zero and any positive cost would
+        # otherwise win the comparison.
+        if measured < FRAME_MS:
+            return False  # nothing measured yet, or too cheap to matter
+        silence_run = self._segmenter.silence_run_ms
+        if silence_run <= 0:
+            return False  # still speaking; no evidence a final is close
+        remaining = max(0, settings.vad_silence_ms - silence_run)
+        return measured >= remaining
 
     def _submit_partial_locked(self, utterance_id: int, audio: np.ndarray) -> None:
         if self._stopping:
@@ -557,11 +606,29 @@ class AudioPipeline:
                 try:
                     worker.start()
                     started.append(worker)
+                except AudioError:
+                    # A device can enumerate cleanly and still fail to open --
+                    # disabled in the OS, or held by another process. Losing one
+                    # channel must not cost the other: loopback is what drives
+                    # question detection, and audio_binding.default_sources()
+                    # already applies this same degrade-don't-fail policy one
+                    # stage earlier, at describe() time. Narrowed to AudioError
+                    # on purpose: anything else is a real fault, and still rolls
+                    # back rather than leaving a worker holding a device.
+                    logger.warning(
+                        "capture_channel_unavailable channel=%s; continuing without it",
+                        worker.channel,
+                    )
                 except Exception:
                     logger.exception("worker_start_failed; stopping the ones already running")
                     for running in started:
                         running.stop()
                     raise
+            if not started:
+                raise AudioError(
+                    "No capture device could be opened. Check the audio "
+                    "settings, or use typed questions instead of live audio."
+                )
             self._workers = started
         finally:
             scheduler.release()

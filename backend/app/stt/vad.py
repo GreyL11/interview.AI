@@ -64,6 +64,17 @@ class Segmenter:
     def duration_ms(self) -> int:
         return self._duration_ms
 
+    @property
+    def silence_run_ms(self) -> int:
+        """How long the current trailing-silence run is, inside an utterance.
+
+        0 while speech is active. Once it reaches `silence_ms` the utterance
+        closes, so `silence_ms - silence_run_ms` is an upper bound on how much
+        longer the final can possibly be away -- which is what lets the
+        scheduler tell a doomed partial from a useful one.
+        """
+        return self._silence_run * FRAME_MS if self.in_speech else 0
+
     def push(self, probability: float) -> SegmentEvent:
         is_speech = probability >= self.threshold
 
