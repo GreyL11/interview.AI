@@ -22,6 +22,15 @@ class TokenMiddleware(BaseHTTPMiddleware):
         if not expected or request.url.path in OPEN_PATHS:
             return await call_next(request)
 
+        # A CORS preflight never carries credentials -- browsers strip the
+        # Authorization header from OPTIONS -- so gating it on the token
+        # rejects every cross-origin request before it is even attempted. The
+        # preflight performs no action; CORSMiddleware is what decides whether
+        # the origin may proceed, and the real request that follows is still
+        # token-checked here.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         if _presented(request) != expected:
             return JSONResponse(status_code=401, content={"detail": "Invalid or missing token"})
         return await call_next(request)

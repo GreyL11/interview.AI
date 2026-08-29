@@ -12,7 +12,6 @@ from app.core.logging import get_logger
 from app.documents.service import DocumentError
 from app.intelligence.answer_validator import AnswerValidationError
 from app.llm.base import LLMError
-from fastapi.middleware.cors import CORSMiddleware
 
 logger = get_logger(__name__)
 
@@ -60,15 +59,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Interview Coach API", version="0.3.0", lifespan=lifespan)
 
+# Order matters, and Starlette applies these outermost-last: TokenMiddleware is
+# added first so it runs *inside* CORS. If it ran outside, its 401 would carry
+# no Access-Control-Allow-Origin and the browser would report an opaque
+# "Failed to fetch" instead of the actual status.
+app.add_middleware(TokenMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
+    # The packaged webview serves from http://tauri.localhost, not from the
+    # dev server's origin.
     allow_origin_regex=r"^(https?://(tauri\.localhost|localhost|127\.0\.0\.1)(:\d+)?)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.add_middleware(TokenMiddleware)
 
 app.include_router(health.router)
 app.include_router(question.router)
