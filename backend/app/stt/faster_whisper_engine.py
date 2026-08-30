@@ -40,6 +40,9 @@ class FasterWhisperEngine(SttEngine):
         self._model = None
         self._lock = threading.Lock()
         self._warmed_up = False
+        #: Set once CUDA has proved unusable at runtime. Sticky, so the
+        #: next call does not retry the GPU and pay the failure again.
+        self._cuda_demoted = False
 
     def _ensure_loaded(self):
         if self._model is not None:
@@ -72,10 +75,7 @@ class FasterWhisperEngine(SttEngine):
                 # and falling back beats refusing to transcribe on a machine
                 # whose CPU would have worked fine.
                 if device == "cuda" and self._device == "auto":
-                    logger.warning(
-                        "stt_gpu_load_failed error=%s; falling back to the CPU",
-                        type(exc).__name__,
-                    )
+                    self._demote_from_cuda("initialisation", exc)
                     device, compute_type = "cpu", self._compute_type
                     try:
                         self._model = self._build(WhisperModel, device, compute_type)
@@ -142,7 +142,7 @@ class FasterWhisperEngine(SttEngine):
         pick the compute type too, or `auto` would land on a combination the
         hardware handles badly.
         """
-        if self._device == "cpu":
+        if self._device == "cpu" or self._cuda_demoted:
             return "cpu", self._compute_type
 
         if self._device == "cuda":
@@ -161,7 +161,10 @@ class FasterWhisperEngine(SttEngine):
 
         usable, reason = _cuda_usable()
         if usable:
-            logger.info("stt_accelerator_selected device=cuda reason=detected")
+            logger.info(
+                "stt_gpu_candidate_detected device=cuda reason=%s; "
+                "attempting cuda initialisation", reason,
+            )
             return "cuda", self._cuda_compute_type
         # Not a warning: no GPU is the normal case on most laptops, and an
         # AMD or Intel machine would otherwise log a scary line on every start
@@ -199,22 +202,54 @@ class FasterWhisperEngine(SttEngine):
         audio = np.ascontiguousarray(audio, dtype=np.float32)
 
         try:
-            segments, info = model.transcribe(
-                audio,
-                language=settings.stt_language or None,
-                beam_size=settings.stt_beam_size if is_final else 1,
-                vad_filter=False,  # segmentation already happened upstream
-                condition_on_previous_text=False,
-            )
-            text = " ".join(segment.text.strip() for segment in segments).strip()
+            return self._run(model, audio, is_final)
         except Exception as exc:
-            raise SttError(f"Transcription failed: {exc}") from exc
+            # CTranslate2 loads cuBLAS/cuDNN lazily, on the first inference
+            # rather than at model construction -- so a machine with an NVIDIA
+            # GPU but no CUDA runtime builds the model happily and then dies
+            # here with "Library cublas64_12.dll is not found". Rebuild on the
+            # CPU and retry in place: the user gets their transcript, not a
+            # restart.
+            if self.active_device != "cuda" or self._device != "auto":
+                raise SttError(f"Transcription failed: {exc}") from exc
+            self._demote_from_cuda("inference", exc)
+            try:
+                return self._run(self._ensure_loaded(), audio, is_final)
+            except Exception as cpu_exc:
+                raise SttError(f"Transcription failed: {cpu_exc}") from cpu_exc
+
+    def _run(self, model, audio: np.ndarray, is_final: bool) -> Transcript:
+        segments, info = model.transcribe(
+            audio,
+            language=settings.stt_language or None,
+            beam_size=settings.stt_beam_size if is_final else 1,
+            vad_filter=False,  # segmentation already happened upstream
+            condition_on_previous_text=False,
+        )
+        text = " ".join(segment.text.strip() for segment in segments).strip()
 
         return Transcript(
             text=text,
             is_final=is_final,
             language=getattr(info, "language", "en") or "en",
             duration_ms=int(len(audio) / SAMPLE_RATE * 1000),
+        )
+
+    def _demote_from_cuda(self, stage: str, exc: Exception) -> None:
+        """Give up on the GPU for the rest of the process and go to the CPU.
+
+        Sticky on purpose: CUDA that is broken at 10:00 is still broken at
+        10:01, and re-probing per utterance would pay the failure every time.
+        """
+        logger.warning(
+            "stt_cuda_init_failed stage=%s error=%s: %s", stage, type(exc).__name__, exc
+        )
+        self._cuda_demoted = True
+        self._model = None
+        self.active_device = None
+        logger.warning(
+            "stt_cpu_fallback_activated compute=%s reason=cuda_%s_failed",
+            self._compute_type, stage,
         )
 
 
