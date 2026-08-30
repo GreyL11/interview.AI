@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings, settings as _settings
+from app.core.secrets import InMemorySecretStore, set_secret_store
 
 # Tests assert against the code's own defaults, so they must not inherit the
 # developer's .env -- otherwise a stale local value (an old STT priority, a
@@ -12,6 +13,25 @@ from app.core.config import Settings, settings as _settings
 _pristine = Settings(_env_file=None)
 for _name in type(_pristine).model_fields:
     setattr(_settings, _name, getattr(_pristine, _name))
+
+# The same rule, one layer down, and the one that was missed: the OS credential
+# store is developer state too.
+#
+# Every `TestClient(app)` runs the application lifespan, and the lifespan calls
+# `load_persisted_secrets()`. Against the real store that reads whatever key the
+# developer has saved and writes it into `settings` -- *after* a test's own
+# monkeypatch has run -- so a machine with a key saved behaves differently from
+# one without. Two tests failed exactly this way, and only on machines where
+# someone had used the app.
+#
+# It also *wrote* to the real store: the obsolete-secret migration deletes
+# entries, so running the suite could remove a credential from the developer's
+# own Credential Manager.
+#
+# Installed here, at import time, because conftest is imported before any test
+# or fixture runs -- a fixture would be too late for the lifespan of a client
+# built by an earlier fixture in the same test.
+set_secret_store(InMemorySecretStore())
 
 from app.api.question import get_orchestrator  # noqa: E402
 from app.chunking.semantic_chunker import SemanticChunker

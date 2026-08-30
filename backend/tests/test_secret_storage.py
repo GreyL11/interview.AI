@@ -387,3 +387,23 @@ def test_the_current_name_wins_over_a_stale_legacy_entry(monkeypatch):
     store = KeyringSecretStore()
     monkeypatch.setattr(store, "_resolve", lambda: FakeBackend())
     assert store.get("groq_api_key") == "current"
+
+
+def test_the_suite_never_touches_the_real_credential_store():
+    """Pins the promise this module's docstring makes.
+
+    Two tests failed on a colleague's laptop and passed on a clean one, because
+    every `TestClient(app)` runs the lifespan, the lifespan calls
+    `load_persisted_secrets()`, and against the real store that loaded whatever
+    key the developer had saved -- overwriting the test's own monkeypatch. The
+    obsolete-secret migration also *deleted* from it.
+
+    Asserted rather than assumed, because the failure mode is invisible on a
+    machine that has never run the app.
+    """
+    from app.core.secrets import KeyringSecretStore, secret_store
+
+    active = secret_store()
+    assert not isinstance(active, KeyringSecretStore), (
+        "tests must run against an in-memory store; see tests/conftest.py"
+    )
