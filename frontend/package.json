@@ -12,7 +12,7 @@
     "tauri": "tauri",
     "tauri:build": "tauri build",
     "desktop:build": "npm run backend:package && npm run build && npm run tauri:build",
-    "backend:package": "cd ../backend && ../venv/Scripts/python.exe -m PyInstaller --noconfirm packaging/call-assistant-backend.spec"
+    "backend:package": "cd ..\\backend && py -3.12 -m PyInstaller --noconfirm packaging\\call-assistant-backend.spec"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

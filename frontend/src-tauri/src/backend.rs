@@ -584,7 +584,7 @@ mod tests {
         let parsed: ReadyLine = serde_json::from_str(line).expect("should parse");
         assert!(parsed.ready);
         assert_eq!(parsed.pid, Some(4242));
-        assert_eq!(parsed.logs_dir.as_deref(), Some("C:\logs"));
+        assert_eq!(parsed.logs_dir.as_deref(), Some(r"C:\logs"));
     }
 
     #[test]

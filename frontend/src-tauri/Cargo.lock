@@ -369,6 +369,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "call-assistant"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rand",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-shell",
+ "tauri-plugin-single-instance",
+ "ureq",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "camino"
 version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1735,24 +1753,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a588916bfdfd92e71cacef98a63d9b1f0d74d6599980d11894290e7ddefffcf7"
 dependencies = [
  "cfb",
-]
-
-[[package]]
-name = "interview-coach"
-version = "0.1.0"
-dependencies = [
- "log",
- "rand",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-shell",
- "tauri-plugin-single-instance",
- "ureq",
- "windows-sys 0.59.0",
 ]
 
 [[package]]

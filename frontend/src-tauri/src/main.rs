@@ -116,26 +116,7 @@ fn open_data_folder(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Excludes the window from anything capturing the screen — Meet/Zoom/Teams
-/// screen-share, OBS, etc. The window keeps rendering normally on the rep's
-/// own display; only the captured frame omits it, with no placeholder box.
-/// Windows-only: there is no equivalent OS API on macOS/Linux.
-#[cfg(windows)]
-fn hide_from_screen_capture(window: &tauri::WebviewWindow) {
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
 
-    match window.hwnd() {
-        Ok(hwnd) => {
-            if let Err(e) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
-                log::warn!("failed to exclude window from screen capture: {e}");
-            }
-        }
-        Err(e) => log::warn!("could not get window handle to exclude from capture: {e}"),
-    }
-}
-
-#[cfg(not(windows))]
-fn hide_from_screen_capture(_window: &tauri::WebviewWindow) {}
 
 /// Start (or restart) the backend and publish the outcome.
 fn start_backend(app: &tauri::AppHandle) {
@@ -296,9 +277,6 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            if let Some(window) = app.get_webview_window("main") {
-                hide_from_screen_capture(&window);
-            }
             // Claimed here, not inside start_backend, so a Retry click during
             // the first boot is refused rather than racing it.
             STARTING.store(true, Ordering::SeqCst);

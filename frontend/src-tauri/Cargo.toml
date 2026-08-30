@@ -34,9 +34,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
-if let Some(window) = app.get_webview_window("main") {
-                hide_from_screen_capture(&window);
-            }
+
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
