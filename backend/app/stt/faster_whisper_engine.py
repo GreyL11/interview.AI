@@ -4,7 +4,7 @@ import time
 import numpy as np
 
 from app.audio.base import SAMPLE_RATE
-from app.core.config import settings
+from app.core.config import resolved_stt_cpu_threads, settings
 from app.core.logging import get_logger
 from app.core.metrics import elapsed_ms, log_metric
 from app.model_status import tracker
@@ -32,6 +32,10 @@ class FasterWhisperEngine(SttEngine):
         self._model_name = model_name or settings.stt_model
         self._device = device or settings.stt_device
         self._compute_type = compute_type or settings.stt_compute_type
+        self._cuda_compute_type = settings.stt_cuda_compute_type
+        #: What was actually chosen, once the model has loaded. Reported to the
+        #: UI so "GPU" is a fact rather than a hope.
+        self.active_device: str | None = None
         self._download_root = download_root or str(settings.data_dir / "models" / "whisper")
         self._model = None
         self._lock = threading.Lock()
@@ -60,70 +64,109 @@ class FasterWhisperEngine(SttEngine):
             tracker.reset("stt")
             tracker.downloading("stt")
             try:
-                self._model = WhisperModel(
-                    self._model_name,
-                    device=device,
-                    compute_type=compute_type,
-                    download_root=self._download_root,
-                    # CTranslate2 serialises calls across num_workers slots. If
-                    # this were left at 1 while the scheduler ran two threads,
-                    # the second would block inside C++ where no priority
-                    # applies — so the two numbers must agree.
-                    num_workers=max(1, settings.stt_inference_concurrency),
-                    cpu_threads=max(0, settings.stt_cpu_threads),
-                )
+                self._model = self._build(WhisperModel, device, compute_type)
             except Exception as exc:
-                if device == "cuda":
-                    message = (
-                        "CUDA STT was explicitly selected but could not start. "
-                        "Install a compatible NVIDIA CUDA runtime with cuBLAS/cuDNN "
-                        "libraries, or set STT_DEVICE=cpu and STT_COMPUTE_TYPE=int8. "
-                        f"Cause: {exc}"
+                # An auto-selected GPU that passed the probe and still failed to
+                # load is the one case worth a second attempt: the probe can
+                # only test the driver, not the whole model-construction path,
+                # and falling back beats refusing to transcribe on a machine
+                # whose CPU would have worked fine.
+                if device == "cuda" and self._device == "auto":
+                    logger.warning(
+                        "stt_gpu_load_failed error=%s; falling back to the CPU",
+                        type(exc).__name__,
                     )
+                    device, compute_type = "cpu", self._compute_type
+                    try:
+                        self._model = self._build(WhisperModel, device, compute_type)
+                    except Exception as cpu_exc:
+                        raise self._load_failure(device, cpu_exc) from cpu_exc
                 else:
-                    message = (
-                        f"Could not load the speech model '{self._model_name}'. The "
-                        f"first run needs internet access to download it. If it was "
-                        f"downloaded before, delete '{self._download_root}' and try "
-                        f"again to repair an incomplete copy. Cause: {exc}"
-                    )
-                tracker.failed("stt", message)
-                raise SttError(message) from exc
+                    raise self._load_failure(device, exc) from exc
 
-            tracker.ready("stt")
+            self.active_device = device
+            tracker.ready("stt", device=device)
             logger.info(
-                "stt_model_loaded model=%s device=%s compute=%s",
-                self._model_name, device, compute_type,
+                "stt_model_loaded model=%s device=%s compute=%s threads=%d",
+                self._model_name, device, compute_type, resolved_stt_cpu_threads(),
             )
             return self._model
 
+    def _build(self, whisper_model, device: str, compute_type: str):
+        return whisper_model(
+            self._model_name,
+            device=device,
+            compute_type=compute_type,
+            download_root=self._download_root,
+            # CTranslate2 serialises calls across num_workers slots. If this
+            # were left at 1 while the scheduler ran two threads, the second
+            # would block inside C++ where no priority applies — so the two
+            # numbers must agree.
+            num_workers=max(1, settings.stt_inference_concurrency),
+            cpu_threads=resolved_stt_cpu_threads(),
+        )
+
+    def _load_failure(self, device: str, exc: Exception) -> SttError:
+        if device == "cuda":
+            message = (
+                "CUDA speech recognition was explicitly selected but could not "
+                "start. Install a compatible NVIDIA CUDA runtime with "
+                "cuBLAS/cuDNN, or set STT_DEVICE=auto to fall back to the CPU "
+                f"automatically. Cause: {exc}"
+            )
+        else:
+            message = (
+                f"Could not load the speech model '{self._model_name}'. The "
+                f"first run needs internet access to download it. If it was "
+                f"downloaded before, delete '{self._download_root}' and try "
+                f"again to repair an incomplete copy. Cause: {exc}"
+            )
+        tracker.failed("stt", message)
+        return SttError(message)
+
     def _resolve_device(self) -> tuple[str, str]:
-        """Validate an explicit CUDA request; CPU is the safe default."""
+        """Decide what to run on, and with what numeric precision.
+
+        Three modes, and the difference between them is what happens when CUDA
+        is asked for but unusable:
+
+          "cuda" -- an explicit demand. Fail loudly, because someone chose it
+                    and silently running 20x slower on the CPU would look like
+                    a performance bug rather than a missing driver.
+          "cpu"  -- an explicit demand. Never probes.
+          "auto" -- the default. Use the GPU when it genuinely works, fall back
+                    to the CPU when it does not, and say which in the log.
+
+        Precision travels with the device: int8 is the right default on a CPU
+        and float16 on an NVIDIA GPU, so picking the device implicitly has to
+        pick the compute type too, or `auto` would land on a combination the
+        hardware handles badly.
+        """
         if self._device == "cpu":
             return "cpu", self._compute_type
-        if self._device == "cuda":
-            try:
-                import ctranslate2
 
-                if ctranslate2.get_cuda_device_count() > 0:
-                    return "cuda", self._compute_type
-            except Exception as exc:
+        if self._device == "cuda":
+            usable, reason = _cuda_usable()
+            if not usable:
                 raise SttError(
-                    "CUDA STT was explicitly selected but CUDA/cuBLAS libraries "
-                    "are unavailable. Install a compatible NVIDIA CUDA runtime, or "
-                    "set STT_DEVICE=cpu and STT_COMPUTE_TYPE=int8."
-                ) from exc
-            raise SttError(
-                "CUDA STT was explicitly selected but no usable CUDA device was found. "
-                "Install the NVIDIA CUDA/cuBLAS runtime, or set STT_DEVICE=cpu and "
-                "STT_COMPUTE_TYPE=int8."
-            )
+                    f"CUDA speech recognition was explicitly requested but is not "
+                    f"usable on this machine ({reason}). Install a compatible NVIDIA "
+                    f"CUDA runtime with cuBLAS/cuDNN, or set STT_DEVICE=auto to fall "
+                    f"back to the CPU automatically."
+                )
+            return "cuda", self._cuda_compute_type
 
         if self._device != "auto":
             return self._device, self._compute_type
 
-        # Preserve compatibility with legacy STT_DEVICE=auto deployments, but
-        # never opt into CUDA implicitly; use STT_DEVICE=cuda to request it.
+        usable, reason = _cuda_usable()
+        if usable:
+            logger.info("stt_accelerator_selected device=cuda reason=detected")
+            return "cuda", self._cuda_compute_type
+        # Not a warning: no GPU is the normal case on most laptops, and an
+        # AMD or Intel machine would otherwise log a scary line on every start
+        # about hardware it was never going to have.
+        logger.info("stt_accelerator_selected device=cpu reason=%s", reason)
         return "cpu", self._compute_type
 
     def warmup(self) -> None:
@@ -173,3 +216,66 @@ class FasterWhisperEngine(SttEngine):
             language=getattr(info, "language", "en") or "en",
             duration_ms=int(len(audio) / SAMPLE_RATE * 1000),
         )
+
+
+#: Probed once. The answer cannot change while the process runs, and the probe
+#: loads CUDA libraries, which is not free.
+_cuda_probe: tuple[bool, str] | None = None
+_cuda_probe_lock = threading.Lock()
+
+
+def _cuda_usable() -> tuple[bool, str]:
+    """Is there an NVIDIA GPU this machine can actually run inference on?
+
+    Returns (usable, reason) -- the reason is for the log, never for the user.
+
+    Counting devices is not enough on its own. A machine can report a GPU and
+    still fail at model construction: this one does, with "CUDA driver version
+    is insufficient for CUDA runtime version". So the probe asks CTranslate2
+    what compute types the device supports, which is the cheapest call that
+    actually touches the driver rather than just enumerating hardware.
+
+    Anything unexpected counts as unusable. CPU transcription is slower but it
+    always works, and the whole point of `auto` is that the app runs everywhere
+    -- AMD, Intel, a VM, a laptop with a stale driver -- without being
+    configured.
+    """
+    global _cuda_probe
+    if _cuda_probe is not None:
+        return _cuda_probe
+
+    with _cuda_probe_lock:
+        if _cuda_probe is not None:
+            return _cuda_probe
+        _cuda_probe = _probe_cuda()
+        return _cuda_probe
+
+
+def _probe_cuda() -> tuple[bool, str]:
+    try:
+        import ctranslate2
+    except Exception as exc:  # pragma: no cover - packaging guard
+        return False, f"ctranslate2 unavailable ({type(exc).__name__})"
+
+    try:
+        if ctranslate2.get_cuda_device_count() <= 0:
+            return False, "no nvidia gpu detected"
+    except Exception as exc:
+        return False, f"gpu enumeration failed ({type(exc).__name__})"
+
+    try:
+        # Touches the driver. Raises on a version mismatch, which enumeration
+        # alone does not -- that is the case this probe exists to catch.
+        supported = ctranslate2.get_supported_compute_types("cuda")
+    except Exception as exc:
+        return False, f"cuda driver unusable ({type(exc).__name__})"
+
+    if not supported:
+        return False, "gpu reports no usable compute types"
+    return True, f"cuda ready ({','.join(sorted(supported))})"
+
+
+def reset_cuda_probe() -> None:
+    """Forget the cached probe. Tests use this; nothing in the app does."""
+    global _cuda_probe
+    _cuda_probe = None

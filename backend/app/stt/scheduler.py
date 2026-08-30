@@ -14,6 +14,7 @@ that is the only job on the critical path to an answer.
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -64,6 +65,7 @@ class InferenceJob:
         "utterance_id",
         "is_final",
         "priority",
+        "enqueued_at",
         "_fn",
         "_lock",
         "_state",
@@ -83,9 +85,48 @@ class InferenceJob:
         self.utterance_id = utterance_id
         self.is_final = is_final
         self.priority = priority
+        #: When this job joined the queue. Used to decide, at pickup time,
+        #: whether transcribing it is still worth the CPU -- see `expired`.
+        self.enqueued_at = time.monotonic()
         self._lock = threading.Lock()
         self._state = "queued"  # queued -> running -> finished, or queued -> cancelled
         self._done = threading.Event()
+
+    def age_seconds(self, now: float | None = None) -> float:
+        return (now if now is not None else time.monotonic()) - self.enqueued_at
+
+    def expired(self, now: float | None = None) -> bool:
+        """Has this job been waiting so long that its output is worthless?
+
+        A transcript is a real-time product. Once it is this far behind, the
+        conversation has moved on: the words are no longer on screen when they
+        would matter, and for the interviewer channel the question they carry
+        has already been superseded. Running it anyway costs the CPU that the
+        *next* utterance needs, which is how a queue that is merely late turns
+        into one that never recovers.
+
+        Deadlines are per-role because the roles differ. The microphone is
+        transcribed for review only and nothing downstream waits on it, so it
+        yields first. Loopback drives question detection and is given
+        substantially longer before it is given up on.
+        """
+        budget = (
+            settings.stt_max_job_age_seconds
+            if self.channel == AudioChannel.LOOPBACK
+            else settings.stt_max_mic_job_age_seconds
+        )
+        if budget <= 0:
+            return False  # shedding disabled
+        return self.age_seconds(now) > budget
+
+    def drop(self) -> bool:
+        """Discard a job that is still queued. True if it will now never run."""
+        with self._lock:
+            if self._state != "queued":
+                return False
+            self._state = "dropped"
+        self._done.set()
+        return True
 
     @property
     def cancelled(self) -> bool:
@@ -155,6 +196,11 @@ class InferenceScheduler:
         self._refcount = 0
         self._running = False
         self._warned_backlog = False
+        #: Jobs shed because they aged out. Surfaced in the worker's
+        #: end-of-session metrics line so a session that silently lost
+        #: transcript is still auditable afterwards.
+        self.dropped_jobs = 0
+        self._warned_dropping = False
 
     # ------------------------------------------------------------- lifecycle
 
@@ -246,6 +292,23 @@ class InferenceScheduler:
         self._queue.put(_Queued(priority, sequence, job))
         self._check_backlog()
 
+    def _note_drop(self, job: InferenceJob) -> None:
+        """Say it once, loudly, rather than once per dropped job.
+
+        Shedding is the system working as designed under overload, but it means
+        the user is losing transcript -- so it must never be silent. A line per
+        drop would bury the log at exactly the moment it is being read.
+        """
+        self.dropped_jobs += 1
+        if job.channel == AudioChannel.LOOPBACK and not self._warned_dropping:
+            self._warned_dropping = True
+            logger.warning(
+                "stt_shedding_load: transcription is too far behind, so "
+                "interviewer audio is being dropped rather than answered late. "
+                "Turn off microphone capture, choose a smaller STT_MODEL, or "
+                "set STT_CPU_THREADS."
+            )
+
     def _check_backlog(self) -> None:
         # The queue is bounded in practice — each channel holds at most one
         # in-flight and one pending partial — so depth here means finals are
@@ -269,6 +332,21 @@ class InferenceScheduler:
             try:
                 if item.job is None:
                     return
+                # Checked at pickup, not at submit: a job is only worthless
+                # once it has actually sat in the queue, and that is exactly
+                # the moment this loop finds out.
+                if item.job.expired() and item.job.drop():
+                    log_metric(
+                        "stt_job_dropped",
+                        channel=item.job.channel.value,
+                        utterance_id=item.job.utterance_id,
+                        is_final=item.job.is_final,
+                        reason="too_stale",
+                        age_ms=int(item.job.age_seconds() * 1000),
+                        queue_depth=self.depth,
+                    )
+                    self._note_drop(item.job)
+                    continue
                 if not item.job.claim():
                     continue  # cancelled while it waited
                 log_metric(

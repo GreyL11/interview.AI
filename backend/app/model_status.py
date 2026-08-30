@@ -51,6 +51,10 @@ class _ModelState:
     kind: str
     state: str = NOT_DOWNLOADED
     detail: str | None = None
+    #: What the model actually ended up running on ("cpu" / "cuda"), once it
+    #: has loaded. Reported so the UI can state the active accelerator as a
+    #: fact rather than repeating what was merely configured.
+    device: str | None = None
 
 
 class ModelTracker:
@@ -70,14 +74,22 @@ class ModelTracker:
 
     # ---------------------------------------------------------- transitions
 
-    def _set(self, kind: str, state: str, detail: str | None = None) -> None:
+    def _set(
+        self,
+        kind: str,
+        state: str,
+        detail: str | None = None,
+        device: str | None = None,
+    ) -> None:
         with self._lock:
             entry = self._states.get(kind)
             if entry is None:
                 return
             entry.state = state
             entry.detail = detail
-        logger.info("model_state kind=%s state=%s", kind, state)
+            if device is not None:
+                entry.device = device
+        logger.info("model_state kind=%s state=%s device=%s", kind, state, device or "-")
 
     def downloading(self, kind: str) -> None:
         self._set(kind, DOWNLOADING)
@@ -85,8 +97,8 @@ class ModelTracker:
     def loading(self, kind: str) -> None:
         self._set(kind, LOADING)
 
-    def ready(self, kind: str) -> None:
-        self._set(kind, READY)
+    def ready(self, kind: str, device: str | None = None) -> None:
+        self._set(kind, READY, device=device)
 
     def failed(self, kind: str, detail: str) -> None:
         # The detail is shown to the user, so it is the loader's own sentence
@@ -116,12 +128,12 @@ class ModelTracker:
         """
         with self._lock:
             entries = [
-                (name, entry.state, entry.detail)
+                (name, entry.state, entry.detail, entry.device)
                 for name, entry in self._states.items()
             ]
 
         out: list[dict] = []
-        for kind, state, detail in entries:
+        for kind, state, detail, device in entries:
             if state in (NOT_DOWNLOADED, DOWNLOADED):
                 state = self._state_from_disk(kind)
             directory = model_dir(kind)
@@ -135,6 +147,9 @@ class ModelTracker:
                     "downloaded": state in _ON_DISK,
                     "path": str(directory),
                     "detail": detail,
+                    # None until the model has loaded -- claiming an
+                    # accelerator before anything ran on it would be a guess.
+                    "device": device,
                 }
             )
         return out

@@ -293,6 +293,8 @@ export interface ModelStatus {
   path: string;
   /** Present when `state` is "failed": what went wrong and what to do. */
   detail: string | null;
+  /** What the model actually runs on. Null until it has loaded. */
+  device: "cpu" | "cuda" | null;
 }
 
 // ------------------------------------------------------------ ws: server->client

@@ -395,3 +395,111 @@ async def test_pipeline_start_warms_the_engine_once():
 
     # One shared model, so one warmup -- not one per channel.
     assert engine.warmups == 1
+
+
+# ------------------------------------------------------- load shedding
+
+
+def test_a_fresh_job_is_not_dropped():
+    from app.stt.scheduler import InferenceJob, priority_for
+
+    job = InferenceJob(lambda: None, AudioChannel.LOOPBACK, 1, True, priority_for(AudioChannel.LOOPBACK, True))
+    assert job.expired() is False
+
+
+def test_a_stale_interviewer_job_expires(monkeypatch):
+    """Observed in production: the queue reached 100 seconds behind. A question
+    transcribed that late has already been superseded, and producing it costs
+    the CPU the next utterance needs."""
+    from app.stt.scheduler import InferenceJob
+
+    monkeypatch.setattr(settings, "stt_max_job_age_seconds", 25.0)
+    job = InferenceJob(lambda: None, AudioChannel.LOOPBACK, 1, True, 0)
+    job.enqueued_at -= 30.0
+    assert job.expired() is True
+
+
+def test_the_microphone_yields_before_the_interviewer(monkeypatch):
+    """The mic is review-only and nothing downstream waits on it, so under
+    overload it is the first thing to give up its slot."""
+    from app.stt.scheduler import InferenceJob
+
+    monkeypatch.setattr(settings, "stt_max_job_age_seconds", 25.0)
+    monkeypatch.setattr(settings, "stt_max_mic_job_age_seconds", 8.0)
+
+    mic = InferenceJob(lambda: None, AudioChannel.MIC, 1, True, 1)
+    loopback = InferenceJob(lambda: None, AudioChannel.LOOPBACK, 1, True, 0)
+    for job in (mic, loopback):
+        job.enqueued_at -= 10.0
+
+    assert mic.expired() is True
+    assert loopback.expired() is False
+
+
+def test_shedding_can_be_disabled(monkeypatch):
+    """0 restores the old unbounded queue, for anyone who would rather have a
+    late transcript than none."""
+    from app.stt.scheduler import InferenceJob
+
+    monkeypatch.setattr(settings, "stt_max_job_age_seconds", 0.0)
+    job = InferenceJob(lambda: None, AudioChannel.LOOPBACK, 1, True, 0)
+    job.enqueued_at -= 10_000.0
+    assert job.expired() is False
+
+
+def test_a_dropped_job_never_runs():
+    from app.stt.scheduler import InferenceJob
+
+    ran = []
+    job = InferenceJob(lambda: ran.append(1), AudioChannel.MIC, 1, True, 1)
+    assert job.drop() is True
+    assert job.claim() is False       # a worker can no longer pick it up
+    assert job.finished is True       # and anything waiting on it is released
+    assert ran == []
+
+
+def test_a_running_job_cannot_be_dropped():
+    """Inference is not interruptible, so shedding only ever applies to work
+    that has not started."""
+    from app.stt.scheduler import InferenceJob
+
+    job = InferenceJob(lambda: None, AudioChannel.MIC, 1, True, 1)
+    assert job.claim() is True
+    assert job.drop() is False
+
+
+def test_stale_work_is_shed_by_a_real_scheduler(monkeypatch):
+    """End to end through the queue: an aged job is discarded at pickup and the
+    fresh one behind it still runs."""
+    from app.stt.scheduler import InferenceScheduler
+
+    monkeypatch.setattr(settings, "stt_max_mic_job_age_seconds", 5.0)
+    scheduler = InferenceScheduler(workers=1)
+    scheduler.acquire()
+    try:
+        # Occupy the single worker first, or it picks the next job up before
+        # the test can age it -- which is the race, not the behaviour.
+        hold = threading.Event()
+        scheduler.submit(
+            lambda: hold.wait(timeout=5.0),
+            channel=AudioChannel.MIC,
+            utterance_id=0,
+            is_final=True,
+        )
+
+        stale = scheduler.submit(
+            lambda: None, channel=AudioChannel.MIC, utterance_id=1, is_final=True
+        )
+        stale.enqueued_at -= 60.0
+
+        done = threading.Event()
+        fresh = scheduler.submit(
+            lambda: done.set(), channel=AudioChannel.MIC, utterance_id=2, is_final=True
+        )
+
+        hold.set()  # release the worker onto the queued pair
+        assert done.wait(timeout=5.0), "the fresh job should still have run"
+        assert fresh.finished
+        assert scheduler.dropped_jobs == 1, "the aged job should have been shed"
+    finally:
+        scheduler.release(timeout=5.0)

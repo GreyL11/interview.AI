@@ -138,7 +138,11 @@ class Settings(BaseSettings):
 
     # Audio capture
     audio_queue_frames: int = 200  # ~6s at 32ms/frame before dropping oldest
-    audio_capture_mic: bool = True        # candidate, recorded for review
+    #: Off by default. The microphone is transcribed for review only -- it never
+    #: drives question detection -- but it was measured at 70% of all STT work
+    #: (548s of 783s), which is what pushed transcription past real time on a
+    #: laptop CPU. Turn it on when the review transcript is worth that cost.
+    audio_capture_mic: bool = False       # candidate, recorded for review
     audio_capture_loopback: bool = True   # interviewer, drives question detection
 
     # Voice activity detection
@@ -150,8 +154,13 @@ class Settings(BaseSettings):
 
     # Speech to text
     stt_model: str = "distil-small.en"
-    stt_device: str = "cpu"
-    stt_compute_type: str = "int8"
+    #: "auto" detects an NVIDIA GPU and uses it, falling back to the CPU when
+    #: there is not one -- so the same build runs on NVIDIA, AMD, Intel and in
+    #: a VM with no configuration. "cuda" demands the GPU and fails loudly if
+    #: it is missing; "cpu" never probes.
+    stt_device: str = "auto"
+    stt_compute_type: str = "int8"          # CPU
+    stt_cuda_compute_type: str = "float16"  # NVIDIA GPU
     stt_beam_size: int = 5
     stt_language: str = "en"
     stt_partial_interval_ms: int = 1000
@@ -160,7 +169,21 @@ class Settings(BaseSettings):
     # concurrency here is what the model is actually told to support: raising
     # it without raising num_workers just moves the queue into C++.
     stt_inference_concurrency: int = 1
-    stt_cpu_threads: int = 0  # 0 = let CTranslate2 size its own intra-op pool
+    #: 0 lets CTranslate2 size its own pool. Measured here, auto-detection was
+    #: roughly 2.5x slower than an explicit count on identical audio, so this
+    #: defaults to a real number -- see `resolved_stt_cpu_threads`.
+    stt_cpu_threads: int = 0
+
+    # Load shedding. Transcription is a real-time product: once the queue is
+    # this far behind, the words arrive after the moment they were useful, and
+    # running them anyway costs the CPU the *next* utterance needs. Without a
+    # deadline the backlog grows without bound -- observed reaching 100s.
+    #: Interviewer audio, which drives question detection. Generous, because
+    #: dropping this loses a question outright.
+    stt_max_job_age_seconds: float = 25.0
+    #: The microphone is transcribed for review only and nothing waits on it,
+    #: so it yields first when the machine cannot keep up.
+    stt_max_mic_job_age_seconds: float = 8.0
 
     # Partial transcripts are display-only best effort; finals are the product.
     stt_enable_partials: bool = True
@@ -268,3 +291,21 @@ def migrate_legacy_data_dir(target: Path | None = None) -> Path | None:
         )
         return legacy
     return None
+
+
+def resolved_stt_cpu_threads() -> int:
+    """How many cores CTranslate2 should use for transcription.
+
+    `STT_CPU_THREADS=0` asks CTranslate2 to decide, which is what shipped and
+    what was measured running ~2.5x slower than an explicit count on identical
+    audio. Auto-detection also behaves badly inside a frozen build, where the
+    process sees the machine's full core count but is competing with the
+    embedding model, OCR and the WebView for it.
+
+    Half the machine, floored at 2 and capped at 8: past roughly eight threads
+    the per-utterance gain flattens while contention with everything else does
+    not.
+    """
+    if settings.stt_cpu_threads > 0:
+        return settings.stt_cpu_threads
+    return max(2, min(8, (os.cpu_count() or 4) // 2))

@@ -132,6 +132,20 @@ const MODEL_NOUNS: Record<string, { thing: string; when: string }> = {
   embedding: { thing: "Document search", when: "the first time you add a document" },
 };
 
+/**
+ * " — running on your graphics card" / " — running on the processor", or
+ * nothing at all.
+ *
+ * Phrased for someone who does not know what CUDA is, and only shown once the
+ * model has actually loaded: `device` is null until then, and claiming an
+ * accelerator before anything has run on it would be a guess.
+ */
+function accelerator(model: ModelStatus): string {
+  if (model.device === "cuda") return " — running on your graphics card";
+  if (model.device === "cpu") return " — running on the processor";
+  return "";
+}
+
 export function describeModel(model: ModelStatus | undefined, kind: string): ModelDescription {
   const noun = MODEL_NOUNS[kind] ?? { thing: "This model", when: "on first use" };
 
@@ -161,7 +175,12 @@ export function describeModel(model: ModelStatus | undefined, kind: string): Mod
         busy: true,
       };
     case "ready":
-      return { sentence: "Ready to use.", label: "Ready", tone: "ok", busy: false };
+      return {
+        sentence: `Ready to use${accelerator(model)}.`,
+        label: "Ready",
+        tone: "ok",
+        busy: false,
+      };
     case "downloaded":
       // On disk but not yet loaded this run. Usable, and loading is fast.
       return {

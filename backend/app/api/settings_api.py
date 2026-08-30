@@ -103,6 +103,10 @@ class ModelStatus(BaseModel):
     downloaded: bool
     path: str
     detail: str | None = None
+    #: What this model is actually running on ("cpu" / "cuda"). None until it
+    #: has loaded -- naming an accelerator before anything ran on it would be a
+    #: guess, and the whole point of reporting it is that it is a fact.
+    device: str | None = None
 
 
 def _provider_statuses() -> list[ProviderStatus]:

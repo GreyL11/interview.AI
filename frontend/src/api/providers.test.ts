@@ -28,6 +28,7 @@ function model(overrides: Partial<ModelStatus> = {}): ModelStatus {
     downloaded: false,
     path: "C:\\models",
     detail: null,
+    device: null,
     ...overrides,
   };
 }
@@ -163,6 +164,23 @@ test("a model is only ready once it has actually loaded", () => {
   );
   assert.equal(described.label, "Ready");
   assert.equal(described.tone, "ok");
+});
+
+test("a ready model names the hardware it actually runs on", () => {
+  // Phrased for someone who does not know what CUDA is.
+  const gpu = describeModel(model({ state: "ready", device: "cuda" }), "stt");
+  assert.match(gpu.sentence, /graphics card/);
+
+  const cpu = describeModel(model({ state: "ready", device: "cpu" }), "stt");
+  assert.match(cpu.sentence, /processor/);
+});
+
+test("the accelerator is not claimed before the model has loaded", () => {
+  // `device` is null until something has actually run on it, so saying "GPU"
+  // here would be a guess rather than a fact.
+  const described = describeModel(model({ state: "ready", device: null }), "stt");
+  assert.doesNotMatch(described.sentence, /graphics card|processor/);
+  assert.match(described.sentence, /Ready/);
 });
 
 test("a failed model shows the engine's own explanation", () => {
