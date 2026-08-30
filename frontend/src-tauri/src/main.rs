@@ -116,7 +116,36 @@ fn open_data_folder(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Excludes the window from anything capturing the screen — Meet/Zoom/Teams
+/// screen-share, OBS, etc. The window keeps rendering normally on the rep's
+/// own display; only the captured frame omits it, with no placeholder box.
+/// Windows-only: there is no equivalent OS API on macOS/Linux.
+#[cfg(windows)]
+fn hide_from_screen_capture(window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+    match window.hwnd() {
+        // tauri's HWND (from the `windows` crate) and windows-sys's HWND are both
+        // just *mut c_void — grab the raw pointer via `.0`, skip a second crate.
+        Ok(hwnd) => {
+            if unsafe { SetWindowDisplayAffinity(hwnd.0, WDA_EXCLUDEFROMCAPTURE) } == 0 {
+                // The error code is the whole diagnosis: 87 (ERROR_INVALID_PARAMETER)
+                // means the OS refused WDA_EXCLUDEFROMCAPTURE — it needs Windows 10
+                // 2004 (build 19041) or later. Without it there is nothing to go on.
+                log::warn!(
+                    "screen-capture exclusion rejected by the OS (GetLastError={})",
+                    unsafe { GetLastError() },
+                );
+            } else {
+                log::info!("window excluded from screen capture");
+            }
+        }
+        Err(e) => log::warn!("could not get window handle to exclude from capture: {e}"),
+    }
+}
 
+#[cfg(not(windows))]
+fn hide_from_screen_capture(_window: &tauri::WebviewWindow) {}
 
 /// Start (or restart) the backend and publish the outcome.
 fn start_backend(app: &tauri::AppHandle) {
@@ -264,6 +293,11 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        // Installs an actual logger behind the `log` facade. Without one every
+        // log::warn!/error! in this file is a silent no-op, which is how a
+        // failed capture-exclusion and a failed backend start both vanished.
+        // Writes to the same folder the "Open logs folder" button reveals.
+        .plugin(tauri_plugin_log::Builder::new().build())
         .manage(BackendState(Mutex::new(None)))
         .manage(StartupStatus(Mutex::new(StartupState::starting())))
         .invoke_handler(tauri::generate_handler![
@@ -277,6 +311,9 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
 
+            if let Some(window) = app.get_webview_window("main") {
+                hide_from_screen_capture(&window);
+            }
             // Claimed here, not inside start_backend, so a Retry click during
             // the first boot is refused rather than racing it.
             STARTING.store(true, Ordering::SeqCst);
