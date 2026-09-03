@@ -323,6 +323,62 @@ class GroqClient(LLMClient):
         )
         return self._to_answer(response.choices[0].message.content or "")
 
+    async def complete_json(
+        self, prompt: str, *, model: str = "", timeout_seconds: float = 5.0
+    ) -> str:
+        """One short, non-streaming JSON completion.
+
+        Serves the question-understanding layer (`StructuredCompleter`), which
+        needs a small structured object rather than a coaching answer, on a
+        much tighter budget than `groq_timeout_seconds` -- it sits on the
+        realtime path between a finished question and its answer.
+
+        JSON mode is safe to use here, unlike `stream_answer`: nothing streams
+        this, so the provider buffering the whole object costs nothing.
+        `model` falls back to the answer model when unset, so the setting can
+        stay empty until there is a reason to split them.
+        """
+        client = self._ensure_client()
+        started = time.monotonic()
+        chosen = model or self.model_name
+        try:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=chosen,
+                    messages=self._messages(prompt),
+                    response_format={"type": "json_object"},
+                    # A classifier that rambles has failed; this also bounds
+                    # the worst-case latency contribution.
+                    max_tokens=512,
+                    temperature=0,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Classified and logged like any other provider failure, but *not*
+            # recorded in `last_error_kind`: the Settings screen reports the
+            # health of answering, and a classifier blip is recovered from
+            # silently rather than shown to the user as a broken key.
+            log_metric(
+                "llm_request_failed",
+                provider=self.provider_name,
+                model=chosen,
+                phase="understanding",
+                failure=self.classify(exc).value,
+                exception=exc.__class__.__name__,
+                duration_ms=elapsed_ms(started, time.monotonic()),
+            )
+            raise
+        log_metric(
+            "llm_understanding_completed",
+            provider=self.provider_name,
+            model=chosen,
+            duration_ms=elapsed_ms(started, time.monotonic()),
+        )
+        return response.choices[0].message.content or ""
+
     async def stream_answer(self, prompt: str) -> AsyncIterator[str]:
         client = self._ensure_client()
         started = time.monotonic()

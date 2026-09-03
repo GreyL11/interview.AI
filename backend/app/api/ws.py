@@ -6,6 +6,7 @@ from app.core.deps import (
     get_llm_client,
     get_retriever,
     get_session_memory,
+    get_question_understander,
     get_session_repository,
     get_summarizer,
 )
@@ -41,6 +42,7 @@ async def _build_session(session_id: str, sessions: SessionRepository) -> LiveSe
             llm=get_llm_client(),
             memory=get_session_memory(),
             summarizer=get_summarizer(),
+            understander=get_question_understander(),
         )
     )
 
@@ -140,6 +142,32 @@ async def _pump(websocket: WebSocket, live: LiveSession) -> None:
                     TranscriptSource.MANUAL,
                     is_final=True,
                 )
+
+        elif message.type == EventType.CONTEXT_ATTACH:
+            # Images arrive base64-encoded; everything else is text the
+            # interviewer pasted and is forwarded byte-for-byte.
+            raw_image = message.data.get("image_base64")
+            image_bytes = None
+            if raw_image:
+                import base64
+                import binascii
+
+                try:
+                    image_bytes = base64.b64decode(raw_image, validate=True)
+                except (binascii.Error, ValueError):
+                    await websocket.send_text(event(
+                        EventType.CONTEXT_REJECTED,
+                        kind=str(message.data.get("kind", "image")),
+                        reason="empty",
+                        message="That image could not be decoded.",
+                    ).model_dump_json())
+                    continue
+            await live.on_context_attached(
+                kind=str(message.data.get("kind", "text")),
+                content=str(message.data.get("content", "")),
+                name=str(message.data.get("name", "")),
+                image_bytes=image_bytes,
+            )
 
         elif message.type == EventType.ANSWER_CANCEL:
             await live.cancel(CancelReason.USER_STOP)

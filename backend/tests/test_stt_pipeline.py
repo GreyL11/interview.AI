@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import threading
 import time
 
@@ -27,9 +28,16 @@ SILENCE_TO_END = 700 // FRAME_MS + 2
 class Recorder:
     def __init__(self):
         self.calls = []
+        #: (text, source, is_final, trace, now, received_at) for every call --
+        #: kept separately from `calls` so the many existing 3-tuple
+        #: assertions don't all need updating for the fields they don't care
+        #: about. `received_at` is wall-clock time.monotonic() at delivery,
+        #: for comparing against the speech-timeline `now` the pipeline sent.
+        self.raw_calls = []
 
-    async def __call__(self, text, source, is_final, trace=None):
+    async def __call__(self, text, source, is_final, trace=None, now=None):
         self.calls.append((text, source, is_final))
+        self.raw_calls.append((text, source, is_final, trace, now, time.monotonic()))
 
     def finals(self):
         return [c for c in self.calls if c[2]]
@@ -38,8 +46,19 @@ class Recorder:
         return [c for c in self.calls if not c[2]]
 
 
-async def run_worker(probabilities, frames, engine=None, partial_interval_ms=1000, channel=AudioChannel.LOOPBACK):
-    """Drive a worker to completion over a fixed frame script."""
+async def run_worker(
+    probabilities,
+    frames,
+    engine=None,
+    partial_interval_ms=1000,
+    channel=AudioChannel.LOOPBACK,
+    on_transcript=None,
+):
+    """Drive a worker to completion over a fixed frame script.
+
+    `on_transcript` overrides the default Recorder, for tests that need the
+    publish side to misbehave.
+    """
     recorder = Recorder()
     source = FakeAudioSource(frames, channel=channel)
     worker = TranscriptionWorker(
@@ -47,7 +66,7 @@ async def run_worker(probabilities, frames, engine=None, partial_interval_ms=100
         detector=ScriptedSpeechDetector(probabilities),
         engine=engine or FakeSttEngine(),
         loop=asyncio.get_running_loop(),
-        on_transcript=recorder,
+        on_transcript=on_transcript or recorder,
         partial_interval_ms=partial_interval_ms,
     )
     worker.start()
@@ -214,6 +233,103 @@ async def test_slow_stt_does_not_block_audio_frame_consumption():
     )
 
     assert worker.frames_consumed == len(frames)
+
+
+class ExplodingRecorder:
+    """An on_transcript that fails on the event loop, the way a SQLite write
+    or a dead subscriber would."""
+
+    def __init__(self, exc=None):
+        self.calls = 0
+        self.exc = exc or RuntimeError("on_transcript exploded")
+
+    async def __call__(self, text, source, is_final, trace=None, now=None):
+        self.calls += 1
+        raise self.exc
+
+
+async def test_a_failure_inside_on_transcript_leaves_evidence(caplog):
+    """`run_coroutine_threadsafe` returns a concurrent.futures.Future, which
+    never reports an unretrieved exception the way asyncio.Task does. Without
+    observing it, a question could be lost with no log, no event and no
+    counter -- which is exactly how it used to behave."""
+    frames = speech_frames(20) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 20 + [0.0] * SILENCE_TO_END
+    exploding = ExplodingRecorder()
+
+    with caplog.at_level(logging.ERROR, logger="app.stt.pipeline"):
+        _, worker = await run_worker(probabilities, frames, on_transcript=exploding)
+
+    # Both the interim and the final publish are offered and both fail here;
+    # asserting the relationship rather than a fixed count keeps this test
+    # independent of partial cadence.
+    assert exploding.calls >= 1, "the transcript should still have been offered"
+    assert worker.publish_failures == exploding.calls, (
+        f"{exploding.calls} publishes failed but "
+        f"{worker.publish_failures} were counted"
+    )
+    assert "transcript_publish_failed" in caplog.text, "no evidence logged"
+    assert "on_transcript exploded" in caplog.text, "traceback not preserved"
+    # The inference-side counter must not absorb a delivery-side failure.
+    assert worker.errors == 0
+
+
+async def test_a_successful_publish_records_no_failure():
+    """Guard against the observer itself becoming a false-positive source."""
+    frames = speech_frames(20) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 20 + [0.0] * SILENCE_TO_END
+
+    recorder, worker = await run_worker(probabilities, frames)
+
+    assert recorder.finals()
+    assert worker.publish_failures == 0
+    assert worker.errors == 0
+
+
+async def test_publishing_to_a_closed_loop_is_counted_not_swallowed():
+    """A final that lands after the session tore down. The transcript is
+    genuinely lost, so it must not look like a successful publish -- and it
+    must not raise into the inference worker either."""
+    dead_loop = asyncio.new_event_loop()
+    dead_loop.close()
+
+    worker = TranscriptionWorker(
+        source=FakeAudioSource([], channel=AudioChannel.LOOPBACK),
+        detector=ScriptedSpeechDetector([]),
+        engine=FakeSttEngine(),
+        loop=dead_loop,
+        on_transcript=Recorder(),
+    )
+
+    worker._publish("a lost question", is_final=True)  # must not raise
+
+    assert worker.publish_failures == 1
+
+
+async def test_final_publishes_with_speech_end_time_not_delivery_time():
+    """Turn/question assembly has to key off when the interviewer stopped
+    talking, not when a backlogged Whisper happened to get around to it --
+    otherwise queue delay masquerades as a real pause between utterances (or
+    swallows one). `now` on the final call must be speech-end time, which
+    predates delivery by roughly the injected STT delay, not the delivery
+    moment itself."""
+    frames = speech_frames(20) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 20 + [0.0] * SILENCE_TO_END
+    delay = 0.2
+
+    recorder, _ = await run_worker(
+        probabilities, frames, engine=SlowSttEngine(delay=delay), partial_interval_ms=1000,
+    )
+
+    finals = [c for c in recorder.raw_calls if c[2]]
+    assert len(finals) == 1
+    _, _, _, trace, now, received_at = finals[0]
+    assert trace is not None
+    assert now == trace.speech_end_at
+    # Loose bound (half the injected delay) so this isn't flaky on a slow CI
+    # box, while still failing hard if `now` regressed to time-of-delivery
+    # (in which case the gap would be ~0, not ~`delay`).
+    assert received_at - now >= delay / 2
 
 
 async def test_slow_partials_are_coalesced_and_final_is_executed():

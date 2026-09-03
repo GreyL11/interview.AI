@@ -202,7 +202,7 @@ class Recorder:
     def __init__(self):
         self.calls = []
 
-    async def __call__(self, text, source, is_final, trace=None):
+    async def __call__(self, text, source, is_final, trace=None, now=None):
         self.calls.append((text, source, is_final))
 
 

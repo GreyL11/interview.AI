@@ -112,10 +112,13 @@ class ReplayHarness:
         # A tiny stabilization window keeps replay fast without disabling the
         # mechanism under test; use monkeypatch (pytest fixture) so it's
         # restored automatically, matching the rest of the test suite's style.
-        if monkeypatch is not None:
-            monkeypatch.setattr(settings, "question_stabilization_ms", stabilization_ms)
-        else:
-            settings.question_stabilization_ms = stabilization_ms
+        # Both hold budgets, so a scenario's timing does not depend on which
+        # Finality branch the detector picked -- see question_detector.Finality.
+        for field in ("question_stabilization_ms", "question_hold_incomplete_ms"):
+            if monkeypatch is not None:
+                monkeypatch.setattr(settings, field, stabilization_ms)
+            else:
+                setattr(settings, field, stabilization_ms)
 
     async def _collect(self, ev: Event) -> None:
         self.result.events.append(ev)

@@ -116,21 +116,95 @@ class Settings(BaseSettings):
     # count program") can still be prepended as context once the very next
     # utterance turns out to be the actual question. Deliberately short: this
     # bridges two halves of one thought, not a running transcript history.
-    question_context_window_ms: int = 4000
+    question_context_window_ms: int = 8000
     # How long after the last accepted question a short fragment ("Why?", "How?")
     # may still count as a follow-up rather than noise. Long enough to cover
     # "candidate read the streamed answer, then asked a quick follow-up".
     question_followup_window_ms: int = 45_000
-    # How long to hold a question that looks mid-clause ("...what happens
-    # when") before asking it, giving a quick continuation a chance to
-    # supersede it first. A complete question is never delayed -- see
-    # question_detector._looks_incomplete.
-    question_stabilization_ms: int = 400
+    # --- turn accumulation budgets -------------------------------------
+    # All three are windows on the SPEECH clock, and all three are spent only
+    # by a turn that is not yet answerable. A complete one-shot question and
+    # an obvious follow-up are held for 0ms and are unaffected by every value
+    # below.
+    #
+    # The sizing is not arbitrary. Two fragments of one spoken turn have their
+    # speech_end timestamps separated by `pause + duration(next fragment)` --
+    # each fragment stamps speech_end vad_silence_ms after its own audio ends,
+    # so those two closes cancel out -- and the next fragment is *delivered*
+    # one STT pass after that. Accumulation therefore only catches a
+    # continuation when:
+    #
+    #     pause + duration(next fragment) + stt_inference  <=  hold
+    #
+    # For natural speech that right-hand side is 1.6-2.8s (a 300ms pause plus
+    # a 1.5s clause plus ~150ms inference is 1950ms). Anything under ~2s
+    # cannot assemble a fragmented question at all -- it fires on the first
+    # fragment and then pays a second provider call to correct itself.
+    #
+    # How long to hold a request that is grammatically whole but worded the
+    # way interviewers word one with a constraint still coming ("find two
+    # numbers", "tell me about a time"). It may already be finished, so this
+    # is the smallest of the three.
+    question_stabilization_ms: int = 2500
+    # How long to hold a request that is provably *not* whole yet -- a
+    # dangling conjunction, a bare "Can you explain", a premise with nothing
+    # asked for. Longer than the above because sending it can only ever be
+    # wrong, so the only cost of waiting is on the rare utterance that is
+    # abandoned mid-sentence. Still bounded, and still never applied to a
+    # complete question, which is held for 0ms.
+    #
+    # A continuation arrives as its own VAD-bounded utterance, so it cannot
+    # land sooner than vad_silence_ms plus its own speech and inference time.
+    # This is the knob that decides whether a split question costs one
+    # provider call or two -- see Finality.ACCUMULATING. Tune on real audio.
+    question_hold_incomplete_ms: int = 3000
+    #: After a fragment has merged into the turn but the result still carries
+    #: no terminal "?", the interviewer has demonstrated that this turn
+    #: arrives in pieces -- so the next piece gets this long to land. Restarted
+    #: by each new fragment, which is what turns N fragments into one provider
+    #: call instead of N. Never applied to a turn that has not fragmented, so
+    #: it costs a one-shot question nothing.
+    question_continuation_ms: int = 2000
+    #: Hard ceiling on one turn's accumulation, and the merge window used
+    #: while a turn is still accumulating. Bounds the worst case for an
+    #: interviewer who never stops qualifying, and stops a held fragment from
+    #: outliving the window that would let its continuation merge -- if the
+    #: hold outlived the merge window, the held words would be discarded
+    #: rather than assembled.
+    question_max_accumulation_ms: int = 10_000
     # Off by default: logs every detector decision (accepted or rejected,
     # with category/confidence/reason) via the existing structured metrics
     # logger, for inspecting real-world detector behavior during manual
     # testing. Never covers MIC audio -- that never reaches the detector.
     question_detector_diagnostics: bool = False
+
+    # --- question understanding ----------------------------------------
+    #: One classification call per *completed* interviewer turn, between
+    #: finality and the answer. Never runs on partials or fragments. Off
+    #: degrades to the deterministic reading the detector already produced --
+    #: answers still happen, context selection is just less precise.
+    question_understanding_enabled: bool = True
+    #: Hard budget. This sits on the realtime path, so it is far tighter than
+    #: `groq_timeout_seconds`: past this the fallback is faster than the
+    #: classifier and the interviewer is waiting either way.
+    question_understanding_timeout_ms: int = 1500
+    #: Empty means "use groq_model". Split only if a smaller/faster model is
+    #: worth the extra configuration surface -- a decision for real audio.
+    question_understanding_model: str = ""
+
+    # --- interviewer-pasted material -----------------------------------
+    #: How close to a question a paste has to be to belong to it. Short on
+    #: purpose: this binds "here is the table" to "what is wrong with it",
+    #: not a paste from earlier in the interview to whatever is asked next.
+    #: Applies in both directions -- paste-then-ask and ask-then-paste are
+    #: the same event in different orders.
+    context_attachment_window_ms: int = 10_000
+    #: Per-attachment ceiling. An attachment over this is rejected with a
+    #: reason rather than truncated: a partial table or query looks complete
+    #: to the model and is worse than none at all.
+    context_attachment_max_chars: int = 20_000
+    #: How many pastes one turn may carry (a schema, a query, an error, ...).
+    context_attachment_max_items: int = 6
 
     # Realtime transport
     ws_replay_buffer: int = 200
@@ -138,6 +212,15 @@ class Settings(BaseSettings):
 
     # Audio capture
     audio_queue_frames: int = 200  # ~6s at 32ms/frame before dropping oldest
+    #: Low-pass the WASAPI loopback stream before decimating it to 16kHz.
+    #: Linear interpolation alone does not reject anything above the output
+    #: Nyquist, so without this a 15kHz tone lands at ~1kHz and broadband
+    #: content above 8kHz sits only ~9dB below the speech itself -- both
+    #: measured on this resampler. Exposed as a switch purely so the two
+    #: arms can be A/B'd on real interview audio; there is no reason to
+    #: prefer the aliased path. Mic capture is unaffected (PortAudio
+    #: resamples that one itself).
+    audio_loopback_antialias: bool = True
     #: Off by default. The microphone is transcribed for review only -- it never
     #: drives question detection -- but it was measured at 70% of all STT work
     #: (548s of 783s), which is what pushed transcription past real time on a

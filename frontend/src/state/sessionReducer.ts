@@ -9,6 +9,8 @@
 
 import type {
   Answer,
+  AttachmentKind,
+  AttachmentRejectReason,
   CancelReason,
   Classification,
   RejectionReason,
@@ -76,6 +78,32 @@ export interface RejectedQuestion {
   reason: RejectionReason | null;
 }
 
+/**
+ * One piece of interviewer-provided material, as the *server* acknowledged it.
+ *
+ * Metadata only, deliberately: the content already left in the outbound frame
+ * and does not need to come back or be held here. That keeps pasted material
+ * out of UI state that gets rendered, logged or persisted, and it is why this
+ * interface has no `content` field. The backend owns the binding lifecycle;
+ * this is a render of its acknowledgements.
+ */
+export interface AttachmentView {
+  /** Local id: the server does not issue one, and this only has to be stable
+   * enough for React keys and for de-duplicating a replayed acknowledgement. */
+  id: string;
+  kind: AttachmentKind;
+  name: string;
+  chars: number;
+  /** OCR text recovered from a pasted screenshot rather than typed. */
+  fromImage: boolean;
+}
+
+export interface AttachmentRejection {
+  kind: string;
+  reason: AttachmentRejectReason | string;
+  message: string;
+}
+
 export interface SessionState {
   connection: ConnectionState;
   sessionId: string | null;
@@ -91,6 +119,14 @@ export interface SessionState {
   current: TurnView | null;
   history: TurnView[];
   lastRejected: RejectedQuestion | null;
+  /** Material the server has accepted for the interview context, oldest
+   * first. Separate from `transcript` and from candidate documents on
+   * purpose -- these are three different things and conflating them would put
+   * a pasted schema into the spoken record. */
+  attachments: AttachmentView[];
+  /** Last refusal, so the user learns why rather than seeing a generic error.
+   * Cleared once a later attachment is accepted. */
+  lastAttachmentRejection: AttachmentRejection | null;
   error: string | null;
   ended: boolean;
 }
@@ -107,6 +143,8 @@ export const initialSessionState: SessionState = {
   current: null,
   history: [],
   lastRejected: null,
+  attachments: [],
+  lastAttachmentRejection: null,
   error: null,
   ended: false,
 };
@@ -332,6 +370,41 @@ function applyEvent(state: SessionState, event: ServerEvent): SessionState {
         phase: "failed",
         errorMessage: str(event.data, "message", "The answer failed."),
       });
+
+    case "context.attached": {
+      const kind = str(event.data, "kind", "text") as AttachmentKind;
+      const view: AttachmentView = {
+        // seq is monotonic per session, so it is already a stable identity for
+        // one acknowledgement -- and it makes a replayed frame idempotent
+        // rather than a duplicate chip.
+        id: `att-${event.seq}`,
+        kind,
+        name: str(event.data, "name"),
+        chars: num(event.data, "chars"),
+        fromImage: bool(event.data, "from_image"),
+      };
+      if (base.attachments.some((existing) => existing.id === view.id)) return base;
+      return {
+        ...base,
+        attachments: [...base.attachments, view],
+        // A success supersedes whatever the last refusal said.
+        lastAttachmentRejection: null,
+      };
+    }
+
+    case "context.rejected":
+      // A normal refusal (too large, empty, unreadable image) is not an
+      // application error and must not surface as one: `error` drives a
+      // failure banner, and a paste the user can simply redo does not belong
+      // there.
+      return {
+        ...base,
+        lastAttachmentRejection: {
+          kind: str(event.data, "kind", "text"),
+          reason: str(event.data, "reason") as AttachmentRejectReason,
+          message: str(event.data, "message", "That attachment was not accepted."),
+        },
+      };
 
     case "error":
       return { ...base, error: str(event.data, "message", "Unknown error") };

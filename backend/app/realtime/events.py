@@ -21,11 +21,20 @@ class EventType(StrEnum):
     ANSWER_COMPLETED = "answer.completed"
     ANSWER_CANCELLED = "answer.cancelled"
     ANSWER_ERROR = "answer.error"
+    #: Pasted material was accepted and is now bound to, or waiting for, a
+    #: question. Carries only metadata -- the content is already the client's.
+    CONTEXT_ATTACHED = "context.attached"
+    #: Rejected with a reason the interviewer can act on (too large, empty,
+    #: unreadable image). Never silently truncated.
+    CONTEXT_REJECTED = "context.rejected"
     ERROR = "error"
 
     # client -> server
     SESSION_STOP = "session.stop"
     QUESTION_MANUAL = "question.manual"
+    #: The interviewer pasted a table / query / snippet / screenshot to be
+    #: answered together with the spoken question around it.
+    CONTEXT_ATTACH = "context.attach"
     ANSWER_CANCEL = "answer.cancel"
     AUDIO_START = "audio.start"
     AUDIO_STOP = "audio.stop"

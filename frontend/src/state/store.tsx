@@ -11,6 +11,7 @@ import {
 } from "react";
 
 import { api } from "../api/client.ts";
+import { prepareImagePaste, prepareTextPaste } from "../api/attachments.ts";
 import { SessionSocket } from "../api/ws.ts";
 import {
   initialSessionState,
@@ -27,6 +28,11 @@ interface SessionContextValue {
   ask: (text: string) => void;
   cancel: () => void;
   toggleAudio: () => void;
+  /** Attach pasted interviewer material to the current interview context.
+   * Returns a local refusal message, or null when the frame went out. The
+   * server's own acceptance/refusal arrives as an event. */
+  attachPaste: (raw: string, name?: string) => string | null;
+  attachImage: (bytes: Uint8Array, name?: string) => string | null;
 }
 
 const SessionContext = createContext<SessionContextValue | null>(null);
@@ -76,6 +82,29 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     socketRef.current?.cancelAnswer();
   }, []);
 
+  const attachPaste = useCallback((raw: string, name = "") => {
+    const socket = socketRef.current;
+    if (socket === null) return "Start a session before attaching material.";
+    const prepared = prepareTextPaste(raw, name);
+    if (!prepared.ok) return prepared.message;
+    // One paste, one frame. No local queue and no retry: replaying this after
+    // a reconnect would attach the same material twice, and there is no
+    // message id for the backend to de-duplicate against.
+    return socket.attachContext(prepared.message)
+      ? null
+      : "Not connected — that material was not attached.";
+  }, []);
+
+  const attachImage = useCallback((bytes: Uint8Array, name = "") => {
+    const socket = socketRef.current;
+    if (socket === null) return "Start a session before attaching material.";
+    const prepared = prepareImagePaste(bytes, name);
+    if (!prepared.ok) return prepared.message;
+    return socket.attachContext(prepared.message)
+      ? null
+      : "Not connected — that image was not attached.";
+  }, []);
+
   const toggleAudio = useCallback(() => {
     const socket = socketRef.current;
     if (socket === null) return;
@@ -88,8 +117,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [state.audio]);
 
   const value = useMemo(
-    () => ({ state, starting, startError, start, stop, ask, cancel, toggleAudio }),
-    [state, starting, startError, start, stop, ask, cancel, toggleAudio],
+    () => ({
+      state, starting, startError, start, stop, ask, cancel, toggleAudio,
+      attachPaste, attachImage,
+    }),
+    [state, starting, startError, start, stop, ask, cancel, toggleAudio,
+     attachPaste, attachImage],
   );
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;

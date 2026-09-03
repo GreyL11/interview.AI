@@ -378,6 +378,74 @@ def test_coalesced_continuation_of_a_dangling_clause_is_stable():
     assert "transaction fails" in second.text
 
 
+# ------------------------------------------------------- sparse trigger only
+# A trigger phrase alone ("explain", "tell me about") is not evidence the
+# interviewer finished their thought -- only that they started one. Distinct
+# from the dangling-clause check above: none of these end on a conjunction,
+# preposition or article, which is exactly why they used to slip through.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Can you explain",
+        "Tell me about",
+        "Can you walk me through",
+        "Could you describe",
+    ],
+)
+def test_a_bare_trigger_with_nothing_after_it_is_flagged_unstable(text):
+    detection = QuestionDetector().inspect(text)
+    assert detection.accepted, f"rejected as {detection.reason} / {detection.detail}"
+    assert detection.stable is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Can you explain how",
+        "Can you explain why",
+        "Tell me about what",
+    ],
+)
+def test_a_trigger_trailing_into_a_bare_wh_word_is_flagged_unstable(text):
+    """Same failure mode one clause later: the trigger has an object clause
+    starting, but that clause itself trails off before saying anything."""
+    detection = QuestionDetector().inspect(text)
+    assert detection.accepted
+    assert detection.stable is False
+
+
+def test_a_trigger_with_a_real_object_is_stable():
+    """The distinguishing case: same opener, but the interviewer actually
+    said what they want -- must not be held back."""
+    detection = QuestionDetector().inspect("Tell me about your last project.")
+    assert detection.accepted
+    assert detection.stable is True
+
+
+def test_explain_with_a_topic_is_stable():
+    detection = QuestionDetector().inspect("Can you explain closures?")
+    assert detection.accepted
+    assert detection.stable is True
+
+
+def test_a_bare_trigger_followed_by_a_real_continuation_merges_and_is_stable():
+    """The 400ms hold exists precisely so this continuation has a chance to
+    land before anything is asked -- once merged, the combined text is a
+    complete, answerable question."""
+    detector = QuestionDetector(coalesce_ms=1000)
+    first = detector.inspect("Can you explain", now=100.0)
+    assert first.accepted and first.stable is False
+
+    second = detector.inspect("how dependency injection works in FastAPI", now=100.3)
+    assert second.accepted
+    assert second.stable is True
+    assert second.supersedes
+    assert "dependency injection" in second.text
+    assert "FastAPI" in second.text
+
+
 # ---------------------------------------------------------- coding problems
 # A coding problem's setup clause ("Given an array, find two numbers") has no
 # terminal "?" and is exactly the imperative-task shape -- and is exactly the

@@ -1,3 +1,4 @@
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -30,6 +31,13 @@ class SpeechDetector(ABC):
 
     def reset(self) -> None:
         return
+
+    @property
+    def name(self) -> str:
+        """Which detector is actually running. Surfaced in the worker's
+        end-of-session metrics, because the difference between Silero and the
+        energy fallback is large and the fallback is otherwise invisible."""
+        return type(self).__name__
 
 
 @dataclass
@@ -107,6 +115,59 @@ class Segmenter:
         return SegmentEvent.SPEECH_CONTINUE
 
 
+def _load_silero() -> tuple[object, str, int]:
+    """Build the shared ONNX session. Returns (session, mode, input_samples)."""
+    import os
+
+    import onnxruntime as ort
+    from faster_whisper.vad import get_assets_path
+
+    path = os.path.join(get_assets_path(), "silero_vad_v6.onnx")
+
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+
+    session = ort.InferenceSession(path, options, providers=["CPUExecutionProvider"])
+
+    inputs = session.get_inputs()
+    input_names = {item.name for item in inputs}
+    if {"input", "state", "sr"}.issubset(input_names):
+        mode = "state"
+    elif {"input", "h", "c"}.issubset(input_names):
+        mode = "lstm"
+    else:
+        raise RuntimeError(f"Unsupported Silero VAD model inputs: {sorted(input_names)}")
+
+    # ONNX reports a dynamic axis as a symbolic name or None, not an int, and
+    # this model's sample axis is routinely dynamic. int() on that raises --
+    # which used to escape all the way out to build_speech_detector() and get
+    # swallowed as "Silero unavailable", silently demoting the whole session
+    # to the energy fallback over a shape annotation. FRAME_SAMPLES is what
+    # the capture layer produces and what Silero v5/v6 expect anyway.
+    declared = next(item.shape[-1] for item in inputs if item.name == "input")
+    try:
+        input_samples = int(declared)
+    except (TypeError, ValueError):
+        input_samples = FRAME_SAMPLES
+        logger.debug("silero_vad_dynamic_input_axis declared=%r; using %d",
+                     declared, input_samples)
+
+    logger.info(
+        "silero_vad_loaded mode=%s input_samples=%d inputs=%s",
+        mode, input_samples, sorted(input_names),
+    )
+    return session, mode, input_samples
+
+
+#: One ONNX session for the whole process. `InferenceSession.run()` is
+#: thread-safe and the recurrent state is passed in explicitly on every call
+#: (as `state`, or `h`/`c`), so the session holds nothing per-channel --
+#: while a fresh one per instance would reload the model for every channel
+#: and again on every audio stop/start.
+_silero_session: tuple[object, str, int] | None = None
+_silero_lock = threading.Lock()
+
+
 class SileroVad(SpeechDetector):
     """Silero VAD loaded from the ONNX asset bundled with faster-whisper."""
 
@@ -122,53 +183,13 @@ class SileroVad(SpeechDetector):
         if self._session is not None:
             return self._session
 
-        try:
-            import os
-
-            import onnxruntime as ort
-            from faster_whisper.vad import get_assets_path
-        except ImportError as exc:
-            raise RuntimeError(f"Silero VAD is unavailable: {exc}") from exc
-
-        path = os.path.join(get_assets_path(), "silero_vad_v6.onnx")
-
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 1
-
-        self._session = ort.InferenceSession(
-            path,
-            options,
-            providers=["CPUExecutionProvider"],
-        )
-
-        input_names = {item.name for item in self._session.get_inputs()}
-
-        input_meta = next(
-            item
-            for item in self._session.get_inputs()
-            if item.name == "input"
-        )
-
-        self._input_samples = int(input_meta.shape[-1])
-
-        if {"input", "state", "sr"}.issubset(input_names):
-            self._mode = "state"
-        elif {"input", "h", "c"}.issubset(input_names):
-            self._mode = "lstm"
-        else:
-            raise RuntimeError(
-                f"Unsupported Silero VAD model inputs: {sorted(input_names)}"
-            )
+        global _silero_session
+        with _silero_lock:
+            if _silero_session is None:
+                _silero_session = _load_silero()
+            self._session, self._mode, self._input_samples = _silero_session
 
         self.reset()
-
-        logger.info(
-            "silero_vad_loaded mode=%s input_samples=%d inputs=%s",
-            self._mode,
-            self._input_samples,
-            sorted(input_names),
-        )
-
         return self._session
 
     def reset(self) -> None:
@@ -230,6 +251,17 @@ class EnergyVad(SpeechDetector):
     ponytail: crude but dependency-free, and it keeps the pipeline runnable when
     the Silero asset cannot be loaded. Noticeably worse in noisy rooms — Silero
     is the real implementation, this is the safety net.
+
+    Calibration, checked against what the capture layer actually produces:
+    both channels deliver float32 in [-1, 1] (the mic via sounddevice's
+    `dtype="float32"`, loopback via int16 / 32768.0), so `rms` here is a true
+    full-scale fraction. With `floor=0.01` and the default
+    `vad_threshold=0.5`, a frame counts as speech at rms >= 0.005, i.e. about
+    -46 dBFS. Ordinary speech sits near 0.05-0.2, and a quiet room floor near
+    0.001-0.003, so the default has headroom -- but a laptop fan, a noisy
+    line, or AGC on the far end can cross it, and then utterances never close
+    on silence. BENCHMARK REQUIRED: the right floor is a property of the
+    machine's noise level, not something that can be derived here.
     """
 
     def __init__(self, floor: float = 0.01) -> None:
@@ -240,11 +272,33 @@ class EnergyVad(SpeechDetector):
         return min(1.0, rms / self._floor) if self._floor > 0 else 0.0
 
 
+#: Said once per process, not once per channel per session. Without this the
+#: same fallback line repeats on every audio start and reads like noise.
+_warned_fallback = False
+
+
 def build_speech_detector() -> SpeechDetector:
+    """Silero if it loads, energy RMS if it does not.
+
+    The fallback is a real downgrade, not a cosmetic one: EnergyVad cannot
+    tell speech from a fan or a keyboard, so in a noisy room utterances stop
+    closing on silence and only end at `vad_max_utterance_ms`. That is worth
+    an ERROR, and worth naming in the worker's metrics line, because
+    everything downstream looks merely "slow" rather than misconfigured.
+    """
+    global _warned_fallback
     try:
         detector = SileroVad()
         detector._ensure_loaded()
         return detector
     except Exception as exc:
-        logger.warning("silero_vad_unavailable falling_back_to_energy error=%s", exc)
+        if not _warned_fallback:
+            _warned_fallback = True
+            logger.error(
+                "silero_vad_unavailable falling_back_to_energy error=%s: %s. "
+                "Speech detection is now RMS-only -- utterance boundaries will "
+                "be unreliable in a noisy room. Check that faster-whisper is "
+                "installed and its bundled VAD asset is present.",
+                type(exc).__name__, exc,
+            )
         return EnergyVad()

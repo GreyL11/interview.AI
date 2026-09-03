@@ -159,6 +159,19 @@ export class SessionSocket {
     return this.send({ type: "question.manual", data: { text } });
   }
 
+  /**
+   * Send interviewer-provided material for the current turn.
+   *
+   * Deliberately *not* retried or queued. `send` returns false on a closed
+   * socket and the caller surfaces that, because a paste is a user action
+   * with a visible result: silently replaying it after a reconnect would
+   * attach the same table twice, and the backend has no message-id to
+   * de-duplicate against. One paste, one frame, or an honest failure.
+   */
+  attachContext(message: ClientMessage): boolean {
+    return this.send(message);
+  }
+
   cancelAnswer(): boolean {
     return this.send({ type: "answer.cancel" });
   }

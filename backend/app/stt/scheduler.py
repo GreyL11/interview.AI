@@ -65,6 +65,7 @@ class InferenceJob:
         "utterance_id",
         "is_final",
         "priority",
+        "session_id",
         "enqueued_at",
         "_fn",
         "_lock",
@@ -79,12 +80,17 @@ class InferenceJob:
         utterance_id: int,
         is_final: bool,
         priority: int,
+        session_id: str | None = None,
     ) -> None:
         self._fn = fn
         self.channel = channel
         self.utterance_id = utterance_id
         self.is_final = is_final
         self.priority = priority
+        #: Carried so every queue-side metric can be joined to the session and
+        #: utterance it belongs to. Without it `stt_job_*` lines are ambiguous
+        #: the moment two channels (or two sessions) are live.
+        self.session_id = session_id
         #: When this job joined the queue. Used to decide, at pickup time,
         #: whether transcribing it is still worth the CPU -- see `expired`.
         self.enqueued_at = time.monotonic()
@@ -255,15 +261,17 @@ class InferenceScheduler:
         utterance_id: int = 0,
         is_final: bool = False,
         priority: int | None = None,
+        session_id: str | None = None,
     ) -> InferenceJob | None:
         """Queue a job. Returns None if the scheduler is not running."""
         if not self._running:
             return None
         job_priority = priority if priority is not None else priority_for(channel, is_final)
-        job = InferenceJob(fn, channel, utterance_id, is_final, job_priority)
+        job = InferenceJob(fn, channel, utterance_id, is_final, job_priority, session_id)
         self._put(job_priority, job)
         log_metric(
             "stt_job_enqueued",
+            session_id=session_id,
             channel=channel.value,
             utterance_id=utterance_id,
             is_final=is_final,
@@ -272,6 +280,7 @@ class InferenceScheduler:
         )
         log_metric(
             "stt_job_priority",
+            session_id=session_id,
             channel=channel.value,
             utterance_id=utterance_id,
             is_final=is_final,
@@ -279,6 +288,7 @@ class InferenceScheduler:
         )
         log_metric(
             "stt_queue_depth",
+            session_id=session_id,
             channel=channel.value,
             utterance_id=utterance_id,
             depth=self.depth,
@@ -338,6 +348,7 @@ class InferenceScheduler:
                 if item.job.expired() and item.job.drop():
                     log_metric(
                         "stt_job_dropped",
+                        session_id=item.job.session_id,
                         channel=item.job.channel.value,
                         utterance_id=item.job.utterance_id,
                         is_final=item.job.is_final,
@@ -351,14 +362,20 @@ class InferenceScheduler:
                     continue  # cancelled while it waited
                 log_metric(
                     "stt_job_started",
+                    session_id=item.job.session_id,
                     channel=item.job.channel.value,
                     utterance_id=item.job.utterance_id,
                     is_final=item.job.is_final,
                     priority=item.job.priority,
+                    # Time this job spent queued before a worker picked it up.
+                    # Distinct from the worker's own `queue_wait_ms`, which is
+                    # measured from speech-end and so includes enqueue lag.
+                    queued_ms=int(item.job.age_seconds() * 1000),
                 )
                 item.job.run()
                 log_metric(
                     "stt_job_completed",
+                    session_id=item.job.session_id,
                     channel=item.job.channel.value,
                     utterance_id=item.job.utterance_id,
                     is_final=item.job.is_final,

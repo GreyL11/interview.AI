@@ -219,6 +219,51 @@ class FasterWhisperEngine(SttEngine):
                 raise SttError(f"Transcription failed: {cpu_exc}") from cpu_exc
 
     def _run(self, model, audio: np.ndarray, is_final: bool) -> Transcript:
+        # Every argument here is deliberate, and the *defaults* left unset
+        # matter as much as the ones passed:
+        #
+        #   language="en"                 skips the language-detection forward
+        #                                 pass on every utterance. Correct for
+        #                                 this product and already a latency win.
+        #   beam_size=5 final / 1 interim accuracy where it counts, speed where
+        #                                 the text is only being displayed.
+        #                                 BENCHMARK REQUIRED: 5 vs 3 vs 1 on
+        #                                 real interviewer audio.
+        #   vad_filter=False              our Segmenter already cut this clip;
+        #                                 Whisper's own VAD would re-trim it and
+        #                                 can clip leading consonants.
+        #   condition_on_previous_text    False: utterances are independently
+        #                                 segmented, so conditioning would carry
+        #                                 text across unrelated clips and invites
+        #                                 repetition loops.
+        #
+        # Left at faster-whisper defaults, each a BENCHMARK REQUIRED decision
+        # because the trade only shows up against real audio:
+        #
+        #   temperature=[0.0 .. 1.0]      the fallback ladder. On a clip that
+        #                                 trips compression_ratio_threshold(2.4)
+        #                                 or log_prob_threshold(-1.0) this
+        #                                 re-decodes up to 6x, which is the most
+        #                                 likely explanation for the 10.3s
+        #                                 outlier final in the shipped log
+        #                                 against a ~110ms median. Pinning 0.0
+        #                                 removes that tail and removes the
+        #                                 rescue for genuinely garbled audio.
+        #   no_speech_threshold=0.6       can still discard a clip our VAD
+        #                                 accepted -> empty final, counted as
+        #                                 `final_transcription_empty`.
+        #   without_timestamps=False      we discard timestamps entirely, so the
+        #                                 timestamp tokens are generated for
+        #                                 nothing. Setting True should cut
+        #                                 decode work, but it changes decoder
+        #                                 behaviour, so it is a measurement not
+        #                                 a cleanup.
+        #   word_timestamps=False         correct as-is; enabling adds a
+        #                                 cross-attention alignment pass.
+        #   initial_prompt=None           an interview-vocabulary prime could
+        #                                 help proper nouns ("Kubernetes",
+        #                                 "idempotent") but risks biasing short
+        #                                 utterances.
         segments, info = model.transcribe(
             audio,
             language=settings.stt_language or None,

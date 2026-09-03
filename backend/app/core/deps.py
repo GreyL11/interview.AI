@@ -14,6 +14,7 @@ from app.llm.base import LLMClient
 from app.llm.groq_client import build_llm_client
 from app.memory.sqlite_memory import SqliteSessionMemory
 from app.memory.summarizer import SessionSummarizer
+from app.realtime.question_understanding import QuestionUnderstander
 from app.retrieval.base import Retriever
 from app.retrieval.local_retriever import LocalRetriever
 from app.storage.chunk_repository import ChunkRepository
@@ -97,6 +98,17 @@ def get_llm_client() -> LLMClient:
 @lru_cache
 def get_summarizer() -> SessionSummarizer:
     return SessionSummarizer(get_session_repository(), get_llm_client())
+
+
+@lru_cache
+def get_question_understander() -> QuestionUnderstander:
+    """The understanding layer, wired to the one provider this app has.
+
+    `GroqClient.complete_json` satisfies the StructuredCompleter protocol, so
+    this reuses the same client (and its connection pool) rather than standing
+    up a second provider path.
+    """
+    return QuestionUnderstander(get_llm_client())
 
 
 @lru_cache

@@ -45,6 +45,12 @@ class PromptMatch:
     prompt: str
     reason: str
     sentence: str
+    #: True when the matched trigger phrase ("explain", "tell me about") is
+    #: essentially all the interviewer has said -- nothing meaningful follows
+    #: it, and nothing follows this sentence either. That is the signature of
+    #: a prompt caught mid-utterance ("Can you explain") rather than a
+    #: complete one ("Can you explain closures?"). See `_has_content_after`.
+    sparse: bool = False
 
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -143,7 +149,13 @@ _CLAUSE_INITIAL = re.compile(
         )
       | (?P<imperative>
             (?:write|implement|code|build|design|create|solve|reverse|sort|return|find|given|
-               list|name|discuss|rank|count|group|select|calculate|compute)\b
+               list|name|discuss|rank|count|group|select|calculate|compute|
+        # Verbs an interviewer uses to continue an existing task rather than
+        # open a new one ("Now handle a stream of integers."). Without these
+        # the continuation was rejected outright and the step was lost, even
+        # though the turn is plainly an instruction. `optimi[sz]e` follows the
+        # same both-spellings convention as `summari[sz]e` above.
+               handle|optimi[sz]e|refactor|extend|modify)\b
         )
         # Deliberately absent: assume, suppose, imagine, consider, take, walk.
         # Those are scenario qualifiers that accompany a question rather than
@@ -176,30 +188,174 @@ def _clause_starts(sentence: str) -> list[int]:
     return offsets
 
 
-def _classify_sentence(sentence: str) -> str | None:
-    """Which layer, if any, marks this sentence as a prompt."""
+#: Words that never count as "the interviewer went on to say something" when
+#: they're all that's left after a trigger phrase -- pronouns and auxiliaries
+#: that any unfinished clause is equally likely to open with ("How would
+#: you...", "Tell me about..."). Deliberately not `_DANGLING_WORDS` from
+#: question_detector: that set flags a sentence by its *last* word anywhere,
+#: this one only judges the tail immediately after a matched trigger.
+_TRIVIAL_TAIL_WORDS = frozenset({
+    "me", "us", "you", "it", "this", "that", "i", "we", "they", "he", "she",
+    "can", "could", "would", "will", "do", "does", "did",
+    "is", "are", "was", "were", "about", "to", "of",
+})
+
+_WORD = re.compile(r"[A-Za-z']+")
+
+
+def _has_content_after(sentence: str, offset: int) -> bool:
+    """Is there a real word after `offset`, or did the trigger consume
+    everything worth reading in this sentence?"""
+    return any(
+        word.lower() not in _TRIVIAL_TAIL_WORDS for word in _WORD.findall(sentence[offset:])
+    )
+
+
+def _classify_sentence(sentence: str) -> tuple[str, int] | None:
+    """Which layer, if any, marks this sentence as a prompt, and where its
+    matched trigger ends -- callers use that offset to tell a complete prompt
+    ("explain closures") from one caught mid-utterance ("explain")."""
     if _ACK_ONLY.match(sentence):
         # Pure acknowledgement. Rejected even with a trailing "?" so a tag
         # question like "Right?" does not trigger coaching.
         return None
 
     if sentence.rstrip().endswith("?"):
-        return REASON_PUNCTUATION
+        # Whisper produced the "?" itself; trust it as closure rather than
+        # second-guessing where the trigger sat inside the sentence.
+        return REASON_PUNCTUATION, len(sentence)
 
-    if _PROMPT_ANYWHERE.search(sentence):
-        return REASON_INTERVIEW_PROMPT
+    match = _PROMPT_ANYWHERE.search(sentence)
+    if match:
+        return REASON_INTERVIEW_PROMPT, match.end()
 
     for offset in _clause_starts(sentence):
         match = _CLAUSE_INITIAL.match(sentence, offset)
         if match is None:
             continue
-        return (
+        reason = (
             REASON_INTERROGATIVE
             if match.group("interrogative")
             else REASON_IMPERATIVE_TASK
         )
+        return reason, match.end()
 
     return None
+
+
+# ------------------------------------------------------- semantic openness
+# A prompt can be a grammatically complete sentence and still not be a
+# complete *request*. These two signals separate "the interviewer finished
+# asking" from "the interviewer finished a clause", which is the difference
+# between one provider call and two.
+
+#: Premise openers. An interviewer who starts here is describing the setup,
+#: and the actual request is still coming ("Given an array of integers...").
+#: Only `given` currently reaches this check on its own -- assume/suppose/
+#: imagine/consider are deliberately absent from `_CLAUSE_INITIAL` and so
+#: never accepted alone -- but they do occur alongside a later trigger
+#: ("Suppose we have a million users, tell me how you'd shard"), which is
+#: why the whole family is listed.
+_SCENARIO_OPENER = re.compile(
+    r"""^\s*(?:(?:so|now|okay|ok|alright|well|and)[,\s]+)*
+    (?:given|suppose|assume|imagine|consider|if|say)\b
+      | \blet'?s\s+say\b
+      | \byou\s+(?:have|are\s+given)\b
+      | \bthere(?:'s|\s+is|\s+are)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+#: What makes a premise into a request: something actually being asked for.
+#: Interrogatives, task imperatives (the `_CLAUSE_INITIAL` vocabulary), and
+#: the explicit "I want you to" / "I need you to" framing.
+_REQUEST_SIGNAL = re.compile(
+    r"""\b(?:
+        what|what's|whats|why|when|where|who|whom|whose|which|how
+      | write|implement|code|build|design|create|solve|reverse|sort|return|find
+      | list|name|discuss|rank|count|group|select|calculate|compute|explain
+      | describe|tell|outline|summari[sz]e|compare|contrast
+      | i\s+(?:want|need)\s+you\s+to
+    )\b""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+#: A request whose object is an unqualified indefinite plural -- "find two
+#: numbers", "find some edge cases". English almost always continues these
+#: with a restrictive clause ("...whose sum equals a target"), and that
+#: clause is what makes the problem well-posed. Anchored to the end of the
+#: prompt, so anything actually following the object (a relative clause, a
+#: prepositional phrase) means the request already closed.
+#:
+#: The filler deliberately excludes prepositions, so "an array of integers"
+#: is not read as the object of the request -- there, "integers" belongs to
+#: "of", and the request ("find duplicate elements in an array of integers")
+#: is complete.
+#: Placeholder nouns that only mean something once a relative clause says
+#: *which* one -- "tell me about a time" is not a request until "...you had
+#: to ship under pressure" arrives. Distinguished from a real object by the
+#: indefinite article: "your last project" is specific and complete, "a
+#: project" is a placeholder.
+_PLACEHOLDER_NOUNS = (
+    "time|situation|example|instance|case|moment|project|experience|occasion|"
+    "problem|scenario"
+)
+
+#: A quantity with no constraint on it yet: "find two numbers". Answerable in
+#: principle -- badly -- so this is the ambiguous tier.
+_OPEN_QUANTITY = re.compile(
+    r"""\b(?:two|three|four|five|six|a|an|some|any|multiple|several)\s+
+    (?:(?!of\b|in\b|on\b|for\b|with\b|from\b|to\b|that\b|which\b|whose\b)[a-z]+\s+){0,1}
+    [a-z]+s\b[\s.,!?]*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+#: A placeholder noun still waiting for its relative clause: "tell me about a
+#: time". Not answerable at all -- there is no question here yet -- so this
+#: belongs in the same tier as a dangling conjunction, not the ambiguous one.
+_PLACEHOLDER_OBJECT = re.compile(
+    rf"\b(?:a|an)\s+(?:{_PLACEHOLDER_NOUNS})\b[\s.,!?]*$",
+    re.IGNORECASE,
+)
+
+
+#: An interviewer walking back a premise they just stated. What follows
+#: replaces the setup, it does not add to it -- "Assume 1,000 QPS. Actually,
+#: assume 10,000 QPS." must not reach the model as both numbers, or the model
+#: is being asked to design for two contradictory loads at once.
+_CORRECTION_OPENER = re.compile(
+    r"""^\s*(?:
+        actually | sorry | no[,\s] | scratch\s+that | strike\s+that
+      | instead | rather | correction | let\s+me\s+rephrase
+      | i\s+mean | make\s+that | on\s+second\s+thought
+    )\b""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def is_correction(text: str) -> bool:
+    """True when this utterance revises what the interviewer just said."""
+    return bool(_CORRECTION_OPENER.match(text.strip()))
+
+
+def is_scenario_without_request(prompt: str) -> bool:
+    """A premise with nothing asked for yet -- "Given an array of integers"."""
+    if not _SCENARIO_OPENER.search(prompt):
+        return False
+    # Strip the opener before looking for a request, so the opener's own verb
+    # ("given" is also a task imperative) cannot count as the request.
+    remainder = _SCENARIO_OPENER.sub(" ", prompt, count=1)
+    return not _REQUEST_SIGNAL.search(remainder)
+
+
+def has_open_quantity(prompt: str) -> bool:
+    """A request that names a quantity but not the constraint on it."""
+    return bool(_OPEN_QUANTITY.search(prompt))
+
+
+def has_placeholder_object(prompt: str) -> bool:
+    """A request whose object is a placeholder awaiting its relative clause."""
+    return bool(_PLACEHOLDER_OBJECT.search(prompt))
 
 
 def _normalize(text: str) -> str:
@@ -228,19 +384,35 @@ def extract_interview_prompt(text: str) -> PromptMatch | None:
 
     matched_index: int | None = None
     matched_reason: str | None = None
+    matched_trigger_end: int | None = None
     for index, sentence in enumerate(sentences):
-        reason = _classify_sentence(sentence)
-        if reason is not None:
-            matched_index, matched_reason = index, reason
+        result = _classify_sentence(sentence)
+        if result is not None:
+            matched_index, (matched_reason, matched_trigger_end) = index, result
 
     if matched_index is None or matched_reason is None:
         return None
+
+    # Sparse only if nothing follows the trigger *and* nothing follows this
+    # sentence either -- a trailing correction sentence ("...actually,
+    # assume 10k QPS") is real content even though the matched sentence
+    # itself might be bare. Never for REASON_PUNCTUATION: Whisper produced
+    # the "?" itself, which this trusts as closure -- there is no "trigger"
+    # to measure a tail against (`_classify_sentence` reports the whole
+    # sentence as consumed), so the check would otherwise fire on every
+    # ordinary complete question.
+    sparse = (
+        matched_reason != REASON_PUNCTUATION
+        and matched_index == len(sentences) - 1
+        and not _has_content_after(sentences[matched_index], matched_trigger_end)
+    )
 
     tail = " ".join(sentences[matched_index:])
     return PromptMatch(
         prompt=_normalize(tail),
         reason=matched_reason,
         sentence=sentences[matched_index],
+        sparse=sparse,
     )
 
 

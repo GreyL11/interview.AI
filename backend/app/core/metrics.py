@@ -51,6 +51,11 @@ class LatencyTrace:
     """
 
     speech_end_at: float
+    #: Which session/utterance produced this trace, so a log line is joinable
+    #: back to the STT-side `stt_job_*`/`speech_*_detected` events (those carry
+    #: `utterance_id` but not `question_id`, and vice versa on the answer side).
+    session_id: str | None = None
+    utterance_id: int | None = None
     stt_queue_wait_ms: int | None = None
     stt_inference_ms: int | None = None
     stt_final_at: float | None = None
@@ -85,6 +90,8 @@ class LatencyTrace:
         log_metric(
             "question_latency_trace",
             question_id=question_id,
+            session_id=self.session_id,
+            utterance_id=self.utterance_id,
             speech_end_to_stt_final_ms=self._ms(self.speech_end_at, self.stt_final_at),
             stt_queue_wait_ms=self.stt_queue_wait_ms,
             stt_inference_ms=self.stt_inference_ms,

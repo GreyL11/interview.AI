@@ -10,6 +10,7 @@ import { ErrorNote, Panel } from "../components/Common.tsx";
 import { StatusPills } from "../components/StatusPills.tsx";
 import { TranscriptPane } from "../components/TranscriptPane.tsx";
 import { isAnswering, visibleTurns } from "../state/sessionReducer.ts";
+import { ContextAttach } from "../components/ContextAttach.tsx";
 import { useSession } from "../state/store.tsx";
 
 export function PracticeScreen() {
@@ -79,6 +80,7 @@ export function PracticeScreen() {
               </button>
             </form>
           )}
+          {live && <ContextAttach />}
         </Panel>
 
         <Panel title="Coaching">

@@ -160,6 +160,32 @@ def _page_text(result) -> str:
     return "\n".join(lines)
 
 
+def ocr_image_bytes(data: bytes) -> str:
+    """Read text out of a single pasted image.
+
+    Shares the process-wide engine with the PDF path, so a session that has
+    already OCR'd a document pays no second model load. Kept separate from
+    `ocr_pdf_pages` because there is no PDF to render here -- the bytes are
+    handed straight to RapidOCR, which decodes the common screenshot formats
+    itself.
+
+    CPU-bound like everything else in this module: callers must already be on
+    a worker thread. A pasted screenshot arriving mid-interview would
+    otherwise block the event loop that is streaming an answer.
+    """
+    engine = _engine.get()
+    started = time.monotonic()
+    result, _ = engine(data)
+    text = _page_text(result)
+    log_metric(
+        "attachment_ocr_completed",
+        duration_ms=elapsed_ms(started, time.monotonic()),
+        bytes=len(data),
+        chars=len(text),
+    )
+    return text
+
+
 def ocr_pdf_pages(
     file_path: Path,
     page_indices: list[int],

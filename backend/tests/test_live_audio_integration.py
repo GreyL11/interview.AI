@@ -240,6 +240,12 @@ async def test_a_question_produces_one_correlated_latency_trace(live, monkeypatc
     assert len(traces) == 1
     trace = traces[0]
     assert trace["question_id"] is not None
+    # Joinable back to the STT-side per-utterance metrics (`stt_job_*`,
+    # `speech_*_detected`), which carry session_id/utterance_id but not
+    # question_id -- without these the two halves of the pipeline can't be
+    # correlated for one question.
+    assert trace["session_id"] == live.session_id
+    assert trace["utterance_id"] == 1
     # STT and LLM stage timings must all be present and non-negative.
     for field in (
         "speech_end_to_stt_final_ms",

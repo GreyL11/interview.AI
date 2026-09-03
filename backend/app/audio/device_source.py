@@ -21,6 +21,33 @@ logger = get_logger(__name__)
 _LOOPBACK_DIAGNOSTIC_INTERVAL = 500
 
 
+#: Anti-alias filter length. 63 taps at a 48kHz native rate is ~0.65ms of
+#: constant group delay and a few microseconds of CPU per callback, which buys
+#: roughly 40dB of stopband rejection -- enough to keep the images out of the
+#: band Whisper actually reads.
+_LOWPASS_TAPS = 63
+#: Cutoff as a fraction of the 16kHz output rate. 0.45 leaves the speech band
+#: (to ~7.2kHz) untouched and puts the transition below the 8kHz Nyquist.
+_LOWPASS_CUTOFF_RATIO = 0.45
+
+
+def _design_lowpass(native_rate: int, taps: int = _LOWPASS_TAPS) -> np.ndarray:
+    """Windowed-sinc low-pass for decimation to SAMPLE_RATE.
+
+    Linear interpolation is not a decimation filter: it barely attenuates
+    anything above the output Nyquist, so content up there folds back into
+    the speech band instead of being discarded. Measured on this code before
+    this filter existed: a 15kHz tone came out at 1029Hz at full amplitude,
+    and broadband hiss above 8kHz landed in the 0-8kHz band only 8.6dB below
+    the speech itself. That is squarely where Whisper's accuracy lives.
+    """
+    cutoff_hz = _LOWPASS_CUTOFF_RATIO * SAMPLE_RATE
+    n = np.arange(taps) - (taps - 1) / 2
+    fc = cutoff_hz / native_rate  # cycles per native-rate sample
+    kernel = 2 * fc * np.sinc(2 * fc * n) * np.hamming(taps)
+    return (kernel / np.sum(kernel)).astype(np.float32)
+
+
 def _pyaudiowpatch():
     """Load the Windows-only WASAPI loopback backend when it is needed."""
     if sys.platform != "win32":
@@ -82,6 +109,8 @@ class DeviceAudioSource(AudioSource):
         self._resample_input = np.empty(0, dtype=np.float32)
         self._resample_position = 0.0
         self._resampled_output = np.empty(0, dtype=np.float32)
+        self._lp_tail = np.empty(0, dtype=np.float32)
+        self._lp_kernel: np.ndarray | None = None
         self._loopback_callback_count = 0
         self._loopback_queue_count = 0
         self._loopback_yield_count = 0
@@ -91,6 +120,18 @@ class DeviceAudioSource(AudioSource):
     @property
     def channel(self) -> AudioChannel:
         return self._channel
+
+    @property
+    def queue_depth(self) -> int:
+        """Frames captured but not yet consumed by the VAD thread.
+
+        Reported at speech-end because it is the one latency term the
+        `speech_end_at` clock cannot see: that timestamp is taken when the
+        segmenter *processes* the closing frame, so anything sitting in this
+        queue means the true speech-to-transcript latency is higher than the
+        trace says, by roughly `queue_depth * 32ms`.
+        """
+        return self._queue.qsize()
 
     def describe(self) -> DeviceInfo:
         if self._device is not None:
@@ -238,6 +279,34 @@ class DeviceAudioSource(AudioSource):
         self._resample_input = np.empty(0, dtype=np.float32)
         self._resample_position = 0.0
         self._resampled_output = np.empty(0, dtype=np.float32)
+        self._lp_tail = np.empty(0, dtype=np.float32)
+        # Only needed when actually decimating; at 16kHz native there is
+        # nothing above Nyquist to reject and the filter would only cost
+        # group delay.
+        self._lp_kernel = (
+            _design_lowpass(self._loopback_sample_rate)
+            if settings.audio_loopback_antialias
+            and self._loopback_sample_rate != SAMPLE_RATE
+            else None
+        )
+
+    def _lowpass(self, mono: np.ndarray) -> np.ndarray:
+        """Band-limit before decimation, carrying filter state across callbacks.
+
+        WASAPI hands us arbitrary-sized chunks, so the last `taps-1` samples
+        are retained as the overlap for the next call -- the same continuity
+        trick the resampler below uses, and what keeps this from clicking at
+        every callback boundary.
+        """
+        if self._lp_kernel is None:
+            return mono
+        padded = np.concatenate((self._lp_tail, mono))
+        if padded.size < self._lp_kernel.size:
+            self._lp_tail = padded
+            return np.empty(0, dtype=np.float32)
+        filtered = np.convolve(padded, self._lp_kernel, mode="valid")
+        self._lp_tail = padded[-(self._lp_kernel.size - 1):]
+        return filtered.astype(np.float32, copy=False)
 
     def _queue_resampled_loopback(self, mono: np.ndarray) -> tuple[int, int, int]:
         """Resample native-rate mono audio and emit only complete VAD frames."""
@@ -275,6 +344,10 @@ class DeviceAudioSource(AudioSource):
         """
         if self._loopback_sample_rate == SAMPLE_RATE:
             return mono.astype(np.float32, copy=False)
+
+        # Band-limit first: everything above the 8kHz output Nyquist has to go
+        # before decimation, or it comes back folded into the speech band.
+        mono = self._lowpass(mono)
 
         samples = np.concatenate((self._resample_input, mono))
         if samples.size < 2:

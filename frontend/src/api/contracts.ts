@@ -313,12 +313,29 @@ export const SERVER_EVENTS = [
   "answer.completed",
   "answer.cancelled",
   "answer.error",
+  "context.attached",
+  "context.rejected",
   "error",
   "pong",
 ] as const;
 export type ServerEventType = (typeof SERVER_EVENTS)[number];
 
 export type RejectionReason = "not_a_question" | "too_short" | "low_confidence";
+
+/**
+ * Interviewer-pasted material. Mirrors `app.realtime.attachments`
+ * (AttachmentKind / RejectReason) -- these strings are the wire contract and
+ * must not be invented client-side.
+ */
+export const ATTACHMENT_KINDS = ["text", "code", "sql", "table", "image"] as const;
+export type AttachmentKind = (typeof ATTACHMENT_KINDS)[number];
+export type AttachmentRejectReason = "empty" | "too_large" | "unreadable_image";
+
+/** Backend limits, from `Settings.context_attachment_*`. Mirrored so the UI can
+ * refuse an oversized paste before encoding it; the backend stays
+ * authoritative and rejects independently. */
+export const ATTACHMENT_MAX_CHARS = 20_000;
+export const ATTACHMENT_MAX_ITEMS = 6;
 export type CancelReason = "superseded" | "user_stop" | "session_ended";
 
 /**
@@ -338,6 +355,21 @@ export interface ServerEvent {
 
 export type ClientMessage =
   | { type: "question.manual"; data: { text: string } }
+  /**
+   * Interviewer-provided material for the current turn. `content` is the
+   * pasted text verbatim; `image_base64` carries a pasted screenshot instead,
+   * which the backend decodes and OCRs. Exactly the shape
+   * `app/api/ws.py` reads.
+   */
+  | {
+      type: "context.attach";
+      data: {
+        kind: AttachmentKind;
+        content: string;
+        name?: string;
+        image_base64?: string;
+      };
+    }
   | { type: "answer.cancel" }
   | { type: "audio.start" }
   | { type: "audio.stop" }

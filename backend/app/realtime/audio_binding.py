@@ -36,6 +36,7 @@ def build_pipeline(
             engine=engine,
             loop=loop,
             on_transcript=live.on_transcript,
+            on_speech_start=live.on_speech_start,
             session_id=live.session_id,
         )
         for source in sources

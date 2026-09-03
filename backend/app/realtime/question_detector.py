@@ -2,6 +2,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass
+from enum import StrEnum
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -10,7 +11,13 @@ from app.intelligence.classifier import classify
 from app.realtime.events import RejectionReason
 from app.realtime.prompt_detector import (
     REASON_IMPERATIVE_TASK,
+    REASON_PUNCTUATION,
+    PromptMatch,
     is_acknowledgement,
+    has_open_quantity,
+    has_placeholder_object,
+    is_correction,
+    is_scenario_without_request,
     REASON_NO_PATTERN,
     extract_interview_prompt,
 )
@@ -29,15 +36,19 @@ _MAX_CONTEXT_CHARS = 220
 _WORD = re.compile(r"[A-Za-z']+")
 
 #: Words that are essentially never how a *complete* thought ends -- trailing
-#: subordinators, conjunctions, prepositions, articles, copulas. Deliberately
-#: excludes bare interrogatives (what/how/why/when alone) since those are
-#: legitimate one-word follow-ups ("Why?"); the follow-up bypass path is
-#: exempted from this check entirely for that reason (see `inspect`).
+#: subordinators, conjunctions, prepositions, articles, copulas, and bare
+#: interrogatives. A one-word follow-up ("Why?", "How?") never reaches this
+#: check: it is below `question_min_words` and only ever accepted through the
+#: follow-up bypass in `inspect`, which is exempted from this check entirely.
+#: What lands here instead is always a *longer* sentence that happens to
+#: trail off on one of these words ("Can you explain how", "Tell me about"),
+#: which is incomplete regardless of length.
 _DANGLING_WORDS = frozenset({
     "if", "that", "because", "so", "and", "but", "or", "nor",
     "the", "a", "an", "of", "to", "is", "are", "was", "were", "be", "been",
     "with", "for", "in", "on", "at", "as", "than", "while", "though",
-    "although", "since", "unless", "until", "whether", "when", "where", "which", "who", "whom",
+    "although", "since", "unless", "until", "whether",
+    "what", "how", "why", "when", "where", "which", "who", "whom", "about",
 })
 
 
@@ -51,6 +62,78 @@ def _looks_incomplete(text: str) -> bool:
     """
     words = _WORD.findall(text)
     return bool(words) and words[-1].lower() in _DANGLING_WORDS
+
+
+class Finality(StrEnum):
+    """How finished the interviewer's request looks.
+
+    A Whisper final only says a VAD segment closed. That is not the same
+    thing as the interviewer having finished asking, which is not the same
+    thing as having an exact question worth spending a provider call on:
+
+        STT final  !=  interviewer turn final  !=  LLM question final
+
+    This enum is the middle one. It decides whether the assembled text goes
+    to the model now, or waits a bounded moment for the rest of the sentence.
+    """
+
+    #: Provably not a whole request yet -- a dangling conjunction, a bare
+    #: trigger phrase, a premise with nothing asked for. Sending this can
+    #: only ever be wrong, so it waits the longest.
+    ACCUMULATING = "accumulating"
+    #: A whole request by grammar, but worded the way interviewers word a
+    #: request that still has a constraint coming ("find two numbers").
+    #: Might be finished; holds briefly rather than betting either way.
+    POTENTIALLY_COMPLETE = "potentially_complete"
+    #: Send now. The overwhelming majority of questions land here.
+    COMPLETE = "complete"
+
+
+def _assess(match: PromptMatch, followup_eligible: bool) -> tuple[Finality, int]:
+    """Decide finality from deterministic evidence, and how long to hold.
+
+    Ordered most-certain first. Every branch names the evidence it acted on,
+    and only the two non-COMPLETE branches ever wait -- there is deliberately
+    no path here that delays an ordinary complete question.
+    """
+    # A follow-up ("Why?", "Can you elaborate?") is complete by construction:
+    # it leans on the previous turn's context, and there is no continuation
+    # coming that would make it more answerable.
+    if followup_eligible:
+        return Finality.COMPLETE, 0
+
+    # Whisper put a "?" here itself, which is the strongest closure signal
+    # available and outranks every heuristic below.
+    #
+    # It has to come first, not just before the semantic checks. The
+    # last-word test cannot tell an object pronoun from a dangling
+    # subordinator -- "Why did you choose that?" and "Can you explain that?"
+    # both end on "that", and both are finished questions that a follow-up
+    # depends on firing immediately. Whisper terminating the utterance is the
+    # evidence that settles it. This does mean trusting a "?" on a fragment,
+    # which is the right bet: the failure mode documented all over this
+    # pipeline is Whisper giving "." to a real question, not "?" to a
+    # half-spoken one.
+    if match.reason == REASON_PUNCTUATION:
+        return Finality.COMPLETE, 0
+
+    # Syntactic incompleteness -- certain, and cheap to detect.
+    if match.sparse or _looks_incomplete(match.prompt):
+        return Finality.ACCUMULATING, settings.question_hold_incomplete_ms
+
+    # A premise with no request in it yet ("Given an array of integers"), or a
+    # request whose object is still a placeholder ("tell me about a time").
+    # Neither is answerable, so both sit in the provably-incomplete tier.
+    if is_scenario_without_request(match.prompt) or has_placeholder_object(match.prompt):
+        return Finality.ACCUMULATING, settings.question_hold_incomplete_ms
+
+    # A request naming a quantity but not the constraint on it ("find two
+    # numbers"). Answerable in principle, just probably not what was meant,
+    # so this gets the shorter hold.
+    if has_open_quantity(match.prompt):
+        return Finality.POTENTIALLY_COMPLETE, settings.question_stabilization_ms
+
+    return Finality.COMPLETE, 0
 
 
 @dataclass
@@ -69,9 +152,24 @@ class Detection:
     #: Which detection layer fired, for logs and diagnosis. Finer-grained than
     #: the wire-level RejectionReason, which the UI depends on.
     detail: str | None = None
-    #: False means the question looks mid-clause and callers should give a
-    #: brief stabilization window for a continuation before asking it.
-    stable: bool = True
+    #: How finished this request looks -- see `Finality`.
+    finality: Finality = Finality.COMPLETE
+    #: How long the caller should hold this before asking, in ms. 0 for a
+    #: complete question, which is the common case. Derived from `finality`
+    #: rather than chosen by the caller, so the evidence and the wait stay
+    #: in one place.
+    hold_ms: int = 0
+    #: Whisper itself terminated this utterance with "?". The strongest
+    #: available evidence that the interviewer stopped asking, and the only
+    #: thing that lets an accumulating turn fire without waiting out its
+    #: continuation window -- which is what keeps "...in FastAPI?" from
+    #: costing 2s of dead air at the end of an otherwise-assembled question.
+    explicit_closure: bool = False
+
+    @property
+    def stable(self) -> bool:
+        """True when this should go to the model immediately."""
+        return self.finality is Finality.COMPLETE
 
     def __post_init__(self) -> None:
         if not self.effective_text:
@@ -135,7 +233,26 @@ class QuestionDetector:
         self._last_accept_detail = None
         self._context.clear()
 
-    def inspect(self, text: str, now: float | None = None, *, buffer_context: bool = True) -> Detection:
+    def close_turn(self) -> None:
+        """Called once an answer has been delivered for the current turn.
+
+        Keeps `_last_accepted_at` (follow-up recency still depends on it) but
+        drops the accept *detail*, which is what selects the long
+        imperative-task merge window. Without this, a coding question and the
+        next, unrelated coding question asked a couple of seconds later would
+        merge into one, because that window is 4s wide and nothing told the
+        detector the first turn was over.
+        """
+        self._last_accept_detail = None
+
+    def inspect(
+        self,
+        text: str,
+        now: float | None = None,
+        *,
+        buffer_context: bool = True,
+        accumulating: bool = False,
+    ) -> Detection:
         """Decide whether `text` is worth answering.
 
         `buffer_context` gates two session-scoped behaviours: a buffer of
@@ -178,11 +295,21 @@ class QuestionDetector:
         # away, comfortably longer than the correction window. Reusing the
         # (already longer) setup-context window here instead of inventing a
         # third number covers that realistic gap.
-        merge_window_ms = (
-            self._context_window_ms
-            if self._last_accept_detail == REASON_IMPERATIVE_TASK
-            else self._coalesce_ms
-        )
+        #
+        # `accumulating` overrides both: while a turn is still being held and
+        # nothing has been sent, the caller is explicitly waiting for exactly
+        # this continuation, so the window has to be at least as wide as the
+        # hold it is waiting out. If it were narrower, the held fragment's
+        # words would be dropped rather than assembled -- the fragment fires
+        # or is cancelled, and the continuation arrives as a bare standalone
+        # question that has lost everything said before it.
+        if accumulating:
+            merge_window_ms = settings.question_max_accumulation_ms
+        elif self._last_accept_detail == REASON_IMPERATIVE_TASK:
+            merge_window_ms = self._context_window_ms
+        else:
+            merge_window_ms = self._coalesce_ms
+
         combined = text
         supersedes = False
         if (
@@ -192,7 +319,14 @@ class QuestionDetector:
             # a fresh question and pays for a duplicate answer.
             and not is_acknowledgement(text)
             and self._last_accepted_at is not None
+            # Speech-clock monotonicity. A final delivered out of order (a
+            # short utterance overtaking a long one) would otherwise produce a
+            # negative gap, which passes any <= window test and would splice
+            # the two in the wrong order.
+            and now >= self._last_accepted_at
             and (now - self._last_accepted_at) * 1000 <= merge_window_ms
+            # A redelivered final must not be concatenated onto itself.
+            and not self._is_repeat_of_tail(text)
         ):
             combined = f"{self._last_text} {text}".strip()
             supersedes = True
@@ -203,6 +337,15 @@ class QuestionDetector:
         may_remember = buffer_context and not followup_eligible
 
         match = extract_interview_prompt(combined)
+        # Stray STT punctuation ("?? -- ...") ends in "?" and so reads as a
+        # punctuation-terminated question, and merging it onto a real question
+        # puts it last, where the sentence scanner prefers it. Requiring one
+        # actual word keeps junk from hijacking a turn it was appended to.
+        if match is not None and not _WORD.search(match.prompt):
+            logger.info('question_rejected reason=no_words text="%s"', _preview(combined))
+            return Detection(
+                False, combined, reason=RejectionReason.NOT_A_QUESTION, detail="no_words"
+            )
         if match is None:
             if may_remember:
                 self._remember_as_context(text, now)
@@ -253,17 +396,24 @@ class QuestionDetector:
             detail = "follow_up"
             log_metric("question_follow_up_detected", text=match.prompt)
 
-        # A follow-up is inherently short and already passed the sentence
-        # classifier on its own merits ("Why?" ends in a bare interrogative
-        # that would otherwise look "dangling") -- the completeness check
-        # does not apply to it.
-        stable = followup_eligible or not _looks_incomplete(match.prompt)
-        if not stable:
-            log_metric("question_looks_incomplete", text=match.prompt)
+        finality, hold_ms = _assess(match, followup_eligible)
+        if finality is not Finality.COMPLETE:
+            # Interviewer speech is only logged when diagnostics are on; the
+            # decision itself is always logged, so the hold is auditable
+            # without putting the transcript on disk.
+            log_metric(
+                "question_not_final",
+                finality=finality.value,
+                hold_ms=hold_ms,
+                sparse=match.sparse,
+                chars=len(match.prompt),
+                text=match.prompt if settings.question_detector_diagnostics else None,
+            )
 
         logger.info(
-            'question_detected reason=%s category=%s stable=%s text="%s"',
-            detail, classification.category.value, stable, _preview(match.prompt),
+            'question_detected reason=%s category=%s finality=%s hold_ms=%d text="%s"',
+            detail, classification.category.value, finality.value, hold_ms,
+            _preview(match.prompt),
         )
         return Detection(
             True,
@@ -272,8 +422,25 @@ class QuestionDetector:
             classification=classification,
             supersedes=supersedes,
             detail=detail,
-            stable=stable,
+            finality=finality,
+            hold_ms=hold_ms,
+            explicit_closure=match.reason == REASON_PUNCTUATION,
         )
+
+    def _is_repeat_of_tail(self, text: str) -> bool:
+        """Is this final a redelivery of what the turn already ends with?
+
+        A duplicate final (the same utterance published twice) would
+        otherwise merge onto itself -- "What is caching? What is caching?" --
+        and be re-asked as a different question. Compared on normalised
+        whitespace/case so punctuation drift between two passes of the same
+        audio does not defeat it.
+        """
+        if not self._last_text:
+            return False
+        incoming = " ".join(text.lower().split())
+        tail = " ".join(self._last_text.lower().split())
+        return bool(incoming) and tail.endswith(incoming)
 
     def _recent_question(self, now: float) -> bool:
         """True if a question was accepted recently enough that a short,
@@ -289,6 +456,13 @@ class QuestionDetector:
         # for anything; skip it rather than let it pollute a later question.
         if sum(1 for c in text if c.isalpha()) < 3:
             return
+        # A self-revision replaces the premise it revises. Keeping both would
+        # hand the model two contradictory constraints ("assume 1,000 QPS" and
+        # "actually, assume 10,000 QPS") and let it pick, which is the one
+        # outcome a correction is supposed to prevent.
+        if is_correction(text) and self._context:
+            log_metric("question_context_corrected", dropped=len(self._context))
+            self._context.clear()
         # Capped per segment, not just at prefix-build time, so one long
         # rambling utterance can't sit in memory uncapped for the rest of the
         # session if nothing ever consumes it.

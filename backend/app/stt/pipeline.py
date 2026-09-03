@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from concurrent.futures import CancelledError, Future
 
 import numpy as np
 
@@ -65,12 +66,19 @@ class TranscriptionWorker:
         partial_interval_ms: int | None = None,
         scheduler: InferenceScheduler | None = None,
         session_id: str | None = None,
+        on_speech_start=None,
     ) -> None:
         self._source = source
         self._detector = detector
         self._engine = engine
         self._loop = loop
         self._on_transcript = on_transcript
+        #: Notified when the interviewer starts a new utterance, so the turn
+        #: layer can tell "paused mid-question" from "finished asking". No
+        #: fixed timeout can do that: the wait needed to catch a continuation
+        #: is `pause + duration(that continuation)`, and the duration of
+        #: speech that has not happened yet is unknowable.
+        self._on_speech_start = on_speech_start
         self._partial_interval_ms = (
             partial_interval_ms if partial_interval_ms is not None
             else settings.stt_partial_interval_ms
@@ -109,6 +117,11 @@ class TranscriptionWorker:
         #: `partials_skipped` so the two policies stay tellable apart.
         self.partials_skipped_near_final = 0
         self.errors = 0
+        #: Transcripts that reached the event loop and failed there, or never
+        #: reached it at all. Written from the loop thread by
+        #: `_observe_publish`; `errors` stays the inference-side count so the
+        #: two failure domains do not get conflated.
+        self.publish_failures = 0
 
     @property
     def transcript_source(self) -> TranscriptSource:
@@ -192,10 +205,15 @@ class TranscriptionWorker:
             self._scheduler.release(timeout=timeout)
 
         logger.info(
-            "transcription_worker_metrics channel=%s frames=%d partials_scheduled=%d "
+            "transcription_worker_metrics channel=%s vad=%s dropped_frames=%s frames=%d "
+            "partials_scheduled=%d "
             "partials_coalesced=%d partials_skipped=%d partials_skipped_near_final=%d "
-            "partials_cancelled=%d errors=%d",
+            "partials_cancelled=%d errors=%d publish_failures=%d shed_jobs=%d",
             self._source.channel.value,
+            # Which VAD actually ran, and whether the capture queue overflowed:
+            # both change how every other number here should be read.
+            self._detector.name,
+            getattr(self._source, "dropped_frames", "?"),
             self.frames_consumed,
             self.partials_scheduled,
             self.partials_coalesced,
@@ -203,13 +221,115 @@ class TranscriptionWorker:
             self.partials_skipped_near_final,
             self.partials_cancelled,
             self.errors,
+            self.publish_failures,
+            # Load-shed jobs, i.e. transcript this session actually lost. The
+            # scheduler counted these all along but nothing ever printed them,
+            # so a session that silently dropped an interviewer question left
+            # no evidence after the one-time warning scrolled past.
+            self._scheduler.dropped_jobs,
         )
 
     def _publish(self, text: str, is_final: bool, trace: LatencyTrace | None = None) -> None:
         if not text.strip():
+            # A final that transcribes to nothing is a silently lost
+            # utterance: VAD said this was speech, the model disagreed (its
+            # own no_speech/logprob thresholds still apply even with
+            # vad_filter off), and nothing downstream ever hears about it.
+            # Counted so a benchmark can tell "the model dropped it" apart
+            # from "the question was never detected".
+            if is_final:
+                log_metric(
+                    "final_transcription_empty",
+                    session_id=self._session_id,
+                    channel=self._source.channel.value,
+                )
             return
-        asyncio.run_coroutine_threadsafe(
-            self._on_transcript(text, self.transcript_source, is_final, trace), self._loop
+        # Turn/question assembly must key off when the interviewer actually
+        # stopped talking, not when Whisper happened to finish transcribing --
+        # under STT backlog those two diverge, and the detector's merge/
+        # coalesce windows would otherwise measure queue delay instead of the
+        # real pause between utterances. `trace` only exists for LOOPBACK
+        # finals (see above), which is the only channel that timing matters for.
+        now = trace.speech_end_at if trace is not None else None
+        coro = self._on_transcript(text, self.transcript_source, is_final, trace, now)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        except RuntimeError as exc:
+            # Nothing will ever await it now, and an un-awaited coroutine is
+            # its own RuntimeWarning at GC time -- noise that would obscure
+            # the real message below.
+            coro.close()
+            # The loop is already closed -- a final that finished after the
+            # session tore down. Not a crash, but the transcript is gone, and
+            # silently returning here is what made that indistinguishable
+            # from a successful publish.
+            self.publish_failures += 1
+            logger.warning(
+                "transcript_publish_rejected channel=%s final=%s error=%s",
+                self._source.channel.value, is_final, exc,
+            )
+            return
+
+        # Observing the future is the whole point. `run_coroutine_threadsafe`
+        # hands back a concurrent.futures.Future, and unlike asyncio.Task that
+        # class never reports an unretrieved exception -- so anything raised
+        # inside LiveSession.on_transcript (the synchronous SQLite write, the
+        # detector, an emit to a dead socket) vanished completely: no log, no
+        # event, no counter. A question could be lost with zero evidence.
+        #
+        # Non-blocking by construction: the callback fires on whichever thread
+        # completes the future, and only ever formats a log line. The capture
+        # and inference threads never wait on this.
+        future.add_done_callback(
+            lambda done: self._observe_publish(done, is_final)
+        )
+
+    def _notify_speech_start(self, utterance_id: int) -> None:
+        """Tell the loop the interviewer just started talking again.
+
+        Same fire-and-observe shape as `_publish`: never blocks the capture
+        thread, never lets a failure vanish.
+        """
+        coro = self._on_speech_start(utterance_id)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        except RuntimeError:
+            coro.close()
+            return
+        future.add_done_callback(lambda done: self._observe_publish(done, False))
+
+    def _observe_publish(self, future: Future, is_final: bool) -> None:
+        """Retrieve a publish outcome so a failure cannot disappear."""
+        try:
+            error = future.exception()
+        except CancelledError:
+            # Normal during shutdown: the loop dropped the coroutine.
+            logger.debug(
+                "transcript_publish_cancelled channel=%s final=%s",
+                self._source.channel.value, is_final,
+            )
+            return
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("transcript_publish_unobservable final=%s", is_final)
+            return
+
+        if error is None:
+            return
+
+        self.publish_failures += 1
+        # exc_info carries the traceback from the event-loop side, which is
+        # the only place it exists -- the capture thread's stack is useless here.
+        logger.error(
+            "transcript_publish_failed channel=%s final=%s error=%s",
+            self._source.channel.value, is_final, type(error).__name__,
+            exc_info=error,
+        )
+        log_metric(
+            "transcript_publish_failed",
+            session_id=self._session_id,
+            channel=self._source.channel.value,
+            is_final=is_final,
+            error=type(error).__name__,
         )
 
     def _run(self) -> None:
@@ -286,6 +406,13 @@ class TranscriptionWorker:
                         channel=self._source.channel.value,
                         utterance_id=self._utterance_id,
                     )
+                    # LOOPBACK only: the candidate's own microphone must never
+                    # influence interviewer turn boundaries.
+                    if (
+                        self._on_speech_start is not None
+                        and self._source.channel == AudioChannel.LOOPBACK
+                    ):
+                        self._notify_speech_start(self._utterance_id)
                     continue
 
                 if event == SegmentEvent.NONE:
@@ -396,6 +523,7 @@ class TranscriptionWorker:
             channel=self._source.channel,
             utterance_id=utterance_id,
             is_final=False,
+            session_id=self._session_id,
         )
         if job is None:
             return
@@ -429,10 +557,28 @@ class TranscriptionWorker:
                 channel=self._source.channel,
                 utterance_id=utterance_id,
                 is_final=True,
+                session_id=self._session_id,
             )
             if job is None:
                 return
             self._outstanding.add(job)
+            speech_end_at = self._speech_end_at[utterance_id]
+        # Deliberately outside the lock: this is the capture thread, and a
+        # formatted log write is not worth holding a lock the inference
+        # callbacks also contend for.
+        #
+        # speech-end -> enqueue. Everything before this point is VAD cost and
+        # audio queue residency, which no other metric covers -- if this is
+        # not ~0 the capture thread is being starved, not the model.
+        log_metric(
+            "stt_final_enqueued",
+            session_id=self._session_id,
+            channel=self._source.channel.value,
+            utterance_id=utterance_id,
+            enqueue_lag_ms=elapsed_ms(speech_end_at, time.monotonic()),
+            audio_duration_ms=int(len(audio) / SAMPLE_RATE * 1000),
+            audio_queue_depth=getattr(self._source, "queue_depth", None),
+        )
         logger.debug(
             "final_transcription_scheduled channel=%s utterance=%d samples=%d queue_depth=%d",
             self._source.channel.value,
@@ -539,6 +685,8 @@ class TranscriptionWorker:
             if speech_end_at is not None and self.channel == AudioChannel.LOOPBACK:
                 trace = LatencyTrace(
                     speech_end_at=speech_end_at,
+                    session_id=self._session_id,
+                    utterance_id=utterance_id,
                     stt_queue_wait_ms=elapsed_ms(speech_end_at, started),
                     stt_inference_ms=elapsed_ms(started, completed),
                     stt_final_at=completed,
