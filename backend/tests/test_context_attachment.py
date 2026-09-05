@@ -295,11 +295,15 @@ def test_the_item_cap_evicts_oldest_first():
 
 
 def test_expiring_drops_only_stale_pending_material():
+    # Derived from the setting rather than hardcoded: the window is tuned
+    # against real interviewer behaviour and this test is about the partition,
+    # not the number.
+    window = settings.context_attachment_window_ms / 1000
     buffer = AttachmentBuffer()
     buffer.add(build_attachment("text", "old", now=100.0))
-    buffer.add(build_attachment("text", "fresh", now=140.0))
+    buffer.add(build_attachment("text", "fresh", now=100.0 + window))
 
-    dropped = buffer.expire(now=141.0)
+    dropped = buffer.expire(now=101.0 + window)
     assert dropped == 1
     assert [a.content for a in buffer.pending] == ["fresh"]
 

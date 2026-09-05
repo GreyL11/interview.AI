@@ -16,6 +16,7 @@ from app.realtime.prompt_detector import (
     is_acknowledgement,
     has_open_quantity,
     has_placeholder_object,
+    REASON_CORRECTION,
     is_correction,
     is_scenario_without_request,
     REASON_NO_PATTERN,
@@ -347,6 +348,45 @@ class QuestionDetector:
                 False, combined, reason=RejectionReason.NOT_A_QUESTION, detail="no_words"
             )
         if match is None:
+            # A self-revision of a question that has *already been answered* is
+            # itself answerable. "Design a rate limiter using Redis." then
+            # "Actually, use Kafka instead." is not setup for some future
+            # question -- the interviewer has changed the task and is waiting,
+            # and the candidate is otherwise left reading an answer about the
+            # wrong technology.
+            #
+            # Deliberately narrow, on the same footing as `followup_eligible`
+            # above: it needs live interviewer speech and a question accepted
+            # recently enough that this is plausibly a revision of it. A
+            # correction with nothing to correct stays what it was -- setup
+            # remembered for whatever comes next.
+            if (
+                buffer_context
+                and is_correction(text)
+                and self._recent_question(now)
+                and _WORD.search(text)
+            ):
+                self._last_accepted_at = now
+                self._last_text = text
+                self._last_accept_detail = REASON_CORRECTION
+                log_metric("question_correction_detected", chars=len(text))
+                logger.info(
+                    'question_detected reason=%s text="%s"',
+                    REASON_CORRECTION, _preview(text),
+                )
+                # No context prefix and no merge: the task being revised lives
+                # in conversation history, which `Relationship.CORRECTION`
+                # already selects. Exact wording is preserved -- the revision
+                # is the question, unrewritten.
+                return Detection(
+                    True,
+                    text,
+                    effective_text=text,
+                    classification=classify(text),
+                    detail=REASON_CORRECTION,
+                    finality=Finality.COMPLETE,
+                    hold_ms=0,
+                )
             if may_remember:
                 self._remember_as_context(text, now)
             logger.info(
@@ -379,9 +419,30 @@ class QuestionDetector:
                 detail="low_confidence",
             )
 
-        effective = f"{context_prefix} {match.prompt}" if context_prefix else match.prompt
-        if context_prefix:
-            log_metric("question_context_attached", chars=len(context_prefix))
+        # Two kinds of premise, one field. `context_prefix` is setup from
+        # *earlier utterances* the detector rejected and remembered; the
+        # premise below is setup from earlier sentences of *this* utterance,
+        # which the last-match sentence scan would otherwise discard. Both are
+        # what the question is being asked against, so both belong in the text
+        # the model sees and neither belongs in the coaching panel.
+        #
+        # Scoped to `text`, deliberately not to `combined`. A merge prepends
+        # the previously accepted question, and the sentence scan is what
+        # *drops* that -- a superseded question ("find the longest
+        # substring... actually, merge intervals") must not come back as the
+        # premise of the question that replaced it. Only sentences the
+        # interviewer said in this same utterance qualify.
+        own = match if combined == text else extract_interview_prompt(text)
+        premise = own.premise if own is not None else ""
+        setup = " ".join(part for part in (context_prefix, premise) if part)
+        effective = f"{setup} {match.prompt}" if setup else match.prompt
+        if setup:
+            log_metric(
+                "question_context_attached",
+                chars=len(setup),
+                from_buffer=len(context_prefix),
+                from_utterance=len(match.premise),
+            )
         if buffer_context:
             # Consumed: a later, unrelated question must not inherit this setup.
             self._context.clear()

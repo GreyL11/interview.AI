@@ -47,9 +47,29 @@ logger = get_logger(__name__)
 
 Emitter = Callable[[Event], Awaitable[None]]
 
+
+def _outcome_of(exc: Exception) -> str:
+    """Trace outcome for a failed turn, from the provider's own classification.
+
+    Reads `LLMError.kind` rather than the exception type: the provider is the
+    only layer that understands its SDK's exception shapes, and it has already
+    reduced them to that enum. Carries no message text, so nothing a provider
+    put in a string can reach a metric line.
+    """
+    kind = getattr(exc, "kind", None)
+    if kind is not None:
+        return f"llm_{getattr(kind, 'value', kind)}"
+    return type(exc).__name__
+
 #: How often `_await_speech_end` re-checks whether the interviewer stopped.
 #: Small against every accumulation budget, so it adds no meaningful latency.
 _SPEECH_POLL_SECONDS = 0.2
+
+#: Cap on how much previously generated code is quoted back into a
+#: prompt. One implementation, not a session's worth: the turns that ask
+#: for it refer to the last thing written, and an unbounded quote-back
+#: would grow the prompt with the interview.
+_MAX_PREVIOUS_CODE_CHARS = 4_000
 
 
 @dataclass(frozen=True)
@@ -609,13 +629,17 @@ class LiveSession:
             # held turn can be sent seconds after the words were spoken -- so
             # comparing the paste against "now" would measure the hold, not
             # the gap between the paste and the question.
-            if follow_up:
-                attachments = self._attachments.carry_forward()
-            else:
-                attachments = self._attachments.bind(
-                    asked_at if asked_at is not None else time.monotonic(),
-                    extend=extend_attachments,
-                )
+            # A follow-up is additive rather than a separate branch: it keeps
+            # what the thread already carries *and* takes anything pasted
+            # since. Carrying the previous turn's material *instead of*
+            # binding is what stranded a paste made between a question and
+            # its one-word follow-up -- "why?" after a paste means the paste
+            # is part of the question. Deduplication inside `bind` is what
+            # keeps the carried material from being counted twice.
+            attachments = self._attachments.bind(
+                asked_at if asked_at is not None else time.monotonic(),
+                extend=extend_attachments or follow_up,
+            )
             self._live_question = _LiveQuestion(
                 question, effective_question, classification, detail
             )
@@ -744,9 +768,12 @@ class LiveSession:
             # History first: a small SQLite read, and the classifier needs it
             # to judge the conversational relationship.
             history_started = time.monotonic()
-            history = await asyncio.to_thread(
-                self._memory.bounded_context, self.session_id
-            )
+            # Both reads in one thread hop. The conversation window carries
+            # answer *summaries* only, which is right for history and useless
+            # for "explain the code you wrote" -- so the last snippet this
+            # session generated is fetched alongside it, and used only if the
+            # understanding layer says the turn refers to it.
+            history, previous_code = await asyncio.to_thread(self._session_context)
             history_ms = elapsed_ms(history_started, time.monotonic())
 
             # Then the two genuinely slow, genuinely independent calls run
@@ -765,6 +792,13 @@ class LiveSession:
             # classification therefore cannot come back and influence an
             # answer, because understand() re-raises CancelledError rather
             # than converting it into a fallback.
+            #
+            # The classifier is told about material this turn did *not* bind
+            # as well as what it did -- metadata only, never content, exactly
+            # as before. Without the unclaimed half it could only ever be
+            # asked about attachments the turn already had, so it could never
+            # report that a question refers to material the window excluded,
+            # which is the one thing needed to recover it.
             retrieval_started = time.monotonic()
             understanding_started = retrieval_started
             chunks, understanding = await asyncio.gather(
@@ -775,15 +809,46 @@ class LiveSession:
                     question_id=turn_id,
                     detail=detail,
                     history=history,
-                    attachment_summaries=summarise_attachments(attachments or []),
+                    attachment_summaries=summarise_attachments(
+                        [*(attachments or []), *self._attachments.unclaimed]
+                    ),
                     utterance_id=trace.utterance_id if trace is not None else None,
                 ),
             )
             settled_at = time.monotonic()
+
+            # Before the prompt is built, so the claim is part of this answer
+            # rather than something the next turn inherits.
+            attachments = self._claim_referenced(turn_id, attachments, understanding)
+            # Quoted back only when the classifier says this turn refers to
+            # it. An LLM-sourced reading is required for the same reason the
+            # attachment claim requires one: on the deterministic and fallback
+            # paths the flag is not a judgement about *this* question, and
+            # unrelated old code in a new question's prompt is worse than
+            # none. Nothing here inspects the words.
+            referenced_code = (
+                previous_code
+                if (
+                    previous_code
+                    and understanding.source is UnderstandingSource.LLM
+                    and understanding.needs_previous_code
+                )
+                else ""
+            )
+            if referenced_code:
+                log_metric(
+                    "previous_code_referenced",
+                    session_id=self.session_id,
+                    question_id=turn_id,
+                    chars=len(referenced_code),
+                    relationship=understanding.relationship.value,
+                )
             context_found = bool(chunks)
             if trace is not None:
                 trace.retrieval_ms = elapsed_ms(retrieval_started, settled_at)
             understanding_ms = elapsed_ms(understanding_started, settled_at)
+            if trace is not None:
+                trace.understanding_ms = understanding_ms
 
             # Context selection, driven by the relationship the classifier
             # reported. Only ever narrows the already-bounded window, and
@@ -799,11 +864,20 @@ class LiveSession:
             self._update_thread_anchor(understanding, question)
 
             prompt_started = time.monotonic()
+            # The deterministic category still picks the floor; the LLM's
+            # intent refines the answer shape and its verbosity reading
+            # constrains the length -- both no-ops when the classifier was not
+            # consulted, since the fallback leaves intent OTHER and verbosity
+            # DEFAULT, neither of which is in either table.
             prompt = build_prompt(
                 effective_question, classification.category,
                 [c.as_context() for c in chunks], selected_history,
                 attachments=render_attachments(attachments or []),
                 understanding=understanding.as_prompt_section(),
+                generated_code=referenced_code,
+                intent=understanding.intent,
+                relationship=understanding.relationship,
+                verbosity=understanding.verbosity,
             )
             if trace is not None:
                 trace.prompt_build_ms = elapsed_ms(prompt_started, time.monotonic())
@@ -867,16 +941,126 @@ class LiveSession:
             self._schedule_summary()
 
         except asyncio.CancelledError:
+            # Superseded or the session closed. Recorded so a turn that never
+            # reached a token still appears in the latency population, then
+            # re-raised unchanged -- a cancelled turn must not answer.
+            if trace is not None:
+                trace.emit_terminal(turn_id, "cancelled")
             raise
         except (LLMError, AnswerValidationError) as exc:
+            # `str(exc)` here is the provider's user-facing message from
+            # `_message(kind)`, never a key, URL or request body -- see
+            # `groq_client._fail`.
+            if trace is not None:
+                trace.emit_terminal(turn_id, _outcome_of(exc))
             self._sessions.mark_turn(turn_id, TurnStatus.FAILED)
             await self.emit(event(EventType.ANSWER_ERROR, turn_id=turn_id,
                                   code=type(exc).__name__, message=str(exc)))
         except Exception as exc:
             logger.exception("answer_pipeline_failed turn=%d", turn_id)
+            if trace is not None:
+                trace.emit_terminal(turn_id, "internal_error")
             self._sessions.mark_turn(turn_id, TurnStatus.FAILED)
             await self.emit(event(EventType.ANSWER_ERROR, turn_id=turn_id,
                                   code="InternalError", message=str(exc)))
+
+    def _session_context(self) -> tuple[list[str], str]:
+        """The conversation window and the newest code this session produced.
+
+        Runs on a worker thread -- both are SQLite reads and neither belongs
+        on the realtime event loop.
+
+        These are separate because the memory layer's window deliberately
+        carries only `answer.summary`: a full code block in every history
+        entry would blow the token budget the window exists to enforce. But
+        that means the code the model itself wrote was unreachable, and
+        "explain the code you wrote", "why did you use a dictionary", "can you
+        refactor this" had nothing to refer to. This fetches it once, capped,
+        for the turns that ask for it.
+        """
+        history = self._memory.bounded_context(self.session_id)
+        code = ""
+        try:
+            turns = self._sessions.get_answered_turns(self.session_id)
+        except Exception:  # pragma: no cover - a history read must never
+            logger.warning("previous_code_lookup_failed", exc_info=True)
+            return history, ""
+        # Newest first: a follow-up refers to the most recent implementation,
+        # not the first one of the session.
+        for turn in reversed(turns):
+            snippet = (turn.answer.code or "") if turn.answer else ""
+            if snippet.strip():
+                code = snippet[:_MAX_PREVIOUS_CODE_CHARS]
+                break
+        return history, code
+
+    def _claim_referenced(
+        self,
+        turn_id: int,
+        attachments: list[Attachment] | None,
+        understanding: Understanding,
+    ) -> list[Attachment]:
+        """Bind unclaimed material to a turn that says it refers to it.
+
+        The deterministic window binds on elapsed time, which is only ever a
+        proxy for ownership and a poor one -- a candidate pastes a problem and
+        the interviewer reads it out before asking about it. Past the window
+        the material stays unclaimed rather than lost, and this is its second
+        chance: taken on the classifier's `needs_attachments`, which is
+        evidence about *this* question rather than a clock reading. Nothing
+        here inspects the words, so it holds for any phrasing that refers to
+        provided material without naming it.
+
+        Deliberately narrow, so nothing that already works can change:
+
+        * only when the turn bound nothing at all -- a successful fresh
+          binding is never widened, reordered or added to;
+        * only for an LLM-sourced reading. `deterministic_fallback` sets
+          `needs_attachments` from "does any material exist", which is true
+          whenever anything is pending, so honouring it would attach stale
+          material every time the classifier was disabled or failed;
+        * only while this turn is still the current one, so a superseded turn
+          cannot consume material out from under its replacement.
+
+        Declining is logged too: material sitting unclaimed while a turn went
+        out without it is exactly the state that was previously invisible.
+        """
+        if attachments or not self._attachments.has_pending:
+            return attachments or []
+
+        oldest = self._attachments.unclaimed[0]
+
+        def declined(reason: str, **fields: object) -> list[Attachment]:
+            log_metric(
+                "attachment_unbound",
+                session_id=self.session_id,
+                question_id=turn_id,
+                reason=reason,
+                count=len(self._attachments.pending),
+                age_ms=int((time.monotonic() - oldest.at) * 1000),
+                **fields,
+            )
+            return []
+
+        if not self._is_current(turn_id):
+            return declined("turn_superseded")
+        if understanding.source is not UnderstandingSource.LLM:
+            return declined("no_understanding", source=understanding.source.value)
+        if not understanding.needs_attachments:
+            return declined("not_referenced")
+
+        claimed = self._attachments.bind(
+            time.monotonic(), extend=True, ignore_age=True
+        )
+        log_metric(
+            "attachment_claimed",
+            session_id=self.session_id,
+            question_id=turn_id,
+            count=len(claimed),
+            age_ms=int((time.monotonic() - oldest.at) * 1000),
+            relationship=understanding.relationship.value,
+        )
+        return claimed
 
     async def _retrieve(self, route: Route, question: str, turn_id: int) -> list[RetrievedChunk]:
         if route not in (Route.RAG, Route.FOLLOW_UP):
@@ -885,9 +1069,36 @@ class LiveSession:
             EventType.ANSWER_RETRIEVING, turn_id=turn_id,
             knowledge_types=[k.value for k in PERSONAL_KNOWLEDGE_TYPES],
         ))
-        return await self._retriever.retrieve(
-            question, knowledge_types=list(PERSONAL_KNOWLEDGE_TYPES)
-        )
+        try:
+            return await self._retriever.retrieve(
+                question, knowledge_types=list(PERSONAL_KNOWLEDGE_TYPES)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Retrieval is enrichment, not the answer. A missing or unreadable
+            # index (no faiss installed, a corrupt or half-written store, a
+            # locked file) used to take the whole turn down with it -- and
+            # because only RAG/FOLLOW_UP-routed questions retrieve, that meant
+            # every follow-up in the interview failing while every other
+            # question worked, which is a maddening thing to diagnose live.
+            #
+            # `context_found=False` already describes an answer built without
+            # personal context, and the validator already keeps such an answer
+            # from claiming personal experience. So degrade to that: the
+            # candidate gets a general answer instead of nothing.
+            log_metric(
+                "retrieval_failed",
+                session_id=self.session_id,
+                question_id=turn_id,
+                # Type only. A store error can quote a path or a query.
+                error=type(exc).__name__,
+            )
+            logger.warning(
+                "retrieval_failed session=%s turn=%s error=%s",
+                self.session_id, turn_id, type(exc).__name__,
+            )
+            return []
 
     async def _stream(self, turn_id: int, prompt: str, trace: LatencyTrace | None = None) -> Answer:
         buffer = ""

@@ -31,6 +31,11 @@ REASON_INTERROGATIVE = "interrogative"
 REASON_INTERVIEW_PROMPT = "interview_prompt"
 REASON_IMPERATIVE_TASK = "imperative_task"
 REASON_NO_PATTERN = "no_question_pattern"
+#: A self-revision of a question already answered. Not produced by
+#: pattern extraction -- `QuestionDetector` assigns it, because whether a
+#: correction is answerable depends on conversation state this module
+#: deliberately has no access to.
+REASON_CORRECTION = "correction"
 
 
 @dataclass(frozen=True)
@@ -51,9 +56,34 @@ class PromptMatch:
     #: a prompt caught mid-utterance ("Can you explain") rather than a
     #: complete one ("Can you explain closures?"). See `_has_content_after`.
     sparse: bool = False
+    #: Sentences of this same utterance that came *before* the prompt and are
+    #: not filler -- the premise a question is asked against:
+    #:
+    #:     "We have ten million rows in the orders table.
+    #:      How would you speed up this join?"
+    #:
+    #: The scanner keeps the last prompt-like sentence, which is right for
+    #: dropping an acknowledgement ("Very good. So tell me...") and wrong for
+    #: a load-bearing premise -- without this the model was asked to speed up
+    #: an unspecified join on a table of unknown size. Kept separate from
+    #: `prompt` so the coaching panel still shows the question the interviewer
+    #: asked rather than the whole paragraph; the caller merges it into
+    #: `Detection.effective_text`, the field that already exists for exactly
+    #: this (premises spread across *separate* utterances).
+    premise: str = ""
 
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+#: One actual word, so stray STT punctuation is not mistaken for a premise.
+_WORDS = re.compile(r"[A-Za-z']")
+
+#: Cap on the premise carried into the prompt. Generous next to a question but
+#: firmly bounded: an interviewer who monologues for a paragraph before asking
+#: should contribute the part nearest the question, not an unbounded prefix.
+#: Tail-anchored for the same reason -- the sentence just before the question
+#: is the one most likely to hold its constraint.
+_MAX_PREMISE_CHARS = 400
 
 # Acknowledgements that make up an entire sentence. Matched whole, so
 # "Very good" is filler but "Very good, now tell me..." is not.
@@ -111,6 +141,15 @@ _PROMPT_ANYWHERE = re.compile(
       | demonstrate
       | give\s+(?:me|us)\s+(?:an?\s+)?(?:example|overview|idea|sense)
       | give\s+(?:me|us)\s+a\s+(?:brief|quick|short|high[\s-]level)
+      # "now give me the implementation" -- an ordinary progression step in a
+      # coding interview -- matched none of the above and was dropped, because
+      # the permitted objects were named individually and no such list can be
+      # complete. Keyed on the determiner instead: a request for *content*
+      # takes a definite one ("give me the implementation", "give me your
+      # approach"), while an interviewer buying time takes an indefinite one
+      # ("give me a second", "give me one moment"). Widening the verb itself
+      # accepted those and answered them, which is worse than missing them.
+      | give\s+(?:me|us)\s+(?:the|your)\b
       | share\s+(?:an?\s+)?(?:example|experience|story)
       | help\s+(?:me|us)\s+understand
       | show\s+(?:me|us)
@@ -155,7 +194,12 @@ _CLAUSE_INITIAL = re.compile(
         # the continuation was rejected outright and the step was lost, even
         # though the turn is plainly an instruction. `optimi[sz]e` follows the
         # same both-spellings convention as `summari[sz]e` above.
-               handle|optimi[sz]e|refactor|extend|modify)\b
+               handle|optimi[sz]e|refactor|extend|modify|
+               # A bare request to respond, which an interviewer uses with a
+               # reference rather than a subject: "Answer this.", "Answer the
+               # second one." Clause-initial anchoring keeps it away from
+               # ordinary speech ("I would answer that with...").
+               answer)\b
         )
         # Deliberately absent: assume, suppose, imagine, consider, take, walk.
         # Those are scenario qualifiers that accompany a question rather than
@@ -325,7 +369,13 @@ _PLACEHOLDER_OBJECT = re.compile(
 #: is being asked to design for two contradictory loads at once.
 _CORRECTION_OPENER = re.compile(
     r"""^\s*(?:
-        actually | sorry | no[,\s] | scratch\s+that | strike\s+that
+        # Lookahead, not a consumed delimiter: `no[,\s]` swallowed the comma,
+        # after which the group's trailing \b sat between "," and " " -- two
+        # non-word characters, so it never held and "No, make that 100
+        # million" was not recognised as a correction at all. Checking the
+        # delimiter without consuming it leaves the boundary on "no" itself,
+        # which is what keeps "nobody" out.
+        actually | sorry | no(?=[,\s]) | scratch\s+that | strike\s+that
       | instead | rather | correction | let\s+me\s+rephrase
       | i\s+mean | make\s+that | on\s+second\s+thought
     )\b""",
@@ -408,11 +458,19 @@ def extract_interview_prompt(text: str) -> PromptMatch | None:
     )
 
     tail = " ".join(sentences[matched_index:])
+    # Everything before the question, minus the pleasantries. Filler is what
+    # the last-match scan exists to discard ("Very good." / "Okay, thanks."),
+    # so dropping it here keeps that behaviour while a real premise survives.
+    premise = " ".join(
+        sentence for sentence in sentences[:matched_index]
+        if not is_acknowledgement(sentence) and _WORDS.search(sentence)
+    ).strip()
     return PromptMatch(
         prompt=_normalize(tail),
         reason=matched_reason,
         sentence=sentences[matched_index],
         sparse=sparse,
+        premise=premise[-_MAX_PREMISE_CHARS:] if premise else "",
     )
 
 

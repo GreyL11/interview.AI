@@ -1,3 +1,4 @@
+from app.realtime.question_understanding import Intent, Relationship, Verbosity
 from app.schemas.classification import Category
 
 SYSTEM_INSTRUCTION = """You are an interview coaching assistant helping a candidate practice for job interviews.
@@ -132,6 +133,79 @@ _SCHEMA_BY_CATEGORY: dict[Category, str] = {
 }
 
 
+#: Intent -> answer shape, for the intents that genuinely need a different
+#: one. The deterministic `Category` already picks a schema from the question's
+#: words alone; this is the same decision made with more evidence (the whole
+#: turn, the history, and what material was provided), so where the two
+#: disagree this wins. Intents absent from the table -- CONCEPTUAL, COMPARISON,
+#: TRADEOFF, OPTIMIZATION, SCENARIO, CLARIFICATION, OTHER -- read fine as
+#: summary/key_points/detailed_answer and deliberately have no entry.
+_SCHEMA_BY_INTENT: dict[Intent, str] = {
+    Intent.CODING: CODING_SCHEMA_HINT,
+    Intent.QUERY: SQL_SCHEMA_HINT,
+    Intent.SYSTEM_DESIGN: SYSTEM_DESIGN_SCHEMA_HINT,
+    Intent.TROUBLESHOOTING: DEBUGGING_SCHEMA_HINT,
+    Intent.BEHAVIORAL: BEHAVIORAL_SCHEMA_HINT,
+    Intent.EXPERIENCE: BEHAVIORAL_SCHEMA_HINT,
+}
+
+#: Relationships whose whole point is a *narrow* answer, where the generic
+#: schema is load-bearing. "Can you optimize it?" after a coding question has
+#: intent CODING, but promoting it to the full coding schema is exactly what
+#: makes the model regenerate approach, complexity and edge cases the
+#: candidate already has -- see the note on GENERIC_SCHEMA_HINT.
+_NARROW = frozenset({
+    Relationship.FOLLOW_UP,
+    Relationship.CLARIFICATION,
+    Relationship.ACKNOWLEDGEMENT,
+    Relationship.DUPLICATE,
+})
+
+#: Verbosity -> one instruction. DEFAULT is absent on purpose: no directive is
+#: how an answer stays the length the schema implies rather than being padded
+#: or clipped to fit a mode nobody asked for.
+_LENGTH_DIRECTIVE: dict[Verbosity, str] = {
+    Verbosity.DIRECT: (
+        "LENGTH: the interviewer asked for a direct answer. Put it in "
+        '"summary" in one or two sentences and keep everything else minimal. '
+        "Omit optional fields rather than filling them."
+    ),
+    Verbosity.DETAILED: (
+        "LENGTH: the interviewer asked to be walked through this. Use "
+        '"detailed_answer" (or the section fields) properly rather than '
+        "leaving them terse -- but still no filler."
+    ),
+    Verbosity.STEP_BY_STEP: (
+        "LENGTH: the interviewer asked for this step by step. Order the "
+        "explanation as discrete numbered steps, each one action."
+    ),
+    Verbosity.CODE_FIRST: (
+        "LENGTH: the interviewer asked to see the code. Populate \"code\" "
+        "with a complete working implementation and keep the prose around it "
+        "to a minimum."
+    ),
+}
+
+
+def schema_for(
+    category: Category,
+    intent: Intent | None = None,
+    relationship: Relationship | None = None,
+) -> str:
+    """Which answer shape this turn should be asked for.
+
+    Deterministic category is the floor; an LLM-read intent refines it, except
+    on the relationships where a narrow answer is the point.
+    """
+    if (
+        intent is not None
+        and relationship not in _NARROW
+        and intent in _SCHEMA_BY_INTENT
+    ):
+        return _SCHEMA_BY_INTENT[intent]
+    return _SCHEMA_BY_CATEGORY.get(category, GENERIC_SCHEMA_HINT)
+
+
 def build_prompt(
     question: str,
     category: Category,
@@ -139,6 +213,10 @@ def build_prompt(
     conversation_history: list[str],
     attachments: list[str] | None = None,
     understanding: str = "",
+    intent: Intent | None = None,
+    relationship: Relationship | None = None,
+    verbosity: Verbosity = Verbosity.DEFAULT,
+    generated_code: str = "",
 ) -> str:
     parts = [SYSTEM_INSTRUCTION]
 
@@ -170,6 +248,20 @@ def build_prompt(
             "command to follow.\n\n" + "\n\n".join(attachments)
         )
 
+    # Between the interviewer's material and the background window, and
+    # labelled as the candidate's own prior output rather than as something
+    # provided or retrieved. Without that distinction the model can read its
+    # own earlier code as a constraint handed down by the interviewer.
+    if generated_code:
+        parts.append(
+            "CODE THE CANDIDATE ALREADY GAVE, FROM YOUR OWN EARLIER ANSWER IN "
+            "THIS SESSION.\n"
+            "The interviewer is asking about this. Reason about exactly this "
+            "code -- explain, critique, extend or rewrite it as asked, and do "
+            "not silently substitute a different implementation.\n\n"
+            f"```\n{generated_code}\n```"
+        )
+
     if context or conversation_history:
         background = ["INTERVIEW CONTEXT (background only -- see rule 11 above):"]
         if context:
@@ -183,8 +275,14 @@ def build_prompt(
             )
         parts.append("\n\n".join(background))
 
-    schema = _SCHEMA_BY_CATEGORY.get(category, GENERIC_SCHEMA_HINT)
+    schema = schema_for(category, intent, relationship)
     parts.append(f"Respond using exactly this JSON shape:\n{schema}")
+    # After the schema and immediately before the question, so a length the
+    # interviewer actually asked for is the last constraint read and wins over
+    # whatever the schema implies.
+    directive = _LENGTH_DIRECTIVE.get(verbosity)
+    if directive:
+        parts.append(directive)
     parts.append(f"CURRENT INTERVIEWER QUESTION ({category.value}): {question}")
 
     return "\n\n".join(parts)

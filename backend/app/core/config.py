@@ -193,18 +193,47 @@ class Settings(BaseSettings):
     question_understanding_model: str = ""
 
     # --- interviewer-pasted material -----------------------------------
-    #: How close to a question a paste has to be to belong to it. Short on
-    #: purpose: this binds "here is the table" to "what is wrong with it",
-    #: not a paste from earlier in the interview to whatever is asked next.
-    #: Applies in both directions -- paste-then-ask and ask-then-paste are
-    #: the same event in different orders.
-    context_attachment_window_ms: int = 10_000
+    #: How close to a question a paste has to be for *elapsed time alone* to
+    #: bind it. Applies in both directions -- paste-then-ask and
+    #: ask-then-paste are the same event in different orders.
+    #:
+    #: Was 10s, which was measurably too short: a candidate pastes a problem
+    #: and the interviewer reads it out before asking about it, and that
+    #: routinely takes longer than ten seconds. The material was then dropped
+    #: and the model answered a question whose "this" referred to nothing.
+    #: Past this window a paste is not lost -- it stays unclaimed, and the
+    #: understanding layer can still claim it for a turn that demonstrably
+    #: refers to it. See `AttachmentBuffer.bind(ignore_age=...)`.
+    context_attachment_window_ms: int = 60_000
     #: Per-attachment ceiling. An attachment over this is rejected with a
     #: reason rather than truncated: a partial table or query looks complete
     #: to the model and is worse than none at all.
     context_attachment_max_chars: int = 20_000
     #: How many pastes one turn may carry (a schema, a query, an error, ...).
     context_attachment_max_items: int = 6
+
+    # --- the composed answer-prompt budget -----------------------------
+    # Every input to one answer prompt is separately bounded, so prompt size
+    # and therefore latency cannot grow with interview length:
+    #
+    #   system + schema      ~4 KB   fixed
+    #   understanding hint   ~1 KB   Understanding's fields are length-capped
+    #                                (_MAX_SHORT=200, _MAX_ITEMS=12)
+    #   history          <= ~5 KB   memory_max_tokens=1200 caps the verbatim
+    #                                window, and select_context then narrows
+    #                                it to <= 2 Q&A pairs plus the summary
+    #   retrieved context    ~4 KB   retriever top-k, bounded per chunk
+    #   attachments      <= 120 KB   max_items(6) x max_chars(20_000)
+    #
+    # The attachment leg is the only loose one, and deliberately so: material
+    # is reproduced byte-for-byte or refused, never trimmed, because a partial
+    # table or query looks complete to the model. Six 20 KB pastes on one turn
+    # is a theoretical worst case rather than interviewer behaviour -- one or
+    # two is real. If it ever bites, lower `context_attachment_max_chars`
+    # rather than adding truncation.
+    #
+    # None of these scale with turn count: turn 200 of a session costs the
+    # same prompt as turn 3.
 
     # Realtime transport
     ws_replay_buffer: int = 200

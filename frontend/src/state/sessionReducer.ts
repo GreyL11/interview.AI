@@ -344,14 +344,21 @@ function applyEvent(state: SessionState, event: ServerEvent): SessionState {
       const hits = Array.isArray(event.data["retrieval_hits"])
         ? (event.data["retrieval_hits"] as RetrievalHitView[])
         : [];
-      return retire(base, {
-        phase: "answered",
-        answer: answer ?? null,
-        streamingSummary: answer?.summary ?? base.current?.streamingSummary ?? "",
-        contextFound: bool(event.data, "context_found"),
-        hits,
-        latencyMs: num(event.data, "latency_ms"),
-      });
+      return {
+        ...retire(base, {
+          phase: "answered",
+          answer: answer ?? null,
+          streamingSummary: answer?.summary ?? base.current?.streamingSummary ?? "",
+          contextFound: bool(event.data, "context_found"),
+          hits,
+          latencyMs: num(event.data, "latency_ms"),
+        }),
+        // Turn-scoped material is spent once its turn has been answered, so
+        // the chip stops promising context the backend has already used.
+        // Only this list: indexed documents and knowledge-base state are
+        // session-wide and are deliberately untouched here.
+        attachments: [],
+      };
     }
 
     case "answer.cancelled":

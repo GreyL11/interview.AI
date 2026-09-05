@@ -16,6 +16,7 @@ import {
   liveStatus,
   initialSessionState,
   isAnswering,
+  isTerminal,
   sessionReducer,
   visibleTurns,
   type SessionState,
@@ -754,4 +755,128 @@ test("code blocks label the languages an interview actually uses", () => {
   assert.equal(detectLanguage("#include <vector>\nstd::vector<int> v;"), "C++");
   // Pseudocode is left unlabelled rather than guessed at.
   assert.equal(detectLanguage("for each item in list:\n  do something"), null);
+});
+
+// ------------------------------------------------ turn-scoped attached material
+
+test("attached material is visible while its turn is unanswered", () => {
+  const state = apply(
+    initialSessionState,
+    ev("context.attached", { kind: "text", chars: 71 }),
+  );
+  assert.equal(state.attachments.length, 1);
+  assert.equal(state.attachments[0]?.chars, 71);
+  assert.equal(state.lastAttachmentRejection, null);
+});
+
+test("attached material disappears once its turn has been answered", () => {
+  // The chip used to outlive the material: nothing cleared it, so it kept
+  // promising context the backend had already consumed.
+  let state = apply(
+    initialSessionState,
+    ev("context.attached", { kind: "sql", chars: 240 }),
+    ev("question.detected", { question: "What is wrong with this?" }, 1),
+  );
+  assert.equal(state.attachments.length, 1, "cleared too early");
+
+  state = apply(state, ev("answer.completed", { answer: ANSWER, latency_ms: 12 }, 1));
+  assert.deepEqual(state.attachments, []);
+  // The answer itself is untouched -- only the turn-scoped material goes.
+  assert.equal(state.current?.phase, "answered");
+});
+
+test("clearing material leaves session-wide state alone", () => {
+  let state = apply(
+    initialSessionState,
+    ev("session.started", { session_id: "s1" }),
+    ev("transcript.final", { text: "What is wrong with this?", source: "loopback" }),
+    ev("context.attached", { kind: "text", chars: 71 }),
+    ev("question.detected", { question: "What is wrong with this?" }, 1),
+    ev("answer.completed", { answer: ANSWER, latency_ms: 12 }, 1),
+  );
+  assert.deepEqual(state.attachments, []);
+  assert.equal(state.sessionId, "s1");
+  assert.equal(state.transcript.length, 1);
+  assert.equal(state.history.length, 1);
+});
+
+test("a rejected paste is reported without becoming an application error", () => {
+  const state = apply(
+    initialSessionState,
+    ev("context.rejected", { kind: "text", reason: "too_large", message: "Too big." }),
+  );
+  assert.equal(state.lastAttachmentRejection?.reason, "too_large");
+  assert.equal(state.error, null);
+  assert.deepEqual(state.attachments, []);
+});
+
+// -------------------------------------------------- the never-stuck invariant
+
+/** Every terminal event must leave the session answerable again. A UI stuck in
+ * "answering" is worse than a visible error: the candidate waits instead of
+ * asking the interviewer to repeat. */
+const TERMINATORS: Array<[string, Record<string, unknown>]> = [
+  ["answer.completed", { answer: ANSWER, latency_ms: 10 }],
+  ["answer.error", { code: "LLMError", message: "The provider is unavailable." }],
+  ["answer.cancelled", { reason: "user_stop" }],
+];
+
+for (const [type, data] of TERMINATORS) {
+  test(`${type} leaves the session answerable`, () => {
+    let state = apply(
+      initialSessionState,
+      ev("session.started", { session_id: "s1" }),
+      ev("question.detected", { question: "What is a covering index?" }, 1),
+      ev("answer.started", {}, 1),
+      ev("answer.delta", { summary: "partial" }, 1),
+      ev(type as ServerEventType, data, 1),
+    );
+    assert.ok(isTerminal(state.current!.phase), `${type} was not terminal`);
+    assert.equal(isAnswering(state), false);
+    assert.notEqual(liveStatus(state), "thinking");
+
+    // And the next question starts cleanly rather than inheriting the state.
+    state = apply(state, ev("question.detected", { question: "And a hash map?" }, 2));
+    assert.equal(state.current?.phase, "detected");
+    assert.equal(state.current?.answer, null);
+    assert.equal(state.current?.streamingSummary, "");
+    assert.equal(state.history.length, 1);
+  });
+}
+
+test("a provider error mid-stream keeps the partial text and stops answering", () => {
+  const state = apply(
+    initialSessionState,
+    ev("session.started", { session_id: "s1" }),
+    ev("question.detected", { question: "What is a covering index?" }, 1),
+    ev("answer.delta", { summary: "an index that covers" }, 1),
+    ev("answer.error", { code: "LLMError", message: "Connection lost." }, 1),
+  );
+  assert.equal(state.current?.phase, "failed");
+  assert.equal(state.current?.streamingSummary, "an index that covers");
+  assert.equal(state.current?.errorMessage, "Connection lost.");
+  assert.equal(isAnswering(state), false);
+  assert.equal(liveStatus(state), "error");
+});
+
+test("a late delta from a superseded turn cannot revive it", () => {
+  const state = apply(
+    initialSessionState,
+    ev("question.detected", { question: "First?" }, 1),
+    ev("answer.delta", { summary: "first partial" }, 1),
+    ev("question.detected", { question: "Second?" }, 2),
+    ev("answer.delta", { summary: "LATE from turn one" }, 1),
+  );
+  assert.equal(state.current?.question, "Second?");
+  assert.equal(state.current?.streamingSummary, "");
+  assert.ok(!JSON.stringify(state.current).includes("LATE"));
+});
+
+test("an error with no active turn does not fabricate one", () => {
+  const state = apply(
+    initialSessionState,
+    ev("answer.error", { code: "LLMError", message: "orphaned" }, 99),
+  );
+  assert.equal(state.current, null);
+  assert.deepEqual(state.history, []);
 });

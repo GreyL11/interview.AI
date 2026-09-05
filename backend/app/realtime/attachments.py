@@ -138,11 +138,34 @@ class AttachmentBuffer:
             log_metric("attachment_expired", dropped=len(stale))
         return len(stale)
 
-    def peek(self, now: float) -> list[Attachment]:
-        """What would attach to a turn asked right now, oldest first."""
-        return sorted(self._fresh(now), key=lambda a: a.at)
+    def peek(self, now: float, *, ignore_age: bool = False) -> list[Attachment]:
+        """What would attach to a turn asked right now, oldest first.
 
-    def bind(self, now: float, extend: bool = False) -> list[Attachment]:
+        `ignore_age=True` drops the window and offers everything unclaimed.
+        The window is only ever a proxy for ownership -- it guesses that a
+        paste close in time to a question belongs to it. A turn that
+        demonstrably refers to provided material is *direct* evidence of the
+        same thing, and beats the proxy, so that path asks for all of it.
+        """
+        return sorted(
+            self.pending if ignore_age else self._fresh(now), key=lambda a: a.at
+        )
+
+    @property
+    def unclaimed(self) -> list[Attachment]:
+        """Everything that has arrived and no turn has taken, oldest first.
+
+        Deliberately age-blind, and metadata is all any caller gets from it in
+        practice: this is what lets the classifier be told that material
+        exists which the current turn did not bind, so it can say whether the
+        question refers to it. Without that the question could never be
+        judged against material the window had already excluded.
+        """
+        return sorted(self.pending, key=lambda a: a.at)
+
+    def bind(
+        self, now: float, extend: bool = False, *, ignore_age: bool = False
+    ) -> list[Attachment]:
         """Attach pending material to the turn being asked now.
 
         Consuming rather than copying is the whole point: a bound attachment
@@ -152,12 +175,15 @@ class AttachmentBuffer:
         `extend=False` starts a fresh turn and therefore *drops* whatever the
         previous turn carried -- without that, one pasted table would ride
         along on every question for the rest of the session. `extend=True` is
-        the same turn being re-asked (a late paste, a correction), which adds
-        to what it already has and must not duplicate it.
+        the same turn being re-asked (a late paste, a correction), a follow-up
+        to it, or a semantic claim -- all of which add to what the turn
+        already has and must not duplicate it.
         """
         if not extend:
             self.bound.clear()
-        taking = self.peek(now)
+        taking = self.peek(now, ignore_age=ignore_age)
+        if not ignore_age:
+            self._report_unbound(now, taking)
         if taking:
             taken = {id(a) for a in taking}
             self.pending = [a for a in self.pending if id(a) not in taken]
@@ -167,9 +193,31 @@ class AttachmentBuffer:
             )
         return list(self.bound)
 
-    def carry_forward(self) -> list[Attachment]:
-        """What a follow-up to the current turn should still see."""
-        return list(self.bound)
+    def _report_unbound(self, now: float, taking: Sequence[Attachment]) -> None:
+        """Say so when material was here and this turn did not take it.
+
+        The silence this closes was the whole reason the original failure
+        could not be diagnosed from logs: material outside the window is
+        skipped by `peek` and stays pending, so nothing is dropped, nothing
+        is expired, and no line is written -- while the turn that should have
+        carried it produces an answer with no trace of what was missing.
+
+        Only fires when material was actually left behind, which is rare, so
+        this is not a per-turn log line.
+        """
+        taken = {id(a) for a in taking}
+        skipped = [a for a in self.pending if id(a) not in taken]
+        if not skipped:
+            return
+        log_metric(
+            "attachment_unbound",
+            reason="outside_window",
+            count=len(skipped),
+            # Oldest first, since that is the one closest to being abandoned.
+            # Negative would mean a paste that arrived after the question was
+            # spoken, which the window also excludes.
+            age_ms=int(max(now - a.at for a in skipped) * 1000),
+        )
 
     def release(self) -> None:
         """The turn is over and its material is no longer in play."""
