@@ -11,6 +11,7 @@ from app.documents.schemas import PERSONAL_KNOWLEDGE_TYPES, RetrievedChunk
 from app.intelligence.answer_validator import AnswerValidationError, validate
 from app.intelligence.router import Route, route_for
 from app.llm.base import LLMClient, LLMError
+from app.llm.messages import GENERIC_PROVIDER_NAME, is_known_message, message_for
 from app.llm.prompts import build_prompt
 from app.llm.streaming import extract_partial_summary, parse_answer_payload
 from app.memory.base import SessionMemory
@@ -46,6 +47,43 @@ from app.storage.session_repository import SessionRepository
 logger = get_logger(__name__)
 
 Emitter = Callable[[Event], Awaitable[None]]
+
+
+#: Shown for a failure whose exception shape this pipeline did not anticipate.
+_INTERNAL_ERROR_MESSAGE = "Something went wrong preparing this answer. Ask again."
+
+#: Structural problems in the model's own reply. Raised by
+#: `app.intelligence.answer_validator` with app-authored text and no
+#: interpolation of anything the provider sent, so it is safe as written.
+_VALIDATION_MESSAGE = "The answer came back unusable. Ask again."
+
+
+def _client_safe_message(exc: Exception) -> str:
+    """The sentence a client may be shown for a failed turn.
+
+    A whitelist, not a filter. Every user-facing provider sentence is built
+    from a fixed template in `app.llm.messages`, so "was this built there?"
+    is answerable exactly, and anything else is replaced rather than
+    inspected. That covers the cases a scrubber would have to guess at: a
+    provider error string echoing the request back (key included), an
+    exception from a client that forgot to normalise, a traceback repr.
+
+    Deny by default is the point. A future provider that raises a raw
+    `LLMError` gets a correct, generic sentence for its own classified
+    `kind`; it does not get to decide what reaches the wire.
+    """
+    if isinstance(exc, AnswerValidationError):
+        return _VALIDATION_MESSAGE
+    if isinstance(exc, LLMError):
+        message = str(exc)
+        if is_known_message(message):
+            return message
+        logger.warning(
+            "answer_error_message_replaced kind=%s exception=%s",
+            exc.kind.value, type(exc).__name__,
+        )
+        return message_for(exc.kind, GENERIC_PROVIDER_NAME)
+    return _INTERNAL_ERROR_MESSAGE
 
 
 def _outcome_of(exc: Exception) -> str:
@@ -205,10 +243,14 @@ class LiveSession:
         if source == TranscriptSource.LOOPBACK:
             self._speech_in_progress = False
 
-        self._sessions.add_transcript(
+        # Every final transcript reaches here, both channels -- a synchronous
+        # SQLite write directly on the event loop would block every other
+        # coroutine (other sessions' events, the STT queue) for its duration.
+        await asyncio.to_thread(
+            self._sessions.add_transcript,
             TranscriptEntry(
                 session_id=self.session_id, source=source, is_final=True, text=text
-            )
+            ),
         )
         await self.emit(event(EventType.TRANSCRIPT_FINAL, text=text, source=source.value))
 
@@ -353,6 +395,7 @@ class LiveSession:
             now,
             buffer_context=source == TranscriptSource.LOOPBACK,
             accumulating=accumulating,
+            has_pending_context=self._attachments.has_pending,
         )
         if settings.question_detector_diagnostics:
             log_metric(
@@ -644,16 +687,8 @@ class LiveSession:
                 question, effective_question, classification, detail
             )
 
-            turn = self._sessions.create_turn(
-                Turn(
-                    session_id=self.session_id,
-                    seq=self._sessions.next_seq(self.session_id),
-                    question=question,
-                    category=classification.category.value,
-                    domain=classification.domain.value,
-                    confidence=classification.confidence,
-                    status=TurnStatus.PENDING,
-                )
+            turn = await asyncio.to_thread(
+                self._create_turn, question, classification
             )
             self._current_turn_id = turn.turn_id
             self._current_partial = ""
@@ -687,6 +722,25 @@ class LiveSession:
             )
             return turn.turn_id
 
+    def _create_turn(self, question: str, classification: Classification) -> Turn:
+        """Sync SQLite work for one new turn, run off the event loop via
+        `asyncio.to_thread` -- see the call site in `ask`. `next_seq` and
+        `create_turn` stay two calls on the same worker thread rather than
+        two separate `to_thread` hops, which is what keeps them as
+        sequential here as they were when both ran inline on the event loop.
+        """
+        return self._sessions.create_turn(
+            Turn(
+                session_id=self.session_id,
+                seq=self._sessions.next_seq(self.session_id),
+                question=question,
+                category=classification.category.value,
+                domain=classification.domain.value,
+                confidence=classification.confidence,
+                status=TurnStatus.PENDING,
+            )
+        )
+
     async def cancel(self, reason: CancelReason = CancelReason.USER_STOP) -> None:
         async with self._lock:
             await self._cancel_current(reason)
@@ -712,7 +766,7 @@ class LiveSession:
         # candidate may have been mid-read when the interviewer moved on.
         # One that produced nothing is just noise in the history.
         if partial.strip():
-            self._sessions.interrupt_turn(turn_id, partial)
+            await asyncio.to_thread(self._sessions.interrupt_turn, turn_id, partial)
             log_metric(
                 "answer_interrupted_with_partial",
                 session_id=self.session_id,
@@ -721,7 +775,7 @@ class LiveSession:
                 answer_partial_chars=len(partial),
             )
         else:
-            self._sessions.mark_turn(turn_id, TurnStatus.CANCELLED)
+            await asyncio.to_thread(self._sessions.mark_turn, turn_id, TurnStatus.CANCELLED)
             log_metric(
                 "answer_cancelled_before_content",
                 session_id=self.session_id,
@@ -905,7 +959,8 @@ class LiveSession:
                 return  # superseded while the last chunk was in flight
 
             latency_ms = int((time.monotonic() - started) * 1000)
-            self._sessions.complete_turn(
+            await asyncio.to_thread(
+                self._sessions.complete_turn,
                 turn_id,
                 answer=answer,
                 context_found=context_found,
@@ -938,7 +993,7 @@ class LiveSession:
             # `_live_question` is cleared, though: a paste arriving now has an
             # answered question to look at and must not re-ask it.
             self._live_question = None
-            self._schedule_summary()
+            await self._schedule_summary()
 
         except asyncio.CancelledError:
             # Superseded or the session closed. Recorded so a turn that never
@@ -948,21 +1003,23 @@ class LiveSession:
                 trace.emit_terminal(turn_id, "cancelled")
             raise
         except (LLMError, AnswerValidationError) as exc:
-            # `str(exc)` here is the provider's user-facing message from
-            # `_message(kind)`, never a key, URL or request body -- see
-            # `groq_client._fail`.
             if trace is not None:
                 trace.emit_terminal(turn_id, _outcome_of(exc))
-            self._sessions.mark_turn(turn_id, TurnStatus.FAILED)
+            await asyncio.to_thread(self._sessions.mark_turn, turn_id, TurnStatus.FAILED)
             await self.emit(event(EventType.ANSWER_ERROR, turn_id=turn_id,
-                                  code=type(exc).__name__, message=str(exc)))
+                                  code=type(exc).__name__,
+                                  message=_client_safe_message(exc)))
         except Exception as exc:
+            # The detail is in the log line above, where it belongs. Nothing
+            # from an unexpected exception is shown to a client: by
+            # definition this branch is the one whose exception shapes were
+            # not anticipated, so its text cannot have been vetted.
             logger.exception("answer_pipeline_failed turn=%d", turn_id)
             if trace is not None:
                 trace.emit_terminal(turn_id, "internal_error")
-            self._sessions.mark_turn(turn_id, TurnStatus.FAILED)
+            await asyncio.to_thread(self._sessions.mark_turn, turn_id, TurnStatus.FAILED)
             await self.emit(event(EventType.ANSWER_ERROR, turn_id=turn_id,
-                                  code="InternalError", message=str(exc)))
+                                  code="InternalError", message=_INTERNAL_ERROR_MESSAGE))
 
     def _session_context(self) -> tuple[list[str], str]:
         """The conversation window and the newest code this session produced.
@@ -1151,12 +1208,22 @@ class LiveSession:
 
     # ------------------------------------------------------------ summarisation
 
-    def _schedule_summary(self) -> None:
-        """Fire-and-forget: summarising must never delay the next question."""
+    async def _schedule_summary(self) -> None:
+        """The actual summarisation is fire-and-forget: it never delays the
+        next question. Its two pre-checks are real SQLite reads, though, and
+        run off the event loop for the same reason every other repository
+        call in this class does -- this one is still awaited (not itself
+        backgrounded) because deciding *whether* to summarise has to finish
+        before the caller (the end of `_answer`, still holding `_lock`)
+        moves on.
+        """
         if self._summarizer is None or not hasattr(self._memory, "verbatim_from_seq"):
             return
-        boundary = self._memory.verbatim_from_seq(self.session_id)
-        if not self._summarizer.needs_summary(self.session_id, boundary):
+        boundary = await asyncio.to_thread(self._memory.verbatim_from_seq, self.session_id)
+        needs = await asyncio.to_thread(
+            self._summarizer.needs_summary, self.session_id, boundary
+        )
+        if not needs:
             return
 
         task = asyncio.create_task(self._summarizer.summarize(self.session_id, boundary))
@@ -1196,9 +1263,10 @@ class LiveSession:
         await self.cancel(CancelReason.SESSION_ENDED)
         for task in list(self._background):
             task.cancel()
-        self._sessions.end(self.session_id)
+        await asyncio.to_thread(self._sessions.end, self.session_id)
+        turn_count = await asyncio.to_thread(self._sessions.get_turns, self.session_id)
         await self.emit(event(
             EventType.SESSION_ENDED,
             session_id=self.session_id,
-            turn_count=len(self._sessions.get_turns(self.session_id)),
+            turn_count=len(turn_count),
         ))

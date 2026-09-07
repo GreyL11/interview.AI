@@ -235,8 +235,18 @@ export interface SettingsView {
   /** False today: changes apply to the running engine but are not written
    * back to .env. Settings says so rather than implying they survive. */
   settings_persist: boolean;
-  groq_key_configured: boolean;
-  groq_model: string;
+  /** Answer generation's provider. Data, not a fixed choice -- any name
+   * app.llm.registry knows (groq, openai, openai_compatible, omnirouter, ...). */
+  llm_provider: string;
+  llm_model: string;
+  /** Only meaningful for a provider with no fixed endpoint of its own
+   * (openai_compatible, omnirouter). Empty otherwise. */
+  llm_base_url: string;
+  llm_key_configured: boolean;
+  /** Empty means "same as llm_provider" / "same as llm_model" -- Question
+   * Understanding and Answer Generation can be configured independently. */
+  question_understanding_provider: string;
+  question_understanding_model: string;
   embedding_model: string;
   stt_model: string;
   stt_device: string;
@@ -254,7 +264,11 @@ export interface SettingsView {
 /** Non-secret settings only. Keys go through setProviderKey/removeProviderKey,
  * which is the single path that also persists them. */
 export interface SettingsUpdate {
-  groq_model?: string;
+  llm_provider?: string;
+  llm_model?: string;
+  llm_base_url?: string;
+  question_understanding_provider?: string;
+  question_understanding_model?: string;
   stt_model?: string;
   stt_device?: string;
   rag_top_k?: number;

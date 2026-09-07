@@ -255,7 +255,8 @@ class Understanding(BaseModel):
 
 
 class StructuredCompleter(Protocol):
-    """One JSON completion, bounded. Implemented by `GroqClient`.
+    """One JSON completion, bounded. Implemented by every real provider client
+    (`GroqClient`, `OpenAICompatibleClient`) -- see `app.llm.registry`.
 
     A Protocol rather than an addition to `LLMClient`: the answer path's
     interface has one job and every existing fake implements it. Widening that

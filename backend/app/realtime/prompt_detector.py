@@ -71,6 +71,13 @@ class PromptMatch:
     #: `Detection.effective_text`, the field that already exists for exactly
     #: this (premises spread across *separate* utterances).
     premise: str = ""
+    #: True when the innermost clause of this prompt still wants an argument
+    #: -- "Explain how Kafka handles", "How would you ensure that the
+    #: service". See `has_open_clause`, which is the only place that decides
+    #: it; kept on the match so the finality tier reads one boolean rather
+    #: than re-deriving grammar from the normalised prompt (which has had a
+    #: "?" appended and so has lost the speaker's own closure signal).
+    open_clause: bool = False
 
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -116,6 +123,40 @@ def is_acknowledgement(text: str) -> bool:
     for it.
     """
     return bool(_ACK_ONLY.match(text.strip()))
+
+
+#: An interviewer navigating the interview itself ("Next question.", "Let's
+#: move to the next question.", "One more question.") rather than asking one.
+#: `_PROMPT_ANYWHERE` below still matches "(?:another|next|final|last|one
+#: more)\s+question" wherever it occurs, on purpose -- that is what lets an
+#: attached question survive ("Next question: what is Kafka?", which ends in
+#: "?" and never reaches this check anyway; "Here's the next question: how
+#: does Kafka work?" likewise). This pattern catches the *other* case: the
+#: phrase used on its own, with nothing following it, meaning "let's move
+#: on" rather than "here is a request". Anchored at both ends like
+#: `_ACK_ONLY`, so it only fires when navigation is literally all the
+#: utterance says -- anything attached after "question" (a colon, a real
+#: question) fails the trailing `$` and falls through to ordinary detection.
+_NAVIGATION_ONLY = re.compile(
+    r"""^\s*
+    (?:(?:o?k(?:ay)?|alright|all\s+right|so|now|well|and|but)[\s,]+)*
+    (?:
+        let'?s\s+(?:move\s+(?:on\s+)?to|go\s+(?:on\s+)?to|do)\s+
+      | (?:we'?ll|we\s+will)\s+(?:go\s+(?:on\s+)?to|move\s+(?:on\s+)?to)\s+
+    )?
+    (?:the\s+)?
+    (?:next|another|one\s+more|final|last)\s+question
+    [\s.,!?]*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def is_navigation_chatter(text: str) -> bool:
+    """True for "Next question.", "Let's move to the next question.", "One
+    more question." -- the interviewer moving the interview along, not
+    asking one. An attached question ("Next question: what is Kafka?")
+    still contains real content after "question" and does not match."""
+    return bool(_NAVIGATION_ONLY.match(text.strip()))
 
 
 # LAYER 3 — interview prompt phrases. Safe to match anywhere in a sentence:
@@ -195,6 +236,15 @@ _CLAUSE_INITIAL = re.compile(
         # though the turn is plainly an instruction. `optimi[sz]e` follows the
         # same both-spellings convention as `summari[sz]e` above.
                handle|optimi[sz]e|refactor|extend|modify|
+               # "Show code", "Show the implementation" -- the same request as
+               # "Show me the code" with the addressee left out, which is
+               # ordinary spoken English and was being dropped entirely
+               # because `_PROMPT_ANYWHERE` only recognises "show me|us".
+               # Belongs here rather than there for the same reason every
+               # other verb does: matched anywhere it would fire inside
+               # ordinary speech ("the metrics show latency rising"), and
+               # clause-initial anchoring is what keeps it a request.
+               show|
                # A bare request to respond, which an interviewer uses with a
                # reference rather than a subject: "Answer this.", "Answer the
                # second one." Clause-initial anchoring keeps it away from
@@ -232,26 +282,55 @@ def _clause_starts(sentence: str) -> list[int]:
     return offsets
 
 
+#: Pronouns that stand in for a topic the interviewer can point at -- on
+#: screen, in a paste, in the code just written. "Explain THIS", "optimize
+#: IT" name no topic in words, but they do name one, which is why
+#: `is_referentially_empty` accepts them and why `_has_content_after` must
+#: count them as content. Defined here, above both users, because the two
+#: readings have to agree: while this set was only consulted by the
+#: referential check and `_TRIVIAL_TAIL_WORDS` below independently called
+#: the same words trivial, "Explain this." was accepted as a real request
+#: and then held for three seconds as though nothing had been asked.
+_OBJECT_STANDINS = frozenset({"it", "this", "that", "them"})
+
 #: Words that never count as "the interviewer went on to say something" when
 #: they're all that's left after a trigger phrase -- pronouns and auxiliaries
 #: that any unfinished clause is equally likely to open with ("How would
 #: you...", "Tell me about..."). Deliberately not `_DANGLING_WORDS` from
 #: question_detector: that set flags a sentence by its *last* word anywhere,
 #: this one only judges the tail immediately after a matched trigger.
+#:
+#: Object standins are subtracted rather than absent, so the two sets cannot
+#: drift back apart. A trailing "that" is still held, by `_DANGLING_WORDS` --
+#: which is the right layer for it, since "that" is genuinely ambiguous
+#: between an object and a complementiser.
 _TRIVIAL_TAIL_WORDS = frozenset({
-    "me", "us", "you", "it", "this", "that", "i", "we", "they", "he", "she",
+    "me", "us", "you", "i", "we", "they", "he", "she",
     "can", "could", "would", "will", "do", "does", "did",
     "is", "are", "was", "were", "about", "to", "of",
-})
+}) - _OBJECT_STANDINS
 
 _WORD = re.compile(r"[A-Za-z']+")
 
 
 def _has_content_after(sentence: str, offset: int) -> bool:
     """Is there a real word after `offset`, or did the trigger consume
-    everything worth reading in this sentence?"""
+    everything worth reading in this sentence?
+
+    Deliberately just "is there one substantive word", for either kind of
+    trigger. An earlier version required *two* after an interrogative, to
+    tell "would you design" (open) from "would you design a distributed
+    system" (closed) by counting. Counting cannot do that job: "what is
+    Kafka" has exactly one substantive word after its trigger and is a
+    finished question, so every short question of that shape paid a 3s hold
+    it did not owe. Saturation is a structural property, not a word count --
+    `has_open_clause` below answers it structurally, and this function is
+    back to the one thing a word count *can* decide: whether the interviewer
+    said anything at all after naming the kind of request.
+    """
     return any(
-        word.lower() not in _TRIVIAL_TAIL_WORDS for word in _WORD.findall(sentence[offset:])
+        word.lower() not in _TRIVIAL_TAIL_WORDS
+        for word in _WORD.findall(sentence[offset:])
     )
 
 
@@ -262,6 +341,15 @@ def _classify_sentence(sentence: str) -> tuple[str, int] | None:
     if _ACK_ONLY.match(sentence):
         # Pure acknowledgement. Rejected even with a trailing "?" so a tag
         # question like "Right?" does not trigger coaching.
+        return None
+
+    if _NAVIGATION_ONLY.match(sentence):
+        # "Next question.", "One more question." -- moving the interview
+        # along, not asking one. Rejected before the "?" check for the same
+        # reason as an acknowledgement: an attached question ("Next
+        # question: what is Kafka?") already fails this pattern's own
+        # trailing anchor (see `is_navigation_chatter`) and falls through to
+        # ordinary detection further down, "?" and all.
         return None
 
     if sentence.rstrip().endswith("?"):
@@ -408,6 +496,393 @@ def has_placeholder_object(prompt: str) -> bool:
     return bool(_PLACEHOLDER_OBJECT.search(prompt))
 
 
+#: A noun phrase opened by a determiner and never closed: "a distributed".
+#: `distributed` premodifies a noun that has not arrived yet -- the head of
+#: "a distributed system" is "system", not "distributed" -- so this is
+#: anchored to the *end* of the prompt and only matches when the participle
+#: is the last thing said. "a distributed system" ends on "system" and never
+#: reaches this pattern; "a distributed" ends on the modifier itself and does.
+#:
+#: Deliberately morphological (a past-participle shape after a determiner),
+#: not a list of adjectives, so it generalises to any premodifier of that
+#: shape ("a partitioned", "a sharded") rather than naming "distributed".
+#:
+#: Past participles only. An earlier version also matched "-ing", which is
+#: where the shape stops being evidence: after a determiner an "-ing" word is
+#: usually a gerund standing as the head noun of a *finished* phrase -- "the
+#: encoding", "the padding", "a rating", "a string", "the meeting" -- and
+#: every one of those was held for three seconds it did not owe. English has
+#: no matching noun use for a bare "-ed" form, so that half of the shape
+#: still carries the signal. The cost is that "a scaling" is no longer
+#: caught, which is the right trade: one uncommon phrase waits less than it
+#: should, instead of every ordinary "-ing" noun waiting when it should not.
+#: `_is_participle` then rules out the words that merely end in those two
+#: letters ("a thread", "a feed").
+_OPEN_PREMODIFIER = re.compile(
+    r"""\b(?:a|an|the|this|that|these|those|some|any|no|every|each)\s+
+    (?:[a-z]+\s+){0,2}
+    (?P<tail>[a-z]*ed)\b[\s.,!?]*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def has_open_premodifier(prompt: str) -> bool:
+    """A determiner opened a noun phrase and the utterance ends on what looks
+    like a premodifier ("a distributed") rather than the head noun it
+    modifies ("a distributed system")."""
+    match = _OPEN_PREMODIFIER.search(prompt)
+    return bool(match) and _is_participle(match.group("tail"))
+
+
+#: Shortest stem that makes an "-ed" ending a real past participle. An
+#: English participle is a verb plus the suffix, so the verb has to survive
+#: stripping it: "distribut(e)+ed", "partition+ed", "shard+ed", "link+ed" all
+#: leave four or more characters. The words that merely *end* in those two
+#: letters do not -- "thread" leaves "thr", "speed" leaves "spe", "head"
+#: leaves "h" -- which is what keeps "What is a thread" from being read as an
+#: unfinished noun phrase. Four is the shortest stem observed among the
+#: participles this pipeline actually meets; three would admit "bed"/"red".
+_MIN_PARTICIPLE_STEM = 4
+
+
+def _is_participle(word: str) -> bool:
+    """Is this "-ed" word a past participle, or just a noun that ends in the
+    same two letters?
+
+    Morphological, not a word list: strip the suffix and ask whether enough
+    of a verb is left to have carried it. See `_MIN_PARTICIPLE_STEM`.
+    """
+    stem = word[:-2] if word.lower().endswith("ed") else ""
+    return len(stem.rstrip("e")) >= _MIN_PARTICIPLE_STEM or len(stem) >= _MIN_PARTICIPLE_STEM
+
+
+# --------------------------------------------------------- clause saturation
+# The signal that separates "the interviewer finished a clause" from "the
+# interviewer finished asking", without a verb lexicon and without an LLM.
+#
+# Everything below reads only *closed* word classes -- determiners,
+# auxiliaries, pronouns, prepositions, subordinators, interrogatives. Those
+# are genuinely finite sets in English (new verbs and nouns appear every
+# year; new articles do not), which is what makes this generalise instead of
+# being the "giant list of English keywords" this module is forbidden to
+# become. Every open-class word -- every noun, verb, adjective, adverb the
+# interviewer might use -- is simply CONTENT, unlisted and unnamed.
+#
+# The question asked of a clause is whether its predicate has an argument:
+#
+#     "how the database"              subject, no predicate      -> open
+#     "how Kafka handles"             predicate, no complement   -> open
+#     "how Kafka handles partitions"  predicate + complement     -> closed
+#
+# and the one genuinely undecidable case -- a predicate with no complement,
+# which is a finished question for an intransitive verb ("how Kafka works")
+# and an unfinished one for a transitive verb ("how Kafka handles") -- is
+# decided by whoever knows more than the grammar does: the speaker. A
+# terminal "." or "!" is Whisper reporting the utterance ended, which is the
+# same weak-but-real closure signal `is_referentially_empty`'s caller already
+# trusts. With no punctuation at all there is nothing to trust, so an
+# unsaturated predicate waits.
+
+_COPULAS = frozenset({"is", "are", "was", "were", "am", "be", "been", "being"})
+
+_AUXILIARIES = _COPULAS | frozenset({
+    "do", "does", "did", "have", "has", "had",
+    "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+})
+
+#: Pronouns that put the *candidate* in the subject position. A request framed
+#: at the candidate ("would you design", "should we shard") names an action
+#: the candidate is being asked to perform, and the thing to perform it on is
+#: exactly what has not been said yet. A third-person subject ("does it
+#: rebalance", "does Kafka replicate") asks about the behaviour of a thing,
+#: which is a whole question with no object at all.
+_ADDRESSEE_PRONOUNS = frozenset({"i", "we", "you"})
+
+_PRONOUNS = _ADDRESSEE_PRONOUNS | frozenset({
+    "it", "they", "he", "she", "there", "them", "him", "her", "me", "us",
+    "this", "that", "these", "those", "one", "ones", "something", "anything",
+})
+
+_DETERMINERS = frozenset({
+    "a", "an", "the", "this", "that", "these", "those", "some", "any", "no",
+    "every", "each", "my", "your", "our", "their", "its", "his", "her",
+    "which", "what", "whose", "both", "either", "neither",
+})
+
+_PREPOSITIONS = frozenset({
+    "of", "to", "in", "on", "at", "for", "with", "from", "by", "about",
+    "into", "onto", "over", "under", "between", "among", "through", "across",
+    "against", "during", "without", "within", "upon", "off", "out", "up",
+    "down", "as", "than", "like", "per", "via", "behind", "before", "after",
+    "below", "above", "along", "around", "beyond", "near", "toward", "towards",
+})
+
+#: Conjunctions and discourse particles. The second half is deliberately the
+#: same vocabulary `_CLAUSE_BOUNDARY` already treats as "a clause may start
+#: after this" -- reused rather than re-listed, so the two cannot disagree
+#: about whether "Now" or "Actually" is a word the interviewer said or just
+#: how they got to the next thing.
+_CONNECTIVES = frozenset({
+    "and", "or", "but", "nor", "so", "then", "also", "plus", "however",
+    "because", "while", "though", "although", "since", "unless", "until",
+    "when", "where", "whenever", "wherever", "not", "just", "very", "really",
+    "now", "okay", "ok", "alright", "well", "next", "finally", "lastly",
+    "actually", "anyway",
+})
+
+#: Interrogatives that can open a clause. `who/whom/what/which/whose` can be
+#: the subject of the clause they open ("who owns the schema"); `how/why/
+#: when/where` are adverbial and the clause still needs a subject of its own
+#: ("how Kafka handles" -- "how" is not what handles anything).
+_SUBJECT_WH = frozenset({"who", "whom", "what", "which", "whose"})
+_ADVERBIAL_WH = frozenset({"how", "why", "when", "where"})
+_CLAUSE_WH = _SUBJECT_WH | _ADVERBIAL_WH
+
+#: Complementisers. Unlike an interrogative these are ambiguous -- "that" is a
+#: relative pronoun in "numbers that sum to a target" (where it *is* the
+#: subject and the next word is the verb) and a complementiser in "ensure
+#: that the service ..." (where a whole clause follows). Only the second
+#: reading opens a clause worth checking, and it is the one where a
+#: determiner or pronoun follows, so that is the condition.
+_COMPLEMENTISERS = frozenset({"that", "if", "whether"})
+
+#: Contracted copulas, expanded before categorisation so "what's the plan"
+#: reads as "what is the plan" rather than as one unknown token.
+_CONTRACTIONS: dict[str, tuple[str, ...]] = {
+    "what's": ("what", "is"), "whats": ("what", "is"),
+    "who's": ("who", "is"), "how's": ("how", "is"),
+    "where's": ("where", "is"), "when's": ("when", "is"),
+    "why's": ("why", "is"), "that's": ("that", "is"),
+    "it's": ("it", "is"), "there's": ("there", "is"),
+    "he's": ("he", "is"), "she's": ("she", "is"),
+    "you're": ("you", "are"), "we're": ("we", "are"),
+    "they're": ("they", "are"), "i'm": ("i", "am"),
+}
+
+#: Every closed class together: what is left over is content.
+_FUNCTION_WORDS = (
+    _AUXILIARIES | _PRONOUNS | _DETERMINERS | _PREPOSITIONS
+    | _CONNECTIVES | _CLAUSE_WH | _COMPLEMENTISERS
+)
+
+
+def _tokens(sentence: str) -> list[str]:
+    out: list[str] = []
+    for word in _WORD.findall(sentence):
+        out.extend(_CONTRACTIONS.get(word.lower(), (word.lower(),)))
+    return out
+
+
+def _is_content(token: str) -> bool:
+    return token not in _FUNCTION_WORDS
+
+
+def _is_argument(token: str) -> bool:
+    """Could this token be part of a predicate's argument?
+
+    Auxiliaries, connectives and subordinators cannot -- "should" in "the
+    system should recover" is not what the system recovers. Everything that
+    can head or fill an argument counts: content words, determiners,
+    pronouns, prepositions.
+    """
+    return token not in _AUXILIARIES and token not in _CONNECTIVES \
+        and token not in _COMPLEMENTISERS
+
+
+def _last_clause_start(tokens: list[str]) -> tuple[int, str | None]:
+    """Where the innermost clause begins, and the word that opened it.
+
+    The innermost clause is the one still being spoken, so it is the one
+    whose saturation decides whether the utterance has finished.
+    """
+    for index in range(len(tokens) - 1, -1, -1):
+        token = tokens[index]
+        if token in _CLAUSE_WH:
+            return index + 1, token
+        if token in _COMPLEMENTISERS and index + 1 < len(tokens):
+            following = tokens[index + 1]
+            if following in _DETERMINERS or following in _PRONOUNS:
+                return index + 1, token
+    return 0, None
+
+
+def _clause_is_open(tokens: list[str], opener: str | None, terminated: bool) -> bool:
+    """Does this clause's predicate still want an argument?
+
+    `opener` is the interrogative or complementiser that introduced the
+    clause, or None for a main clause. `terminated` is whether the speaker
+    marked the utterance as ended, which is the tie-breaker for the one case
+    grammar alone cannot settle.
+    """
+    if not tokens:
+        # A trigger or interrogative with nothing after it at all.
+        return True
+
+    # A copula's complement is its argument, and it comes straight after:
+    # "what is Kafka" is finished, "how the system is" is not.
+    for index, token in enumerate(tokens):
+        if token in _COPULAS:
+            return not any(_is_content(later) for later in tokens[index + 1:])
+
+    inverted = tokens[0] in _AUXILIARIES
+    cursor = 1 if inverted else 0
+
+    # Whose action is being described. A main clause and an inverted question
+    # state their subject; an adverbial interrogative's clause has to as well;
+    # a subject interrogative ("who owns...") already is the subject, and a
+    # bare imperative ("reverse a string") has none.
+    subject_is_addressee = False
+    #: A bare instruction ("reverse a string", "now handle retries") has no
+    #: subject to find: the interviewer is telling the candidate to do
+    #: something, and the clause is exactly a predicate plus its argument.
+    imperative = opener is None and not inverted
+    if not imperative:
+        if cursor < len(tokens) and tokens[cursor] in _PRONOUNS:
+            subject_is_addressee = tokens[cursor] in _ADDRESSEE_PRONOUNS
+            cursor += 1
+        elif opener in _SUBJECT_WH and not inverted:
+            pass  # the interrogative itself is the subject
+        else:
+            # A noun-phrase subject: its determiner and modifiers, then its
+            # head. The head is the last content word before anything that
+            # can only start a *new* argument, which is what tells "owns the
+            # schema" (predicate + object) from "the database handles"
+            # (subject + predicate).
+            while cursor < len(tokens) and (
+                tokens[cursor] in _DETERMINERS or tokens[cursor] in _CONNECTIVES
+            ):
+                cursor += 1
+            if cursor < len(tokens) and _is_content(tokens[cursor]):
+                cursor += 1  # the subject's head noun
+
+    # The predicate is the next open-class word: whatever auxiliaries,
+    # determiners or discourse particles sit between the subject and it are
+    # not the action being described ("should" in "the system should
+    # recover", "actually" in "no, actually reverse a linked list").
+    while cursor < len(tokens) and not _is_content(tokens[cursor]):
+        cursor += 1
+
+    if cursor >= len(tokens):
+        return True  # a subject with no predicate at all: "how the database"
+    cursor += 1  # the predicate
+
+    if any(_is_argument(token) for token in tokens[cursor:]):
+        return False  # the predicate has its argument
+
+    # A predicate with nothing after it at all.
+    #
+    # An instruction to the candidate is unfinished whatever else is true:
+    # "reverse", "now handle", "how would you design" name an action and not
+    # the thing to do it to, and the thing to do it to is the question.
+    if imperative or subject_is_addressee:
+        return True
+    # Otherwise it is genuinely undecidable from grammar -- intransitive and
+    # finished ("how Kafka works"), or transitive and interrupted ("how Kafka
+    # handles") -- so it turns on the two things that are not grammar: an
+    # inverted main clause is a whole question already ("does it rebalance"),
+    # and a speaker who terminated the utterance said they were done.
+    return not terminated and not inverted and opener is not None
+
+
+def has_open_clause(text: str) -> bool:
+    """True when the utterance's innermost clause provably wants more.
+
+    The one deterministic signal for a subordinate clause caught mid-flight
+    -- "Explain how Kafka handles", "Tell me how the database", "How would
+    you ensure that the service" -- which no amount of counting words or
+    inspecting the final word can see, because none of those clauses end on a
+    function word and all of them are several words long.
+    """
+    sentences = _sentences(text)
+    if not sentences:
+        return False
+    last = sentences[-1]
+    tokens = _tokens(last)
+    if not tokens:
+        return False
+    start, opener = _last_clause_start(tokens)
+    return _clause_is_open(
+        tokens[start:], opener, terminated=last.rstrip().endswith((".", "!", "?"))
+    )
+
+
+#: The generic request verbs already enumerated in `_PROMPT_ANYWHERE` /
+#: `_CLAUSE_INITIAL` above ("explain", "show", "tell", ...) -- reused here
+#: for a second question: does one of them GOVERN an object standing in for
+#: a topic (`_OBJECT_STANDINS`, checked by `_has_verb_with_standin_object`)?
+#: "Explain THIS", "optimize IT", "answer THAT" name no topic in words, but
+#: the pronoun points at something presentable -- on screen, on the page --
+#: that can exist with no prior turn to resolve it against, unlike a bare
+#: trigger with nothing after it ("Can you explain?") or one whose only
+#: object is a personal pronoun ("Show ME" names who receives the answer,
+#: never what the answer is about, so it does not count).
+_REQUEST_VERBS = frozenset({
+    "explain", "describe", "elaborate", "compare", "contrast", "define",
+    "outline", "summarize", "summarise", "illustrate", "demonstrate",
+    "tell", "walk", "talk", "show", "give", "share", "help", "understand",
+    "write", "implement", "code", "build", "design", "create", "solve",
+    "reverse", "sort", "return", "find", "given", "list", "name",
+    "discuss", "rank", "count", "group", "select", "calculate", "compute",
+    "handle", "optimize", "optimise", "refactor", "extend", "modify",
+    "answer",
+})
+# `_OBJECT_STANDINS` is defined above, beside `_TRIVIAL_TAIL_WORDS`, because
+# both readings of a standin pronoun have to come from the same set.
+
+#: Words that carry no topic of their own -- interrogatives, auxiliaries and
+#: subject pronouns (the same closed classes as `_TRIVIAL_TAIL_WORDS`, plus
+#: the interrogatives themselves, which that set deliberately excludes
+#: because it is applied *after* one has already been matched as a trigger),
+#: a handful of discourse/referential particles ("then", "so", "not", "one"),
+#: and `_REQUEST_VERBS` itself. None of these name a subject; a request
+#: built from nothing else -- and that does not clear
+#: `_has_verb_with_standin_object` either -- is leaning entirely on context
+#: that has to already exist.
+#: `_OBJECT_STANDINS` is added back explicitly, because the two questions the
+#: two sets answer are different and a standin answers them oppositely.
+#: "Did the interviewer say anything after the trigger?" -- yes, "this" in
+#: "Explain this" is the object, which is why `_TRIVIAL_TAIL_WORDS` no longer
+#: contains it. "Does this utterance name a topic of its own?" -- no, "it" in
+#: "What about it?" points at a conversation that has to already exist. The
+#: case where a standin *does* supply a topic is the one where a request verb
+#: governs it, and `_has_verb_with_standin_object` is what recognises that.
+_REFERENTIAL_FILLER = (
+    _TRIVIAL_TAIL_WORDS | _OBJECT_STANDINS | _REQUEST_VERBS | frozenset({
+        "what's", "whats", "what", "how", "why", "when", "where", "which",
+        "who", "whom", "whose",
+        "then", "so", "not", "one", "really", "also",
+    })
+)
+
+
+def _has_verb_with_standin_object(words: list[str]) -> bool:
+    lowered = [w.lower() for w in words]
+    return any(
+        w in _REQUEST_VERBS and any(tail in _OBJECT_STANDINS for tail in lowered[i + 1:])
+        for i, w in enumerate(lowered)
+    )
+
+
+def is_referentially_empty(text: str) -> bool:
+    """True when this utterance names no topic of its own -- "Which one?",
+    "Can you?", "Show me.", "Can you explain?", "What about it?" -- as
+    against a genuinely self-contained short request that is just as few
+    words but does name one -- "What is Kafka?", "Explain Kafka.", "Use
+    SQL." -- or one whose verb takes a topic-standing-in pronoun as its
+    object -- "Explain this.", "Can we optimize it?". Whatever survives
+    stripping the closed-class scaffolding in `_REFERENTIAL_FILLER` (or
+    resolving as a governed object-standin) is that topic; nothing left
+    means the request has none of its own and can only be answered by
+    leaning on a conversation that already exists.
+    """
+    words = _WORD.findall(text)
+    if not words:
+        return False
+    if _has_verb_with_standin_object(words):
+        return False
+    return all(word.lower() in _REFERENTIAL_FILLER for word in words)
+
+
 def _normalize(text: str) -> str:
     cleaned = text.strip().rstrip(".,;: \t")
     if not cleaned:
@@ -463,7 +938,9 @@ def extract_interview_prompt(text: str) -> PromptMatch | None:
     # so dropping it here keeps that behaviour while a real premise survives.
     premise = " ".join(
         sentence for sentence in sentences[:matched_index]
-        if not is_acknowledgement(sentence) and _WORDS.search(sentence)
+        if not is_acknowledgement(sentence)
+        and not is_navigation_chatter(sentence)
+        and _WORDS.search(sentence)
     ).strip()
     return PromptMatch(
         prompt=_normalize(tail),
@@ -471,6 +948,12 @@ def extract_interview_prompt(text: str) -> PromptMatch | None:
         sentence=sentences[matched_index],
         sparse=sparse,
         premise=premise[-_MAX_PREMISE_CHARS:] if premise else "",
+        # Computed on the raw tail, not on `prompt`: `_normalize` appends the
+        # "?" that Whisper did not, and whether the speaker terminated the
+        # utterance themselves is exactly what the check needs to know.
+        open_clause=(
+            matched_reason != REASON_PUNCTUATION and has_open_clause(tail)
+        ),
     )
 
 

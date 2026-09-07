@@ -11,7 +11,7 @@ from app.documents.service import DocumentService
 from app.embeddings.base import EmbeddingProvider
 from app.embeddings.onnx_embedder import OnnxEmbedder
 from app.llm.base import LLMClient
-from app.llm.groq_client import build_llm_client
+from app.llm.registry import ProviderConfig, build_client
 from app.memory.sqlite_memory import SqliteSessionMemory
 from app.memory.summarizer import SessionSummarizer
 from app.realtime.question_understanding import QuestionUnderstander
@@ -89,10 +89,58 @@ def get_session_memory() -> SqliteSessionMemory:
     return SqliteSessionMemory(get_session_repository())
 
 
+def api_key_for(provider: str) -> str:
+    """Read `<provider>_api_key` off Settings, if that field exists.
+
+    The same convention `app.core.secrets`/`app.api.settings_api` already use
+    -- a provider's key lives in the field named after it, discovered by name
+    rather than through a per-provider branch.
+    """
+    return getattr(settings, f"{provider}_api_key", "") or ""
+
+
+def _answer_config() -> ProviderConfig:
+    return ProviderConfig(
+        provider=settings.llm_provider,
+        model=settings.llm_model,
+        api_key=api_key_for(settings.llm_provider),
+        base_url=settings.llm_base_url,
+        timeout_seconds=settings.llm_timeout_seconds,
+        max_retries=settings.llm_max_retries,
+    )
+
+
+def _understanding_config() -> ProviderConfig:
+    """Question Understanding's own provider config -- independent of the
+    answer stage's, but defaulting to it field-by-field when unset. See
+    `Settings.question_understanding_provider`."""
+    provider = settings.question_understanding_provider or settings.llm_provider
+    return ProviderConfig(
+        provider=provider,
+        model=settings.question_understanding_model or settings.llm_model,
+        api_key=api_key_for(provider),
+        base_url=settings.question_understanding_base_url or settings.llm_base_url,
+        timeout_seconds=settings.llm_timeout_seconds,
+        max_retries=settings.llm_max_retries,
+    )
+
+
 @lru_cache
 def get_llm_client() -> LLMClient:
-    """The one cloud provider, behind the shared LLMClient interface."""
-    return build_llm_client()
+    """Answer generation's provider, behind the shared LLMClient interface."""
+    return build_client(_answer_config())
+
+
+@lru_cache
+def get_question_understanding_client() -> LLMClient:
+    """Question Understanding's provider. Reuses the answer client (and its
+    connection pool) whenever the two stages are configured identically,
+    which is the common case; only builds a second client when they
+    genuinely differ."""
+    config = _understanding_config()
+    if config == _answer_config():
+        return get_llm_client()
+    return build_client(config)
 
 
 @lru_cache
@@ -102,13 +150,13 @@ def get_summarizer() -> SessionSummarizer:
 
 @lru_cache
 def get_question_understander() -> QuestionUnderstander:
-    """The understanding layer, wired to the one provider this app has.
-
-    `GroqClient.complete_json` satisfies the StructuredCompleter protocol, so
-    this reuses the same client (and its connection pool) rather than standing
-    up a second provider path.
-    """
-    return QuestionUnderstander(get_llm_client())
+    """The understanding layer, wired to whichever provider Settings names for
+    it. Duck-typed against `StructuredCompleter` (see
+    app.realtime.question_understanding): any client without a `complete_json`
+    method degrades this to the deterministic fallback rather than erroring."""
+    client = get_question_understanding_client()
+    completer = client if hasattr(client, "complete_json") else None
+    return QuestionUnderstander(completer)
 
 
 @lru_cache

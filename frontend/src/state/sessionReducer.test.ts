@@ -769,9 +769,12 @@ test("attached material is visible while its turn is unanswered", () => {
   assert.equal(state.lastAttachmentRejection, null);
 });
 
-test("attached material disappears once its turn has been answered", () => {
-  // The chip used to outlive the material: nothing cleared it, so it kept
-  // promising context the backend had already consumed.
+test("attached material survives its turn being answered, for a follow-up to use", () => {
+  // The backend keeps bound material available past answer.completed --
+  // until the *next fresh* question starts -- specifically so a same-thread
+  // follow-up ("why?", "what about row 3?") can still use it. Clearing the
+  // chip here, as this test used to assert, hid it before the candidate had
+  // a chance to ask that follow-up.
   let state = apply(
     initialSessionState,
     ev("context.attached", { kind: "sql", chars: 240 }),
@@ -780,19 +783,34 @@ test("attached material disappears once its turn has been answered", () => {
   assert.equal(state.attachments.length, 1, "cleared too early");
 
   state = apply(state, ev("answer.completed", { answer: ANSWER, latency_ms: 12 }, 1));
-  assert.deepEqual(state.attachments, []);
-  // The answer itself is untouched -- only the turn-scoped material goes.
+  assert.equal(state.attachments.length, 1, "cleared before a follow-up could use it");
   assert.equal(state.current?.phase, "answered");
 });
 
+test("attached material clears once a second new question starts without it", () => {
+  // A genuinely new, unrelated question -- one that did not itself claim the
+  // material via its own context.attached -- means the thread the material
+  // belonged to has fully passed.
+  const state = apply(
+    initialSessionState,
+    ev("context.attached", { kind: "sql", chars: 240 }),
+    ev("question.detected", { question: "What is wrong with this?" }, 1),
+    ev("answer.completed", { answer: ANSWER, latency_ms: 12 }, 1),
+    ev("question.detected", { question: "What is a hash map?" }, 2),
+  );
+  assert.deepEqual(state.attachments, []);
+  assert.equal(state.current?.turnId, 2);
+});
+
 test("clearing material leaves session-wide state alone", () => {
-  let state = apply(
+  const state = apply(
     initialSessionState,
     ev("session.started", { session_id: "s1" }),
     ev("transcript.final", { text: "What is wrong with this?", source: "loopback" }),
     ev("context.attached", { kind: "text", chars: 71 }),
     ev("question.detected", { question: "What is wrong with this?" }, 1),
     ev("answer.completed", { answer: ANSWER, latency_ms: 12 }, 1),
+    ev("question.detected", { question: "What is a hash map?" }, 2),
   );
   assert.deepEqual(state.attachments, []);
   assert.equal(state.sessionId, "s1");

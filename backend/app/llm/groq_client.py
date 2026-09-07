@@ -1,89 +1,38 @@
-"""The application's only cloud provider.
+"""Groq behind the shared `LLMClient` interface.
 
-Groq is reached through the official SDK. This module is deliberately the whole
-provider layer: there is one cloud model, so a router, a priority list and a
-failover table would be machinery with nothing to route between.
+Reached through the official SDK, so this module is genuinely Groq-specific
+in a way the OpenAI-compatible transport (`app.llm.openai_compatible`) is
+not: Groq's SDK raises its own exception classes rather than plain HTTP
+errors, so the mapping from those classes onto `LLMErrorKind` has to live
+somewhere, and here is the only place that imports the SDK at all.
 
 What lives here, and nowhere else:
 
-  * the client (one per process, so the connection pool is reused)
+  * the client (one per instance, so its connection pool is reused across
+    requests -- see `_ensure_client`)
   * the mapping from Groq's exception classes onto `LLMErrorKind`
-  * the user-facing sentence for each failure kind
 
-Answer parsing and validation stay in the shared path (`app.llm.streaming`,
-`app.intelligence.answer_validator`), which is provider-unaware.
+Everything else -- the wording for each failure kind, answer parsing and
+validation, provider selection -- is shared (`app.llm.messages`,
+`app.llm.streaming`, `app.llm.registry`, `app.intelligence.answer_validator`),
+because none of it is actually Groq-specific.
 """
 
 import asyncio
 import time
 from collections.abc import AsyncIterator
 
-from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import elapsed_ms, log_metric
 from app.llm.base import LLMClient, LLMError, LLMErrorKind
+from app.llm.messages import message_for
+from app.llm.registry import ProviderConfig, validate_model
 from app.llm.streaming import parse_answer_payload
 from app.schemas.answer import Answer
 
 logger = get_logger(__name__)
 
-#: Sentences the Settings screen and the answer pane show verbatim. Each names
-#: the thing the user can actually do about it; "The Groq request failed" is
-#: only reachable when the SDK produced something we genuinely cannot classify.
-_MESSAGES: dict[LLMErrorKind, str] = {
-    LLMErrorKind.AUTH: (
-        "The Groq API key was rejected. Check it in Settings and save it again."
-    ),
-    LLMErrorKind.NOT_CONFIGURED: (
-        "No Groq API key is configured. Add one in Settings to enable answers."
-    ),
-    LLMErrorKind.MODEL_UNAVAILABLE: (
-        "The configured Groq model is not available to this account. "
-        "Choose a different model in Settings."
-    ),
-    LLMErrorKind.RATE_LIMIT: (
-        "Groq's rate limit was reached. Wait a moment and ask again."
-    ),
-    LLMErrorKind.TIMEOUT: "Groq did not respond in time. Ask again.",
-    LLMErrorKind.NETWORK: (
-        "Could not reach Groq. Check this machine's internet connection."
-    ),
-    LLMErrorKind.SERVER: "Groq reported a server error. Try again shortly.",
-    LLMErrorKind.MALFORMED: "Groq returned a response this app could not read.",
-    LLMErrorKind.UNKNOWN: "The Groq request failed.",
-}
-
-
-def _message(kind: LLMErrorKind, model: str | None = None) -> str:
-    base = _MESSAGES.get(kind, _MESSAGES[LLMErrorKind.UNKNOWN])
-    if kind is LLMErrorKind.MODEL_UNAVAILABLE and model:
-        return base.replace("The configured Groq model", f"The Groq model '{model}'")
-    return base
-
-
-class GroqConfigError(ValueError):
-    """The configured model name is unusable. Raised at construction, because a
-    blank or malformed model is a configuration mistake, not a runtime failure
-    that should be rediscovered on every question."""
-
-
-def validate_model(name: str) -> str:
-    """Normalise and sanity-check a model identifier.
-
-    Deliberately not an allow-list of known Groq models: that list changes on
-    Groq's schedule, not this app's, and a stale copy would reject a model that
-    works. What *can* be checked locally is checked here; whether the account
-    can actually use the model is answered by Groq, and surfaces as
-    MODEL_UNAVAILABLE with the name in the message.
-    """
-    cleaned = (name or "").strip()
-    if not cleaned:
-        raise GroqConfigError("GROQ_MODEL is empty; set a Groq model identifier.")
-    if any(character.isspace() for character in cleaned):
-        raise GroqConfigError(
-            f"GROQ_MODEL {cleaned!r} contains whitespace; it must be a single identifier."
-        )
-    return cleaned
+_NAME = "Groq"
 
 
 class GroqClient(LLMClient):
@@ -91,7 +40,10 @@ class GroqClient(LLMClient):
 
     Construction never raises on a missing key: the app must still start and
     still serve documents, history and transcription without one, so "no key"
-    surfaces per-answer as a NOT_CONFIGURED LLMError.
+    surfaces per-answer as a NOT_CONFIGURED LLMError. A malformed *model*
+    still raises at construction (via `validate_model`), because that is a
+    configuration mistake rather than a runtime failure worth rediscovering on
+    every question.
     """
 
     provider_name = "groq"
@@ -128,35 +80,35 @@ class GroqClient(LLMClient):
         504: LLMErrorKind.SERVER,
     }
 
-    def __init__(self) -> None:
+    def __init__(self, config: ProviderConfig) -> None:
+        self._config = config
         self._client = None
         #: Last classified failure, for the Settings screen. Never a message
         #: from the provider and never anything key-derived -- just the kind.
         self.last_error_kind: LLMErrorKind | None = None
         # Fails fast and loudly on a misconfigured model rather than sending it
         # to Groq once per question.
-        validate_model(settings.groq_model)
+        validate_model(config.model)
 
     @property
     def model_name(self) -> str:
-        # Read through, not cached: PUT /settings can change the model at
-        # runtime and the next request must use the new one.
-        return settings.groq_model
+        return self._config.model
 
     @property
     def configured(self) -> bool:
-        return bool(settings.groq_api_key)
+        return bool(self._config.api_key)
 
     # ------------------------------------------------------------- lifecycle
 
     def _ensure_client(self):
-        """One client per process. A per-request client would discard the
-        connection pool and put TLS setup on every answer."""
+        """One client per instance, so the connection pool is reused. A
+        per-request client would discard it and put TLS setup on every
+        answer."""
         if self._client is not None:
             return self._client
-        if not settings.groq_api_key:
+        if not self._config.api_key:
             raise LLMError(
-                _message(LLMErrorKind.NOT_CONFIGURED),
+                message_for(LLMErrorKind.NOT_CONFIGURED, _NAME),
                 kind=LLMErrorKind.NOT_CONFIGURED,
             )
         try:
@@ -172,12 +124,12 @@ class GroqClient(LLMClient):
             ) from exc
 
         self._client = AsyncGroq(
-            api_key=settings.groq_api_key,
+            api_key=self._config.api_key,
             # The SDK already retries exactly the failures worth retrying
             # (connection errors, 408, 429, 5xx) with backoff, and never retries
             # a deterministic 400/401/404. Set explicitly so that contract is
             # visible here rather than inherited from an SDK default.
-            max_retries=settings.groq_max_retries,
+            max_retries=self._config.max_retries,
         )
         logger.info("groq_client_initialised model=%s", self.model_name)
         return self._client
@@ -256,10 +208,18 @@ class GroqClient(LLMClient):
         return LLMErrorKind.UNKNOWN
 
     def _as_llm_error(self, exc: Exception) -> LLMError:
+        # An LLMError raised by this layer is already normalised: its `kind`
+        # came from `classify` and its sentence from `app.llm.messages`.
+        # Re-classifying it can only ever lose information -- that is how a
+        # NOT_CONFIGURED "add a key in Settings" became an UNKNOWN "the
+        # request failed" -- so it is returned as it stands.
+        if isinstance(exc, LLMError):
+            self.last_error_kind = exc.kind
+            return exc
         kind = self.classify(exc)
         self.last_error_kind = kind
         return LLMError(
-            _message(kind, self.model_name),
+            message_for(kind, _NAME, self.model_name),
             kind=kind,
             retry_after_seconds=self._retry_after_seconds(exc),
         )
@@ -307,7 +267,7 @@ class GroqClient(LLMClient):
                     messages=self._messages(prompt),
                     response_format={"type": "json_object"},
                 ),
-                timeout=settings.groq_timeout_seconds,
+                timeout=self._config.timeout_seconds,
             )
         except asyncio.CancelledError:
             raise
@@ -330,8 +290,8 @@ class GroqClient(LLMClient):
 
         Serves the question-understanding layer (`StructuredCompleter`), which
         needs a small structured object rather than a coaching answer, on a
-        much tighter budget than `groq_timeout_seconds` -- it sits on the
-        realtime path between a finished question and its answer.
+        much tighter budget than the answer-generation timeout -- it sits on
+        the realtime path between a finished question and its answer.
 
         JSON mode is safe to use here, unlike `stream_answer`: nothing streams
         this, so the provider buffering the whole object costs nothing.
@@ -402,7 +362,7 @@ class GroqClient(LLMClient):
                     # in generate_answer above, where buffering costs nothing.
                     stream=True,
                 ),
-                timeout=settings.groq_timeout_seconds,
+                timeout=self._config.timeout_seconds,
             )
         except asyncio.CancelledError:
             raise
@@ -449,21 +409,21 @@ class GroqClient(LLMClient):
         if not text:
             self.last_error_kind = LLMErrorKind.MALFORMED
             raise LLMError(
-                "Groq returned an empty response.", kind=LLMErrorKind.MALFORMED
+                message_for(LLMErrorKind.MALFORMED, _NAME), kind=LLMErrorKind.MALFORMED
             )
         try:
             data = parse_answer_payload(text)
         except Exception as exc:
             self.last_error_kind = LLMErrorKind.MALFORMED
             raise LLMError(
-                _message(LLMErrorKind.MALFORMED), kind=LLMErrorKind.MALFORMED
+                message_for(LLMErrorKind.MALFORMED, _NAME), kind=LLMErrorKind.MALFORMED
             ) from exc
         try:
             return Answer.model_validate(data)
         except Exception as exc:
             self.last_error_kind = LLMErrorKind.MALFORMED
             raise LLMError(
-                _message(LLMErrorKind.MALFORMED), kind=LLMErrorKind.MALFORMED
+                message_for(LLMErrorKind.MALFORMED, _NAME), kind=LLMErrorKind.MALFORMED
             ) from exc
 
 
@@ -475,19 +435,3 @@ def _chunk_text(chunk) -> str:
         return ""
     delta = getattr(choices[0], "delta", None)
     return getattr(delta, "content", None) or "" if delta is not None else ""
-
-
-def build_llm_client() -> LLMClient:
-    """Composition root for the LLM layer.
-
-    One provider, so this is a constructor rather than a router. It stays a
-    function because `app.core.deps` caches it and the settings API clears that
-    cache to pick up a newly saved key without a restart.
-    """
-    client = GroqClient()
-    logger.info(
-        "llm_initialised provider=groq model=%s configured=%s",
-        client.model_name,
-        client.configured,
-    )
-    return client

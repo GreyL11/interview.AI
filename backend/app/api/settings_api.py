@@ -6,9 +6,11 @@ from pydantic import BaseModel
 from app.audio.base import AudioChannel, DeviceInfo
 from app.audio.devices import audio_available, list_devices
 from app.core.config import settings
+from app.core.deps import api_key_for
 from app.core.logging import get_logger
 from app.core.secret_config import forget_secret, persist_secret
 from app.core.secrets import SecretStoreUnavailable, secret_store
+from app.llm.registry import ProviderConfigError, known_providers, validate_base_url, validate_model
 from app.model_status import model_states
 
 logger = get_logger(__name__)
@@ -55,8 +57,14 @@ class SettingsView(BaseModel):
     #: Mutations here apply to the running process only; nothing is written
     #: back to .env. The UI says so rather than implying they persist.
     settings_persist: bool = False
-    groq_key_configured: bool
-    groq_model: str
+    llm_provider: str
+    llm_model: str
+    llm_base_url: str
+    llm_key_configured: bool
+    #: Empty means "same as llm_provider" / "same as llm_model" -- see
+    #: `Settings.question_understanding_provider`.
+    question_understanding_provider: str
+    question_understanding_model: str
     embedding_model: str
     stt_model: str
     stt_device: str
@@ -80,7 +88,11 @@ class SettingsUpdate(BaseModel):
     exactly the confusion this split exists to prevent.
     """
 
-    groq_model: str | None = None
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    llm_base_url: str | None = None
+    question_understanding_provider: str | None = None
+    question_understanding_model: str | None = None
     stt_model: str | None = None
     stt_device: str | None = None
     rag_top_k: int | None = None
@@ -110,40 +122,61 @@ class ModelStatus(BaseModel):
 
 
 def _provider_statuses() -> list[ProviderStatus]:
-    """Static configuration joined with the running client's own view.
+    """Static configuration joined with the running clients' own view.
 
-    Read defensively: a Settings screen must not fail to render because the LLM
-    layer is unhappy.
+    Answer generation and Question Understanding can be configured with
+    different providers (see `Settings.question_understanding_provider`), so
+    this reports one entry per *distinct* provider actually in use -- one
+    entry in the common case where both stages agree, two when they do not.
+
+    Read defensively: a Settings screen must not fail to render because the
+    LLM layer is unhappy.
     """
-    active = False
-    last_error: str | None = None
-    try:
-        from app.core.deps import get_llm_client
+    from app.core.deps import get_llm_client, get_question_understanding_client
 
-        client = get_llm_client()
-        active = True
-        kind = getattr(client, "last_error_kind", None)
-        last_error = kind.value if kind is not None else None
-    except Exception as exc:
-        logger.warning("provider_status_unavailable error=%s", type(exc).__name__)
+    answer_provider = settings.llm_provider
+    understanding_provider = settings.question_understanding_provider or settings.llm_provider
+    model_for = {
+        answer_provider: settings.llm_model,
+        understanding_provider: settings.question_understanding_model or settings.llm_model,
+    }
 
-    return [
-        ProviderStatus(
-            name="groq",
-            model=settings.groq_model,
-            configured=bool(settings.groq_api_key),
+    def _status(provider: str, getter) -> ProviderStatus:
+        active = False
+        last_error: str | None = None
+        try:
+            client = getter()
+            active = True
+            kind = getattr(client, "last_error_kind", None)
+            last_error = kind.value if kind is not None else None
+        except Exception as exc:
+            logger.warning(
+                "provider_status_unavailable provider=%s error=%s", provider, type(exc).__name__
+            )
+        return ProviderStatus(
+            name=provider,
+            model=model_for[provider],
+            configured=bool(api_key_for(provider)),
             active=active,
             last_error_kind=last_error,
         )
-    ]
+
+    statuses = [_status(answer_provider, get_llm_client)]
+    if understanding_provider != answer_provider:
+        statuses.append(_status(understanding_provider, get_question_understanding_client))
+    return statuses
 
 
 def _view() -> SettingsView:
     return SettingsView(
         providers=_provider_statuses(),
         secure_storage_available=secret_store().available,
-        groq_key_configured=bool(settings.groq_api_key),
-        groq_model=settings.groq_model,
+        llm_provider=settings.llm_provider,
+        llm_model=settings.llm_model,
+        llm_base_url=settings.llm_base_url,
+        llm_key_configured=bool(api_key_for(settings.llm_provider)),
+        question_understanding_provider=settings.question_understanding_provider,
+        question_understanding_model=settings.question_understanding_model,
         embedding_model=settings.embedding_model,
         stt_model=settings.stt_model,
         stt_device=settings.stt_device,
@@ -164,19 +197,48 @@ async def get_settings() -> SettingsView:
     return _view()
 
 
+def _validate_llm_change(
+    changed: dict, *, provider_key: str, model_key: str, base_url_key: str, required: bool = True,
+) -> None:
+    """Reject a provider/model/base_url combination that cannot possibly work,
+    before it takes effect -- discovering it on the next question instead
+    would take the provider down with a confusing error from deep inside it.
+
+    `required` is False for Question Understanding's own provider/model,
+    where an empty string is valid and means "same as answer generation" --
+    see `Settings.question_understanding_provider`.
+    """
+    provider = changed.get(provider_key, getattr(settings, provider_key))
+    if provider or required:
+        if provider not in known_providers():
+            raise ProviderConfigError(
+                f"Unknown LLM provider '{provider}'. Known providers: "
+                f"{', '.join(sorted(known_providers()))}."
+            )
+    if model_key in changed and (changed[model_key] or required):
+        changed[model_key] = validate_model(changed[model_key])
+    if (provider_key in changed or base_url_key in changed) and provider:
+        base_url = changed.get(base_url_key, getattr(settings, base_url_key))
+        validate_base_url(provider, base_url)
+
+
 @router.put("/settings", response_model=SettingsView)
 async def update_settings(update: SettingsUpdate) -> SettingsView:
     changed = update.model_dump(exclude_none=True)
 
-    if "groq_model" in changed:
-        # Rejected here rather than discovered on the next question: a blank or
-        # malformed model would otherwise take the provider down silently.
-        from app.llm.groq_client import GroqConfigError, validate_model
-
-        try:
-            changed["groq_model"] = validate_model(changed["groq_model"])
-        except GroqConfigError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        _validate_llm_change(
+            changed, provider_key="llm_provider", model_key="llm_model", base_url_key="llm_base_url"
+        )
+        _validate_llm_change(
+            changed,
+            provider_key="question_understanding_provider",
+            model_key="question_understanding_model",
+            base_url_key="question_understanding_base_url",
+            required=False,
+        )
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     for key, value in changed.items():
         setattr(settings, key, value)
@@ -184,11 +246,21 @@ async def update_settings(update: SettingsUpdate) -> SettingsView:
     # Never log a value, only which fields moved.
     logger.info("settings_updated fields=%s", sorted(changed))
 
-    if "groq_model" in changed:
+    llm_changed = {"llm_provider", "llm_model", "llm_base_url"} & changed.keys()
+    understanding_changed = {
+        "question_understanding_provider", "question_understanding_model",
+        "question_understanding_base_url",
+    } & changed.keys()
+    if llm_changed:
         from app.core.deps import get_llm_client, get_summarizer
 
         get_llm_client.cache_clear()
         get_summarizer.cache_clear()
+    if llm_changed or understanding_changed:
+        from app.core.deps import get_question_understander, get_question_understanding_client
+
+        get_question_understanding_client.cache_clear()
+        get_question_understander.cache_clear()
     if "stt_model" in changed or "stt_device" in changed:
         from app.core.deps import get_stt_engine
         from app.stt.scheduler import reset_shared_scheduler
@@ -273,9 +345,16 @@ def _refresh_engine() -> None:
     the client it started with. That is the atomic swap -- no lock needed,
     because nothing mutates the old instance.
     """
-    from app.core.deps import get_llm_client, get_summarizer
+    from app.core.deps import (
+        get_llm_client,
+        get_question_understander,
+        get_question_understanding_client,
+        get_summarizer,
+    )
 
     get_llm_client.cache_clear()
+    get_question_understanding_client.cache_clear()
+    get_question_understander.cache_clear()
     get_summarizer.cache_clear()
 
 

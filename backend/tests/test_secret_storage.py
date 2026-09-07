@@ -159,6 +159,17 @@ def test_an_unknown_provider_key_is_stored_but_not_applied_to_settings(store):
     assert OTHER_KEY_NAME not in load_persisted_secrets()
 
 
+def test_every_provider_api_key_field_is_discovered(store):
+    """A new provider is a Settings field, not a code change -- see
+    `secret_field_names()`. Pins that the fields app.llm.registry actually
+    routes to are all discoverable, not just groq's."""
+    from app.core.secrets import secret_field_names
+
+    names = secret_field_names()
+    for expected in ("groq_api_key", "openai_api_key", "openai_compatible_api_key", "omnirouter_api_key"):
+        assert expected in names
+
+
 def test_an_obsolete_gemini_credential_is_purged_on_startup(store):
     """Migration: an install upgraded from a build that still had a second
     provider must not leave an orphaned entry in Credential Manager."""
@@ -292,6 +303,27 @@ def test_removing_an_environment_key_says_it_will_return(client, store):
     settings.groq_api_key = "from-environment"
     body = client.delete("/providers/groq/key").json()
     assert "restart" in body["detail"].lower()
+
+
+def test_repr_of_settings_never_contains_a_configured_key(store, monkeypatch):
+    """A stray `logger.info(f"{settings}")`, an unhandled traceback with
+    `settings` in a local frame, or a debugger printing it must not be how a
+    key leaks -- repr()/str() redact every `*_api_key` field."""
+    monkeypatch.setattr(settings, "groq_api_key", GROQ_SECRET)
+    monkeypatch.setattr(settings, "openai_api_key", OTHER_SECRET)
+
+    rendered_repr = repr(settings)
+    rendered_str = str(settings)
+
+    for rendered in (rendered_repr, rendered_str):
+        assert GROQ_SECRET not in rendered
+        assert OTHER_SECRET not in rendered
+        assert "groq_api_key" in rendered  # the field itself still shows, just not its value
+
+
+def test_repr_of_settings_is_honest_about_an_unconfigured_key(store, monkeypatch):
+    monkeypatch.setattr(settings, "groq_api_key", "")
+    assert "groq_api_key='***'" not in repr(settings)
 
 
 def _provider(client, name: str) -> dict:

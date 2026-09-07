@@ -3,12 +3,18 @@ import os
 import sys
 from pathlib import Path
 
+from pydantic import AliasChoices, Field, model_serializer
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: Folder name under %LOCALAPPDATA% used when the desktop shell did not pass
 #: --data-dir. Matches the Tauri bundle identifier so both processes agree on
 #: one location even if they disagree about who chose it.
 APP_IDENTIFIER = "com.callassistant.desktop"
+
+#: What a redacted secret serialises as. A fixed marker rather than an
+#: empty string, so a dump makes it visible that a key is set without
+#: revealing it, and so nothing mistakes a redacted dump for "no key".
+_REDACTED = "***"
 
 #: Identifiers this app shipped under before it was renamed. The desktop
 #: shell derives the per-user data directory from the bundle identifier, so
@@ -55,17 +61,42 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- LLM (Groq is the only cloud provider) ---
+    # --- LLM (provider-neutral -- see app.llm.registry for the provider list) ---
+    #: Which provider answers questions. Data, not code: app.llm.registry maps
+    #: this name onto an implementation, so a new provider is a registry entry,
+    #: never a branch here or in the interview pipeline.
+    llm_provider: str = "groq"
+    #: The single place an answer model is named. Aliased to the
+    #: pre-multi-provider env var name so an existing GROQ_MODEL in a
+    #: developer's .env keeps working. Validated by app.llm.registry.validate_model.
+    llm_model: str = Field(
+        default="openai/gpt-oss-120b",
+        validation_alias=AliasChoices("llm_model", "groq_model"),
+    )
+    #: Only meaningful for a provider with no fixed endpoint of its own
+    #: (openai_compatible, omnirouter, ...). Ignored by every other provider.
+    llm_base_url: str = ""
+    llm_timeout_seconds: float = Field(
+        default=30.0,
+        validation_alias=AliasChoices("llm_timeout_seconds", "groq_timeout_seconds"),
+    )
+    #: Passed to whichever provider client is built. Each one retries only the
+    #: failures worth retrying (connection errors, 408, 429, 5xx) and never a
+    #: deterministic 400/401/404 -- this is the ceiling on that, not a second
+    #: retry loop layered on top.
+    llm_max_retries: int = Field(
+        default=2,
+        validation_alias=AliasChoices("llm_max_retries", "groq_max_retries"),
+    )
+
+    # Per-provider secrets. Any `<name>_api_key` field here is discovered
+    # automatically by app.core.secrets and loaded from / saved to the OS
+    # credential store -- adding a provider is adding a field, never a branch;
+    # see secret_field_names().
     groq_api_key: str = ""
-    #: The single place a model is named. Everything else reads
-    #: `settings.groq_model`, so changing it here (or via PUT /settings) is the
-    #: whole change. Validated by app.llm.groq_client.validate_model.
-    groq_model: str = "openai/gpt-oss-120b"
-    groq_timeout_seconds: float = 30.0
-    #: Passed to the Groq SDK, which retries only connection errors, 408, 429
-    #: and 5xx. Deterministic failures (bad key, unknown model) are never
-    #: retried by the SDK and must never be retried here either.
-    groq_max_retries: int = 2
+    openai_api_key: str = ""
+    openai_compatible_api_key: str = ""
+    omnirouter_api_key: str = ""
 
     # Local storage
     data_dir: Path = default_data_dir()
@@ -121,6 +152,15 @@ class Settings(BaseSettings):
     # may still count as a follow-up rather than noise. Long enough to cover
     # "candidate read the streamed answer, then asked a quick follow-up".
     question_followup_window_ms: int = 45_000
+    # How soon after a question was accepted an *identical* utterance is read
+    # as a redelivery of it rather than as a fresh question -- a final
+    # published twice, or a manual submit double-clicked. Sized to be well
+    # under the gap between two things a person actually says (a second
+    # spoken question is seconds away, and one worth re-asking is much
+    # further) and well over the gap between two copies of one event. An
+    # interviewer who genuinely repeats a question later is outside this and
+    # gets a second answer, which is the right outcome.
+    question_redelivery_ms: int = 1500
     # --- turn accumulation budgets -------------------------------------
     # All three are windows on the SPEECH clock, and all three are spent only
     # by a turn that is not yet answerable. A complete one-shot question and
@@ -185,12 +225,18 @@ class Settings(BaseSettings):
     #: answers still happen, context selection is just less precise.
     question_understanding_enabled: bool = True
     #: Hard budget. This sits on the realtime path, so it is far tighter than
-    #: `groq_timeout_seconds`: past this the fallback is faster than the
+    #: `llm_timeout_seconds`: past this the fallback is faster than the
     #: classifier and the interviewer is waiting either way.
     question_understanding_timeout_ms: int = 1500
-    #: Empty means "use groq_model". Split only if a smaller/faster model is
-    #: worth the extra configuration surface -- a decision for real audio.
+    #: Each empty independently means "same as answer generation" -- see
+    #: `app.core.deps._understanding_config`. Split only when it is worth the
+    #: extra configuration surface: a smaller/faster model on the same
+    #: provider, or (since the two stages are fully independent) a different
+    #: provider entirely -- e.g. Groq for understanding, OmniRouter for the
+    #: answer itself.
+    question_understanding_provider: str = ""
     question_understanding_model: str = ""
+    question_understanding_base_url: str = ""
 
     # --- interviewer-pasted material -----------------------------------
     #: How close to a question a paste has to be for *elapsed time alone* to
@@ -312,6 +358,45 @@ class Settings(BaseSettings):
     stt_priority_mic_partial: int = 3
 
     log_level: str = "INFO"
+
+    def __repr_args__(self):
+        """Redact every `*_api_key` field from `repr(settings)`/`str(settings)`.
+
+        pydantic builds both from this. Without it, a stray log line, an
+        unhandled traceback, or a debugger printing a local variable would
+        each be a way for a key to leak in plain text -- this is the one
+        chokepoint that closes all three at once.
+        """
+        for name, value in super().__repr_args__():
+            if name.endswith("_api_key") and value:
+                value = "***"
+            yield name, value
+
+    @model_serializer(mode="wrap")
+    def _redact_secrets(self, handler):
+        """The same redaction for `model_dump()` and `model_dump_json()`.
+
+        `__repr_args__` above closes repr/str, which was the leak anyone was
+        actually likely to cause. Serialisation was the other half and was
+        open: anything that dumped Settings -- a diagnostics endpoint, a
+        support bundle, a telemetry payload, a config echo in a log -- would
+        have carried every key in plain text. Nothing in `app/` does that
+        today, which is exactly why it is worth closing now rather than
+        after something does.
+
+        Redaction lives in serialisation only. Attribute access
+        (`settings.groq_api_key`) is untouched, so `app.core.deps.api_key_for`,
+        `app.core.secrets` and the credential-store round trip all still see
+        the real value -- reading a key and publishing one are different acts,
+        and only the second is guarded here.
+        """
+        dumped = handler(self)
+        if not isinstance(dumped, dict):
+            return dumped
+        return {
+            key: (_REDACTED if key.endswith("_api_key") and value else value)
+            for key, value in dumped.items()
+        }
 
     @property
     def documents_dir(self) -> Path:

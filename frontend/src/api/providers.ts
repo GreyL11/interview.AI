@@ -18,7 +18,12 @@ export interface ProviderDescription {
   tone: BadgeTone;
 }
 
-const LABELS: Record<string, string> = { groq: "Groq" };
+const LABELS: Record<string, string> = {
+  groq: "Groq",
+  openai: "OpenAI",
+  openai_compatible: "OpenAI-compatible endpoint",
+  omnirouter: "OmniRouter",
+};
 
 export function providerLabel(name: string): string {
   if (name in LABELS) return LABELS[name] as string;

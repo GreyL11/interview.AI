@@ -2,8 +2,10 @@
 
 Local-first interview practice. Everything except LLM reasoning runs on your machine:
 audio, speech-to-text, documents, embeddings, vector search, and session history never
-leave the device. Groq receives only the current question, retrieved context, and a
-bounded slice of conversation memory — never raw audio, never your document library.
+leave the device. The configured LLM provider (Groq, OpenAI, OmniRouter, or any
+OpenAI-compatible endpoint — see [docs/llm-providers.md](docs/llm-providers.md))
+receives only the current question, retrieved context, and a bounded slice of
+conversation memory — never raw audio, never your document library.
 
 > **Product boundary.** This is for mock interviews, practice, and settings where AI
 > assistance is explicitly permitted. It is not built to conceal assistance from an
@@ -31,7 +33,10 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Then set `GROQ_API_KEY` in `.env` (the packaged app uses the OS credential store instead).
+Then set `GROQ_API_KEY` in `.env` (the packaged app uses the OS credential store
+instead). To use a different provider, set `LLM_PROVIDER` and `LLM_MODEL` instead —
+see [docs/llm-providers.md](docs/llm-providers.md) for the full provider list and how
+to configure OpenAI, OmniRouter, or a self-hosted OpenAI-compatible endpoint.
 
 Live audio needs two extra packages that are **not** in the base install:
 
@@ -70,7 +75,7 @@ Documents ─ parse ─ chunk ─ embed ─┬─ FAISS (vectors)
                                    └─ SQLite (text, metadata, vector ids)
 
 Audio ─ VAD ─ Whisper ─ final transcript ─ classify ─ route ─┬─ retrieve
-                                                             └─ Groq ─── validate ─ WS events
+                                                             └─ LLMClient ─ validate ─ WS events
 ```
 
 Key interfaces, each with one real implementation — swap without touching callers:

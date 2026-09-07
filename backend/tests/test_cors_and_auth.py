@@ -79,7 +79,8 @@ def test_health_answers_a_browser_request_with_cors_headers(secured):
 
 def test_ready_reports_the_provider_that_actually_exists(secured):
     body = secured.get("/ready", headers={"Authorization": f"Bearer {TOKEN}"}).json()
-    assert "groq_configured" in body
+    assert "llm_configured" in body
+    assert "groq_configured" not in body
     assert "gemini_configured" not in body
 
 

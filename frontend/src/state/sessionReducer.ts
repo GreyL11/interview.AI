@@ -124,6 +124,17 @@ export interface SessionState {
    * purpose -- these are three different things and conflating them would put
    * a pasted schema into the spoken record. */
   attachments: AttachmentView[];
+  /** Which turn the current attachment set was last bound to -- null while
+   * material is still pending (attached before any question asked about it).
+   * The backend keeps bound material available until the *next fresh
+   * question* starts (see `LiveSession.ask`'s `extend_attachments`), so the
+   * indicator survives the turn it arrived for and one turn beyond it --
+   * long enough for a same-thread follow-up to still see it -- and clears
+   * once a second new question starts without having claimed it itself.
+   * There is no wire signal for "this new question is a follow-up", so this
+   * is a bounded approximation, not an exact mirror of the backend's own
+   * relationship-aware binding. */
+  attachmentsTurnId: number | null;
   /** Last refusal, so the user learns why rather than seeing a generic error.
    * Cleared once a later attachment is accepted. */
   lastAttachmentRejection: AttachmentRejection | null;
@@ -144,6 +155,7 @@ export const initialSessionState: SessionState = {
   history: [],
   lastRejected: null,
   attachments: [],
+  attachmentsTurnId: null,
   lastAttachmentRejection: null,
   error: null,
   ended: false,
@@ -311,11 +323,21 @@ function applyEvent(state: SessionState, event: ServerEvent): SessionState {
               // screen means this was an interruption, not a bare cancel.
               interrupted: base.current.streamingSummary.trim() !== "" }]
           : base.history;
+      // Pending material (attached before this question, or still bound from
+      // the turn just retired above) is claimed by this turn the first time
+      // we see it -- covering both "paste, then ask" and "answer completes,
+      // then a same-thread follow-up starts". Only a *second* new question
+      // without a claim in between means the material belonged to a thread
+      // that has now fully passed, so it clears here instead.
+      const stillOwned =
+        base.attachmentsTurnId === null || base.attachmentsTurnId === event.turn_id;
       return {
         ...base,
         history,
         current: newTurn(event, event.turn_id),
         lastRejected: null,
+        attachments: stillOwned ? base.attachments : [],
+        attachmentsTurnId: stillOwned ? (base.attachmentsTurnId ?? event.turn_id) : null,
       };
     }
 
@@ -344,21 +366,20 @@ function applyEvent(state: SessionState, event: ServerEvent): SessionState {
       const hits = Array.isArray(event.data["retrieval_hits"])
         ? (event.data["retrieval_hits"] as RetrievalHitView[])
         : [];
-      return {
-        ...retire(base, {
-          phase: "answered",
-          answer: answer ?? null,
-          streamingSummary: answer?.summary ?? base.current?.streamingSummary ?? "",
-          contextFound: bool(event.data, "context_found"),
-          hits,
-          latencyMs: num(event.data, "latency_ms"),
-        }),
-        // Turn-scoped material is spent once its turn has been answered, so
-        // the chip stops promising context the backend has already used.
-        // Only this list: indexed documents and knowledge-base state are
-        // session-wide and are deliberately untouched here.
-        attachments: [],
-      };
+      // The backend keeps bound material available past this point -- until
+      // the *next fresh* question starts -- so a same-thread follow-up can
+      // still use it. Clearing the chip here (as this used to) hid it before
+      // the candidate had a chance to ask that follow-up; see
+      // `attachmentsTurnId` and the "question.detected" case for where it
+      // actually gets retired.
+      return retire(base, {
+        phase: "answered",
+        answer: answer ?? null,
+        streamingSummary: answer?.summary ?? base.current?.streamingSummary ?? "",
+        contextFound: bool(event.data, "context_found"),
+        hits,
+        latencyMs: num(event.data, "latency_ms"),
+      });
     }
 
     case "answer.cancelled":
@@ -391,9 +412,19 @@ function applyEvent(state: SessionState, event: ServerEvent): SessionState {
         fromImage: bool(event.data, "from_image"),
       };
       if (base.attachments.some((existing) => existing.id === view.id)) return base;
+      // Pasted while a turn is actively in flight (mid-question, mid-answer):
+      // claim it for that turn immediately. Otherwise it is fresh, unclaimed
+      // material -- pending, exactly like a paste that arrives before any
+      // question has been asked at all -- until the next question.detected
+      // claims it.
+      const openTurnId =
+        base.current !== null && !isTerminal(base.current.phase)
+          ? base.current.turnId
+          : null;
       return {
         ...base,
         attachments: [...base.attachments, view],
+        attachmentsTurnId: openTurnId,
         // A success supersedes whatever the last refusal said.
         lastAttachmentRejection: null,
       };

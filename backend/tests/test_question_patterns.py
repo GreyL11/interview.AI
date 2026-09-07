@@ -237,12 +237,47 @@ def test_a_non_correction_premise_still_accumulates_context():
 # From the "also test" list: the STT path can redeliver or reorder.
 
 
-def test_a_duplicate_final_is_not_concatenated_onto_itself():
+def test_a_duplicate_final_is_dropped_as_a_redelivery():
+    """A redelivered final must not produce a second turn.
+
+    This assertion used to be `repeat.accepted` plus "at least it was not
+    concatenated onto itself". Not doubling up the *text* was never the whole
+    problem: accepting the copy at all opened a second turn, spent a second
+    understanding call and a second answer call, and showed the candidate the
+    same question and the same answer twice. Dropping it is the stronger
+    guarantee, and it subsumes the old one -- text that never reaches
+    extraction cannot double up.
+
+    What makes it a redelivery rather than a repeat is not the text alone;
+    see `QuestionDetector._is_redelivery`. The tests below pin the cases that
+    must still be answered.
+    """
     detector = QuestionDetector()
     first = detector.inspect("What is caching?", now=100.0)
     repeat = detector.inspect("What is caching?", now=100.3)
 
-    assert repeat.accepted
+    assert first.accepted
+    assert not repeat.accepted
+    assert repeat.detail == "duplicate_redelivery"
+    assert not repeat.supersedes
+
+
+def test_a_late_redelivery_is_still_not_concatenated_onto_itself():
+    """The second line of defence, on a path that is still reachable.
+
+    An imperative-task accept keeps its merge window open for
+    `question_context_window_ms`, which outlives the redelivery window -- so
+    a copy arriving three seconds later is past "this is a redelivery" and
+    into "this could be the closing clause of the coding problem". It is
+    neither, and `_is_repeat_of_tail` is what keeps it from being spliced
+    onto itself into "Write a function to reverse a string Write a function
+    to reverse a string".
+    """
+    detector = QuestionDetector()
+    first = detector.inspect("Write a function to reverse a string", now=100.0)
+    repeat = detector.inspect("Write a function to reverse a string", now=103.0)
+
+    assert repeat.accepted, "past the redelivery window this is ordinary speech"
     assert not repeat.supersedes
     assert repeat.text == first.text, "a redelivered final must not double up"
 

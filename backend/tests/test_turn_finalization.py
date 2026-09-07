@@ -15,6 +15,8 @@ the *decision* to hold is asserted at the detector level, the *consequence*
 (one provider call, not two) at the session level.
 """
 
+import asyncio
+
 import pytest
 
 from app.core.config import settings
@@ -344,3 +346,47 @@ async def test_a_followup_is_answered_without_waiting(harness):
     assert len(result.of(EventType.ANSWER_COMPLETED)) == 2
     assert harness.live._pending_ask is None
     assert result.detected_questions()[-1] == "Why?"
+
+
+# --------------------------------------------------- the hold boundary itself
+# Characterization, not a correctness claim. When the gap between a fragment
+# and its continuation equals the hold exactly, the hold's expiry and the
+# arrival of the continuation are two events with no defined order, so both
+# outcomes are legal: the pair merges into one question, or the fragment is
+# answered and the continuation becomes its own question. Deliberately not
+# forced either way -- pinning it would mean making the scheduler
+# deterministic at a boundary no interviewer can hit on purpose.
+#
+# What is *not* negotiable is asserted instead: whichever way the race falls,
+# no question is answered twice and nothing the interviewer said is lost.
+
+
+@asyncio_test
+@pytest.mark.parametrize("attempt", range(6))
+async def test_the_hold_boundary_never_costs_a_duplicate_answer(monkeypatch, attempt):
+    hold_ms = 30
+    h = ReplayHarness(monkeypatch=monkeypatch, stabilization_ms=hold_ms)
+    try:
+        await h.live.on_transcript(
+            "How would you design a distributed",
+            TranscriptSource.LOOPBACK, is_final=True, now=100.0,
+        )
+        # Exactly the hold, on the real clock the pending task sleeps against.
+        await asyncio.sleep(hold_ms / 1000)
+        await h.live.on_transcript(
+            "system that processes millions of events per second?",
+            TranscriptSource.LOOPBACK, is_final=True, now=100.0 + hold_ms / 1000,
+        )
+        await h.settle()
+
+        detected = h.result.detected_questions()
+        completed = h.result.completed_turn_ids()
+        assert len(detected) in (1, 2), detected
+        assert len(completed) == len(set(completed)), "a turn answered twice"
+        assert len(completed) <= len(detected)
+        # The continuation reaches an answer either way.
+        answered = " ".join(detected).lower()
+        assert "millions of events per second" in answered
+        assert "distributed" in answered
+    finally:
+        await h.close()

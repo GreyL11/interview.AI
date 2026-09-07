@@ -14,7 +14,10 @@ from app.realtime.prompt_detector import (
     REASON_PUNCTUATION,
     PromptMatch,
     is_acknowledgement,
+    is_navigation_chatter,
+    is_referentially_empty,
     has_open_quantity,
+    has_open_premodifier,
     has_placeholder_object,
     REASON_CORRECTION,
     is_correction,
@@ -51,6 +54,18 @@ _DANGLING_WORDS = frozenset({
     "although", "since", "unless", "until", "whether",
     "what", "how", "why", "when", "where", "which", "who", "whom", "about",
 })
+
+
+def _identity(text: str) -> str:
+    """What makes two utterances the same utterance.
+
+    Case, internal whitespace and terminal punctuation are all things two
+    passes over the same audio differ on freely -- the documented failure
+    mode of this pipeline is Whisper putting a "." where it earlier put a
+    "?" -- while the *words* are what the interviewer said. So the words are
+    the identity and the rest is noise.
+    """
+    return " ".join(text.lower().split()).rstrip(".!?").strip()
 
 
 def _looks_incomplete(text: str) -> bool:
@@ -122,10 +137,23 @@ def _assess(match: PromptMatch, followup_eligible: bool) -> tuple[Finality, int]
     if match.sparse or _looks_incomplete(match.prompt):
         return Finality.ACCUMULATING, settings.question_hold_incomplete_ms
 
-    # A premise with no request in it yet ("Given an array of integers"), or a
-    # request whose object is still a placeholder ("tell me about a time").
-    # Neither is answerable, so both sit in the provably-incomplete tier.
-    if is_scenario_without_request(match.prompt) or has_placeholder_object(match.prompt):
+    # A premise with no request in it yet ("Given an array of integers"), a
+    # request whose object is still a placeholder ("tell me about a time"),
+    # a noun phrase opened by a determiner and never closed ("a distributed"
+    # -- the noun it modifies, "system", has not arrived yet), or a clause
+    # whose predicate still wants an argument ("Explain how Kafka handles" --
+    # what Kafka handles has not been said). None of the four is answerable,
+    # so all sit in the provably-incomplete tier.
+    #
+    # `open_clause` is the one of the four that cannot be seen by looking at
+    # the last word or counting the words: those clauses are several words
+    # long and end on ordinary content. See `prompt_detector.has_open_clause`.
+    if (
+        is_scenario_without_request(match.prompt)
+        or has_placeholder_object(match.prompt)
+        or has_open_premodifier(match.prompt)
+        or match.open_clause
+    ):
         return Finality.ACCUMULATING, settings.question_hold_incomplete_ms
 
     # A request naming a quantity but not the constraint on it ("find two
@@ -202,6 +230,7 @@ class QuestionDetector:
         coalesce_ms: int | None = None,
         context_window_ms: int | None = None,
         followup_window_ms: int | None = None,
+        redelivery_ms: int | None = None,
     ) -> None:
         self._min_words = min_words if min_words is not None else settings.question_min_words
         self._min_confidence = (
@@ -218,11 +247,19 @@ class QuestionDetector:
             followup_window_ms if followup_window_ms is not None
             else settings.question_followup_window_ms
         )
+        self._redelivery_ms = (
+            redelivery_ms if redelivery_ms is not None
+            else settings.question_redelivery_ms
+        )
         self._last_accepted_at: float | None = None
         self._last_text: str = ""
         #: Which layer accepted the last question -- see the merge-window
         #: comment in `inspect` for why this matters.
         self._last_accept_detail: str | None = None
+        #: A request the interviewer named but did not finish in one
+        #: utterance ("Explain"), kept for the utterance that completes it.
+        #: See `_remember_trigger` / `_resume_from_trigger`.
+        self._pending_trigger: tuple[float, str] | None = None
         #: Interviewer utterances that were not themselves a question, kept
         #: around briefly in case the *next* utterance is the question they
         #: were setting up -- see `_context_prefix` / `_remember_as_context`.
@@ -232,6 +269,7 @@ class QuestionDetector:
         self._last_accepted_at = None
         self._last_text = ""
         self._last_accept_detail = None
+        self._pending_trigger = None
         self._context.clear()
 
     def close_turn(self) -> None:
@@ -253,6 +291,7 @@ class QuestionDetector:
         *,
         buffer_context: bool = True,
         accumulating: bool = False,
+        has_pending_context: bool = False,
     ) -> Detection:
         """Decide whether `text` is worth answering.
 
@@ -267,30 +306,57 @@ class QuestionDetector:
         `buffer_context=False` for anything that isn't live interviewer speech
         (a typed question, the candidate's own mic) so it can neither draw on
         nor pollute either mechanism.
+
+        `has_pending_context` is whether the session is holding material (a
+        paste) the interviewer could be pointing at -- sourced from
+        `LiveSession`'s attachment buffer, which this detector otherwise has
+        no visibility into at all. "Explain this." grounded by a paste of
+        code is exactly as answerable as one grounded by a recent question;
+        only a caller that knows about both can say which apply.
         """
         now = now if now is not None else time.monotonic()
         text = text.strip()
 
-        short = len(text.split()) < self._min_words
-        followup_eligible = short and buffer_context and self._recent_question(now)
-        if short and not followup_eligible:
-            logger.info('question_rejected reason=too_short text="%s"', _preview(text))
-            return Detection(False, text, reason=RejectionReason.TOO_SHORT, detail="too_short")
+        if self._is_redelivery(text, now):
+            log_metric("question_redelivery_dropped", chars=len(text))
+            logger.info(
+                'question_rejected reason=duplicate_redelivery text="%s"', _preview(text)
+            )
+            return Detection(
+                False, text,
+                reason=RejectionReason.NOT_A_QUESTION,
+                detail="duplicate_redelivery",
+            )
 
-        # A follow-on clause spoken right after a question is a correction, not a
-        # new question: "How would you scale this? ... Actually, assume 10k QPS."
-        # A follow-up-bypassed fragment is excluded: merging "Okay." onto the
-        # previous question's own "?" sentence would accept pure filler that
-        # the length gate exists to keep out -- a follow-up must stand on its
-        # own and lean on conversation history instead, never on a merge.
+        short = len(text.split()) < self._min_words
+        # A referential fragment ("Which one?", "Can you?", "Show me.") names
+        # no topic of its own regardless of raw word count -- it leans
+        # entirely on a conversation that must already exist, exactly like a
+        # too-short one does. A genuinely self-contained short request
+        # ("What is Kafka?", "Explain Kafka.", "Use SQL.") names a topic and
+        # is unaffected.
         #
-        # The merge window itself adapts to *why* the last question was
-        # accepted. A punctuation/interrogative accept ("How would you scale
-        # this?") is a complete sentence Whisper terminated on its own, so a
-        # short window is right -- it is a correction if anything follows.
-        # An imperative-task accept with no terminal "?" ("Given an array of
+        # Only applies once Whisper has terminated the utterance ("?" or a
+        # fallback "."): a bare, unpunctuated trigger with nothing after it
+        # yet ("Can you", waiting for "...optimize it?") is not this at all --
+        # it is a fragment the existing accumulation mechanism already holds
+        # for its continuation, and rejecting it here instead would drop it
+        # on the floor rather than let it accumulate.
+        referential = (
+            not short
+            and text.rstrip()[-1:] in ".!?"
+            and is_referentially_empty(text)
+        )
+        needs_context = short or referential
+        grounded = self._recent_question(now) or has_pending_context
+
+        # The merge window adapts to *why* the last question was accepted. A
+        # punctuation/interrogative accept ("How would you scale this?") is a
+        # complete sentence Whisper terminated on its own, so a short window
+        # is right -- it is a correction if anything follows. An
+        # imperative-task accept with no terminal "?" ("Given an array of
         # integers, I want you to find two numbers") is exactly how a coding
-        # problem's setup clause looks *before* its closing condition arrives
+        # problem setup clause looks *before* its closing condition arrives
         # ("...whose sum equals a target value"), and that closing clause is
         # its own VAD-bounded utterance -- a full speech+silence-close cycle
         # away, comfortably longer than the correction window. Reusing the
@@ -300,7 +366,7 @@ class QuestionDetector:
         # `accumulating` overrides both: while a turn is still being held and
         # nothing has been sent, the caller is explicitly waiting for exactly
         # this continuation, so the window has to be at least as wide as the
-        # hold it is waiting out. If it were narrower, the held fragment's
+        # hold it is waiting out. If it were narrower, the held fragment
         # words would be dropped rather than assembled -- the fragment fires
         # or is cancelled, and the continuation arrives as a bare standalone
         # question that has lost everything said before it.
@@ -311,14 +377,11 @@ class QuestionDetector:
         else:
             merge_window_ms = self._coalesce_ms
 
-        combined = text
-        supersedes = False
-        if (
-            not followup_eligible
+        mergeable = (
             # An acknowledgement is not a continuation. Merging "That makes
             # sense." onto the imperative task before it rebuilds that task as
             # a fresh question and pays for a duplicate answer.
-            and not is_acknowledgement(text)
+            not is_acknowledgement(text)
             and self._last_accepted_at is not None
             # Speech-clock monotonicity. A final delivered out of order (a
             # short utterance overtaking a long one) would otherwise produce a
@@ -328,7 +391,50 @@ class QuestionDetector:
             and (now - self._last_accepted_at) * 1000 <= merge_window_ms
             # A redelivered final must not be concatenated onto itself.
             and not self._is_repeat_of_tail(text)
-        ):
+        )
+
+        # A short utterance arriving while a turn is still being assembled is
+        # that turn next piece, not a follow-up to it. A follow-up leans on an
+        # answer the candidate has just read; a held turn has produced no
+        # answer to lean on, so reading "partitions?" as a follow-up to a held
+        # "Explain how Kafka handles" both loses every word of the fragment
+        # and asks the model a question with no subject in it. Granted only
+        # when the merge would actually happen, so the word floor still holds
+        # for a short utterance with nothing to attach to.
+        continuation = accumulating and buffer_context and mergeable
+        followup_eligible = (
+            needs_context and buffer_context and grounded and not continuation
+        )
+        if needs_context and not followup_eligible and not continuation:
+            reason_detail = "too_short" if short else "no_referent"
+            # Rejected, but not necessarily discardable. "Explain" is below
+            # the word floor and leans on nothing, yet it is unmistakably the
+            # start of a request -- and the utterance that finishes it
+            # ("Kafka replication.") names no request of its own, so without
+            # keeping the opener both halves were rejected and the question
+            # was lost outright. Remembered here rather than through
+            # `_remember_as_context`, which only enriches a prompt that was
+            # detected some other way and so could never have rescued this.
+            if buffer_context:
+                self._remember_trigger(text, now)
+            logger.info(
+                'question_rejected reason=%s text="%s"', reason_detail, _preview(text)
+            )
+            return Detection(
+                False, text, reason=RejectionReason.TOO_SHORT, detail=reason_detail
+            )
+
+        # A follow-on clause spoken right after a question is a correction, not
+        # a new question: "How would you scale this? ... Actually, assume 10k
+        # QPS." A follow-up-bypassed fragment is excluded: merging "Okay." onto
+        # the previous question own "?" sentence would accept pure filler that
+        # the length gate exists to keep out -- a follow-up must stand on its
+        # own and lean on conversation history instead, never on a merge. Both
+        # the window and the eligibility were decided above, beside the length
+        # gate that now depends on them.
+        combined = text
+        supersedes = False
+        if mergeable and not followup_eligible:
             combined = f"{self._last_text} {text}".strip()
             supersedes = True
 
@@ -338,6 +444,16 @@ class QuestionDetector:
         may_remember = buffer_context and not followup_eligible
 
         match = extract_interview_prompt(combined)
+        if match is None and buffer_context:
+            # Nothing here is a request on its own. If the interviewer named
+            # one in an earlier utterance that was too short to accept, this
+            # may be its object -- try the two together before giving up.
+            # Strictly a fallback: an utterance that is a request by itself
+            # never reaches this, so a real question can never be rewritten
+            # by an older fragment.
+            resumed = self._resume_from_trigger(combined, now)
+            if resumed is not None:
+                combined, match = resumed
         # Stray STT punctuation ("?? -- ...") ends in "?" and so reads as a
         # punctuation-terminated question, and merging it onto a real question
         # puts it last, where the sentence scanner prefers it. Requiring one
@@ -369,6 +485,7 @@ class QuestionDetector:
                 self._last_accepted_at = now
                 self._last_text = text
                 self._last_accept_detail = REASON_CORRECTION
+                self._pending_trigger = None
                 log_metric("question_correction_detected", chars=len(text))
                 logger.info(
                     'question_detected reason=%s text="%s"',
@@ -451,6 +568,9 @@ class QuestionDetector:
         # Coalescing works on raw speech; the cleaned prompt is what coaching sees.
         self._last_text = combined
         self._last_accept_detail = match.reason
+        # Consumed, or irrelevant now that a whole question has landed either
+        # way: an opener must never reach across a completed turn.
+        self._pending_trigger = None
 
         detail = match.reason
         if followup_eligible:
@@ -487,6 +607,84 @@ class QuestionDetector:
             hold_ms=hold_ms,
             explicit_closure=match.reason == REASON_PUNCTUATION,
         )
+
+    def _is_redelivery(self, text: str, now: float) -> bool:
+        """Is this the utterance that was *just* accepted, delivered twice?
+
+        Three conditions, not one. Identical text alone means nothing -- an
+        interviewer may legitimately re-ask a question later in the session,
+        or ask the same thing again after a topic switch, and both must be
+        answered. What makes this a redelivery is that the identical text
+        arrives while the turn it opened is still the live one, inside a
+        window far shorter than the gap between two spoken questions:
+
+          * the text matches the currently-live accepted turn exactly, on
+            normalised whitespace and case (so punctuation drift between two
+            passes over the same audio does not defeat it),
+          * a question has actually been accepted for it to be a copy of,
+          * and it lands within `question_redelivery_ms` of that acceptance.
+
+        Deliberately compared against the *accepted* turn rather than the
+        previous delivery, so a burst of copies is measured from the one real
+        question and cannot extend its own window indefinitely.
+        """
+        if not self._last_text or self._last_accepted_at is None:
+            return False
+        elapsed_ms = (now - self._last_accepted_at) * 1000
+        if not 0 <= elapsed_ms <= self._redelivery_ms:
+            return False
+        incoming = _identity(text)
+        return bool(incoming) and incoming == _identity(self._last_text)
+
+    def _remember_trigger(self, text: str, now: float) -> None:
+        """Keep a request the interviewer named but did not finish.
+
+        Narrow on purpose -- "Only legitimate task/opening fragments should be
+        retained", not every rejected utterance. The test is the one the
+        module already uses for "this is the start of a request": pattern
+        extraction matches it, and the match is `sparse`, meaning the trigger
+        phrase is the whole of what was said. That accepts "Explain",
+        "Optimize", "Show"; it rejects acknowledgements and navigation
+        (extraction returns None for both), and it rejects a referential
+        fragment like "Which one?" (extraction matches on punctuation, not on
+        a bare trigger, so it is not sparse).
+        """
+        match = extract_interview_prompt(text)
+        if match is None or not match.sparse or match.reason == REASON_PUNCTUATION:
+            return
+        if not _WORD.search(text):
+            return
+        self._pending_trigger = (now, text)
+        log_metric("question_trigger_held", chars=len(text))
+
+    def _resume_from_trigger(self, text: str, now: float) -> tuple[str, PromptMatch] | None:
+        """Join a held opener onto the utterance that finishes it.
+
+        Bounded by the same window as the setup-context buffer: an opener is
+        setup, and setup that is half a minute old belongs to a different
+        question. Returns the joined text and its match, so the accepted
+        question is the interviewer's own words in the order they said them
+        -- the same thing the ordinary merge path produces for a fragment
+        that *was* long enough to accept.
+        """
+        if self._pending_trigger is None:
+            return None
+        held_at, trigger = self._pending_trigger
+        if not 0 <= (now - held_at) * 1000 <= self._context_window_ms:
+            self._pending_trigger = None
+            return None
+        # An acknowledgement or a navigation phrase is not the object of the
+        # held request; joining onto one would manufacture a question out of
+        # "Explain" plus "Okay."
+        if is_acknowledgement(text) or is_navigation_chatter(text) or not _WORD.search(text):
+            return None
+        joined = f"{trigger} {text}".strip()
+        match = extract_interview_prompt(joined)
+        if match is None:
+            return None
+        self._pending_trigger = None
+        log_metric("question_trigger_resumed", chars=len(joined))
+        return joined, match
 
     def _is_repeat_of_tail(self, text: str) -> bool:
         """Is this final a redelivery of what the turn already ends with?

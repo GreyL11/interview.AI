@@ -14,17 +14,19 @@ import asyncio
 
 import pytest
 
-from app.core.config import settings
 from app.llm.base import LLMError, LLMErrorKind
-from app.llm.groq_client import GroqClient, GroqConfigError, validate_model
+from app.llm.groq_client import GroqClient
+from app.llm.registry import ProviderConfig, ProviderConfigError, build_client, validate_model
 
 
 @pytest.fixture
-def groq(monkeypatch):
+def groq() -> GroqClient:
     """A client with a key, so `_ensure_client` is not the thing being tested."""
-    monkeypatch.setattr(settings, "groq_api_key", "TEST_KEY_DO_NOT_LEAK")
-    monkeypatch.setattr(settings, "groq_model", "openai/gpt-oss-120b")
-    return GroqClient()
+    return GroqClient(
+        ProviderConfig(
+            provider="groq", model="openai/gpt-oss-120b", api_key="TEST_KEY_DO_NOT_LEAK"
+        )
+    )
 
 
 # --------------------------------------------------------------- SDK shapes
@@ -143,30 +145,32 @@ def test_transient_failures_are_not_marked_deterministic(kind):
 
 def test_every_kind_produces_an_actionable_sentence():
     """No kind may fall through to a vague "request failed" -- that is the
-    message this work existed to eliminate."""
-    from app.llm.groq_client import _MESSAGES
+    message this work existed to eliminate. Shared across every provider; see
+    app.llm.messages."""
+    from app.llm.messages import _TEMPLATES
 
     for kind in LLMErrorKind:
-        assert kind in _MESSAGES, f"{kind} has no user-facing sentence"
-        assert _MESSAGES[kind].strip()
+        assert kind in _TEMPLATES, f"{kind} has no user-facing sentence"
+        assert _TEMPLATES[kind].strip()
 
 
-def test_a_missing_model_names_the_model_that_is_missing(groq, monkeypatch):
-    monkeypatch.setattr(settings, "groq_model", "some-retired-model")
-    error = groq._as_llm_error(_sdk_error("NotFoundError", 404))
+def test_a_missing_model_names_the_model_that_is_missing():
+    client = GroqClient(
+        ProviderConfig(provider="groq", model="some-retired-model", api_key="x")
+    )
+    error = client._as_llm_error(_sdk_error("NotFoundError", 404))
     assert "some-retired-model" in str(error)
 
 
-def test_a_missing_key_says_where_to_put_one(monkeypatch):
-    monkeypatch.setattr(settings, "groq_api_key", "")
-    client = GroqClient()
+def test_a_missing_key_says_where_to_put_one():
+    client = GroqClient(ProviderConfig(provider="groq", model="openai/gpt-oss-120b"))
     with pytest.raises(LLMError) as caught:
         client._ensure_client()
     assert caught.value.kind is LLMErrorKind.NOT_CONFIGURED
     assert "Settings" in str(caught.value)
 
 
-def test_an_error_never_echoes_the_provider_text_or_the_key(groq, monkeypatch):
+def test_an_error_never_echoes_the_provider_text_or_the_key(groq):
     """A provider's error string can quote the request back, key included."""
     exc = _sdk_error("AuthenticationError", 401, message="bad key TEST_KEY_DO_NOT_LEAK")
     rendered = str(groq._as_llm_error(exc))
@@ -210,15 +214,17 @@ def test_a_usable_model_is_accepted_and_trimmed():
 
 @pytest.mark.parametrize("bad", ["", "   ", "two words", "has\ttab", "new\nline"])
 def test_an_unusable_model_is_rejected_at_configuration_time(bad):
-    with pytest.raises(GroqConfigError):
+    with pytest.raises(ProviderConfigError):
         validate_model(bad)
 
 
-def test_the_model_is_read_through_so_a_settings_change_takes_effect(groq, monkeypatch):
-    """PUT /settings can change the model at runtime; a cached copy would keep
-    sending the old one until restart."""
-    monkeypatch.setattr(settings, "groq_model", "llama-3.3-70b-versatile")
-    assert groq.model_name == "llama-3.3-70b-versatile"
+def test_a_new_client_picks_up_whatever_model_it_was_built_with():
+    """PUT /settings rebuilds the client (see app.core.deps cache-clearing) --
+    this client only ever reads the config it was constructed with."""
+    client = GroqClient(
+        ProviderConfig(provider="groq", model="llama-3.3-70b-versatile", api_key="x")
+    )
+    assert client.model_name == "llama-3.3-70b-versatile"
 
 
 # --------------------------------------------------------------- streaming
@@ -412,16 +418,14 @@ async def test_a_fenced_json_payload_is_still_accepted(groq):
 # ------------------------------------------------------------- composition
 
 
-def test_the_only_provider_is_groq():
-    """Regression guard for the Gemini removal: the factory builds one client
-    and it is this one."""
-    from app.llm.groq_client import build_llm_client
-
-    assert build_llm_client().provider_name == "groq"
+def test_the_registry_builds_a_groq_client_for_the_groq_provider():
+    client = build_client(ProviderConfig(provider="groq", model="openai/gpt-oss-120b"))
+    assert isinstance(client, GroqClient)
+    assert client.provider_name == "groq"
 
 
-def test_construction_never_raises_without_a_key(monkeypatch):
+def test_construction_never_raises_without_a_key():
     """The app must still start, transcribe and serve documents with no key;
     only answering should fail."""
-    monkeypatch.setattr(settings, "groq_api_key", "")
-    assert GroqClient().configured is False
+    client = GroqClient(ProviderConfig(provider="groq", model="openai/gpt-oss-120b", api_key=""))
+    assert client.configured is False

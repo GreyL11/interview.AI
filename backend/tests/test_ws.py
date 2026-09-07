@@ -190,11 +190,12 @@ def test_socket_survives_a_missing_provider_key(database, retriever, monkeypatch
     start, transcribe, and record without one; only answers should fail."""
     from app.core.config import settings as app_settings
     from app.llm.groq_client import GroqClient
+    from app.llm.registry import ProviderConfig
 
     monkeypatch.setattr(app_settings, "groq_api_key", "")
 
     repo = SessionRepository(database)
-    real_client = GroqClient()  # must not raise
+    real_client = GroqClient(ProviderConfig(provider="groq", model="openai/gpt-oss-120b"))  # must not raise
     monkeypatch.setattr(deps, "get_session_repository", lambda: repo)
     monkeypatch.setattr(deps, "get_retriever", lambda: retriever)
     monkeypatch.setattr(deps, "get_llm_client", lambda: real_client)

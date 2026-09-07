@@ -178,13 +178,56 @@ export function SetupScreen() {
             control={<StatusBadge label="Unknown" tone="idle" />}
           />
         )}
-        <ProviderKeyRow
-          provider="groq"
-          label={providerLabel("groq")}
-          configured={settings.groq_key_configured}
-          secureStorage={settings.secure_storage_available}
-          onChanged={refresh}
+        {providers.map((provider) => (
+          <ProviderKeyRow
+            key={provider.name}
+            provider={provider.name}
+            label={providerLabel(provider.name)}
+            configured={provider.configured}
+            secureStorage={settings.secure_storage_available}
+            onChanged={refresh}
+          />
+        ))}
+        <LlmConfigRow
+          title="Answer generation"
+          providerValue={settings.llm_provider}
+          modelValue={settings.llm_model}
+          baseUrlValue={settings.llm_base_url}
+          showBaseUrl
+          onSave={(update) =>
+            save(
+              {
+                llm_provider: update.provider,
+                llm_model: update.model,
+                llm_base_url: update.base_url,
+              },
+              "Answer generation provider updated.",
+            )
+          }
         />
+        <LlmConfigRow
+          title="Question understanding"
+          hint="Leave blank to use the same provider and model as answer generation."
+          providerValue={settings.question_understanding_provider}
+          modelValue={settings.question_understanding_model}
+          providerPlaceholder={`Same as answer generation (${settings.llm_provider})`}
+          modelPlaceholder={`Same as answer generation (${settings.llm_model})`}
+          onSave={(update) =>
+            save(
+              {
+                question_understanding_provider: update.provider,
+                question_understanding_model: update.model,
+              },
+              "Question understanding provider updated.",
+            )
+          }
+        />
+        <datalist id="llm-known-providers">
+          <option value="groq" />
+          <option value="openai" />
+          <option value="openai_compatible" />
+          <option value="omnirouter" />
+        </datalist>
       </SettingsSection>
 
       <SettingsSection
@@ -480,6 +523,113 @@ function ProviderKeyRow({
           {failure}
         </p>
       )}
+    </SettingsRow>
+  );
+}
+
+/**
+ * Provider + model (+ base URL) for one stage of the pipeline -- answer
+ * generation or question understanding. Both fields are just text: any
+ * provider `app.llm.registry` knows and any model identifier the provider
+ * accepts, including one this build has never heard of (GPT-5.6 Terra,
+ * GPT-5.6 Luna, or whatever ships after them). The datalist is a hint, not a
+ * restriction -- see `#llm-known-providers` above.
+ */
+function LlmConfigRow({
+  title,
+  hint,
+  providerValue,
+  modelValue,
+  baseUrlValue = "",
+  providerPlaceholder,
+  modelPlaceholder,
+  showBaseUrl = false,
+  onSave,
+}: {
+  title: string;
+  hint?: string;
+  providerValue: string;
+  modelValue: string;
+  baseUrlValue?: string;
+  providerPlaceholder?: string;
+  modelPlaceholder?: string;
+  showBaseUrl?: boolean;
+  onSave: (update: {
+    provider?: string;
+    model?: string;
+    base_url?: string;
+  }) => Promise<void>;
+}) {
+  const [provider, setProvider] = useState(providerValue);
+  const [modelField, setModelField] = useState(modelValue);
+  const [baseUrl, setBaseUrl] = useState(baseUrlValue);
+  const [busy, setBusy] = useState(false);
+
+  // The engine is the source of truth: a save elsewhere (or a stale value
+  // from before this screen loaded) must be reflected here too.
+  useEffect(() => setProvider(providerValue), [providerValue]);
+  useEffect(() => setModelField(modelValue), [modelValue]);
+  useEffect(() => setBaseUrl(baseUrlValue), [baseUrlValue]);
+
+  const dirty =
+    provider !== providerValue ||
+    modelField !== modelValue ||
+    (showBaseUrl && baseUrl !== baseUrlValue);
+
+  const apply = async () => {
+    setBusy(true);
+    try {
+      // `save` (the caller) already reports failure at the page level, so
+      // nothing here needs its own error state.
+      await onSave({
+        provider: provider !== providerValue ? provider : undefined,
+        model: modelField !== modelValue ? modelField : undefined,
+        base_url: showBaseUrl && baseUrl !== baseUrlValue ? baseUrl : undefined,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const providerFieldId = `${title}-provider`.replace(/\s+/g, "-").toLowerCase();
+
+  return (
+    <SettingsRow label={title} hint={hint}>
+      <div className="settings-key">
+        <label className="visually-hidden" htmlFor={providerFieldId}>
+          {`${title} provider`}
+        </label>
+        <input
+          id={providerFieldId}
+          list="llm-known-providers"
+          placeholder={providerPlaceholder ?? "groq"}
+          disabled={busy}
+          value={provider}
+          onChange={(changeEvent) => setProvider(changeEvent.target.value)}
+        />
+        <label className="visually-hidden" htmlFor={`${providerFieldId}-model`}>
+          {`${title} model`}
+        </label>
+        <input
+          id={`${providerFieldId}-model`}
+          placeholder={modelPlaceholder ?? "model identifier"}
+          disabled={busy}
+          value={modelField}
+          onChange={(changeEvent) => setModelField(changeEvent.target.value)}
+        />
+        {showBaseUrl && (
+          <input
+            aria-label={`${title} base URL`}
+            placeholder="Base URL (only for openai_compatible / omnirouter)"
+            disabled={busy}
+            value={baseUrl}
+            onChange={(changeEvent) => setBaseUrl(changeEvent.target.value)}
+          />
+        )}
+        <button disabled={!dirty || busy} onClick={() => void apply()}>
+          {busy ? "Saving…" : "Save"}
+        </button>
+      </div>
     </SettingsRow>
   );
 }

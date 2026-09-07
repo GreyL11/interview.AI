@@ -39,10 +39,11 @@ async def ready() -> dict[str, object]:
     """Startup detail for the shell's first screen: what is configured and what
     still needs the user's attention."""
     from app.audio.devices import audio_available
+    from app.core.deps import api_key_for
 
     return {
         "status": "ready",
-        "groq_configured": bool(settings.groq_api_key),
+        "llm_configured": bool(api_key_for(settings.llm_provider)),
         "audio_available": audio_available(),
         "data_dir": str(settings.data_dir),
     }

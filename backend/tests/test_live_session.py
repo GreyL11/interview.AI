@@ -5,6 +5,8 @@ import uuid
 import pytest
 
 from app.documents.schemas import KnowledgeType, utcnow
+from app.llm.base import LLMErrorKind
+from app.llm.messages import GENERIC_PROVIDER_NAME, message_for
 from app.memory.session_memory import InMemorySessionMemory
 from app.realtime.events import CancelReason, EventType
 from app.realtime.session import LiveSession
@@ -608,7 +610,18 @@ async def test_llm_failure_emits_answer_error(sessions, session_id, retriever):
 
     errors = collector.of(EventType.ANSWER_ERROR)
     assert errors
-    assert "exploded" in errors[0].data["message"]
+    # This used to assert the provider's own words reached the client
+    # ("exploded", from BrokenLLM's message). That is the thing the error
+    # boundary now stops: an exception message that was not built by
+    # `app.llm.messages` is not shown, because a provider's error string can
+    # echo the request -- key included -- back at whoever reads it. What the
+    # client gets instead is the correct user-facing sentence for the failure
+    # the provider itself classified. See tests/test_error_boundary.py.
+    assert "exploded" not in errors[0].data["message"]
+    assert errors[0].data["message"] == message_for(
+        LLMErrorKind.UNKNOWN, GENERIC_PROVIDER_NAME
+    )
+    assert errors[0].data["code"] == "LLMError"
     assert sessions.get_turns(session_id)[0].status == TurnStatus.FAILED
 
 
