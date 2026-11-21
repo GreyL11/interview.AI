@@ -1,8 +1,22 @@
 import pytest
 from fastapi.testclient import TestClient
 
+import tempfile
+from pathlib import Path
+
 from app.core.config import Settings, settings as _settings
-from app.core.secrets import InMemorySecretStore, set_secret_store
+
+# The rotating log is installed by the first get_logger() call, under
+# settings.logs_dir. Pointed at a throwaway folder before anything logs, so a
+# test run never writes mock models, fake CUDA failures and scripted metrics
+# into the developer's real call-assistant.log -- where they had been pushing
+# real sessions out of the rotation and masquerading as field data.
+_settings.data_dir = Path(tempfile.mkdtemp(prefix="call-assistant-tests-"))
+from app.core.logging import get_logger  # noqa: E402
+
+get_logger("tests")
+
+from app.core.secrets import InMemorySecretStore, set_secret_store  # noqa: E402
 
 # Tests assert against the code's own defaults, so they must not inherit the
 # developer's .env -- otherwise a stale local value (an old STT priority, a

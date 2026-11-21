@@ -357,6 +357,19 @@ def _refresh_engine() -> None:
     get_question_understander.cache_clear()
     get_summarizer.cache_clear()
 
+    # Sessions captured their clients at construction. Without this, fixing a
+    # rejected key only helped the *next* session: the open interview kept
+    # answering with the old key until the app was restarted. Same atomic
+    # swap -- an answer already streaming finishes on the client it started
+    # with; the next question uses the new one.
+    from app.realtime.manager import session_manager
+
+    session_manager.refresh_providers(
+        llm=get_llm_client(),
+        understander=get_question_understander(),
+        summarizer=get_summarizer(),
+    )
+
 
 @router.put("/providers/{provider}/key", response_model=ProviderKeyResult)
 async def set_provider_key(provider: str, update: ProviderKeyUpdate) -> ProviderKeyResult:

@@ -764,6 +764,14 @@ class LiveSession:
             )
         )
 
+    def refresh_providers(self, *, llm, understander, summarizer) -> None:
+        """Swap in clients rebuilt after a key/provider change. Plain
+        reassignment: an in-flight answer keeps the reference it holds."""
+        self._llm = llm
+        self._understander = understander
+        self._summarizer = summarizer
+        log_metric("session_providers_refreshed", session_id=self.session_id)
+
     async def cancel(self, reason: CancelReason = CancelReason.USER_STOP) -> None:
         async with self._lock:
             await self._cancel_current(reason)

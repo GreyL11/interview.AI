@@ -16,6 +16,7 @@ from app.stt.scheduler import (
     WARMUP_PRIORITY,
     InferenceJob,
     InferenceScheduler,
+    priority_for,
     shared_scheduler,
 )
 from app.stt.vad import FRAME_MS, SegmentEvent, Segmenter, SpeechDetector
@@ -150,6 +151,7 @@ class TranscriptionWorker:
         self._source.start()
         self._scheduler.acquire()
         self._acquired = True
+        self._scheduler.register_channel(self._source.channel, self._segmenter)
         try:
             self._thread = threading.Thread(
                 target=self._run, name=f"stt-{self._source.channel.value}", daemon=True
@@ -159,6 +161,7 @@ class TranscriptionWorker:
             # Never leave a reference behind on a worker that never ran, or the
             # scheduler's threads outlive every session that used them.
             self._acquired = False
+            self._scheduler.unregister_channel(self._source.channel, self._segmenter)
             self._scheduler.release()
             raise
         if self._source.channel == AudioChannel.LOOPBACK:
@@ -206,6 +209,7 @@ class TranscriptionWorker:
         for job in finals:
             job.wait(timeout=timeout)
 
+        self._scheduler.unregister_channel(self._source.channel, self._segmenter)
         if self._acquired:
             self._acquired = False
             self._scheduler.release(timeout=timeout)
@@ -543,7 +547,10 @@ class TranscriptionWorker:
         Still inert until a partial has actually been timed -- one unguarded
         partial per session is the price of having something to measure.
         """
-        measured = self._last_partial_inference_ms
+        # Any channel's measurement will do: both channels share one model, so
+        # a partial costs the same whichever channel asks for it. That also
+        # closes the "first partial per channel is unguarded" gap.
+        measured = max(self._last_partial_inference_ms, self._scheduler.last_partial_ms)
         # A partial that runs in less than one audio frame cannot meaningfully
         # delay anything, so there is nothing to protect the final from. The
         # floor also keeps the guard from firing at the very end of the silence
@@ -552,7 +559,20 @@ class TranscriptionWorker:
         if measured < FRAME_MS:
             return False  # nothing measured yet, or too cheap to matter
         remaining = max(0, settings.vad_silence_ms - self._segmenter.silence_run_ms)
-        return measured >= remaining
+        if measured >= remaining:
+            return True
+        # Another channel's open utterance counts too, when its final outranks
+        # this partial: a mic partial must not hold the model while the
+        # interviewer's final is about to be submitted.
+        my_priority = priority_for(self._source.channel, is_final=False)
+        for channel, segmenter in self._scheduler.open_utterances():
+            if channel == self._source.channel or not segmenter.in_speech:
+                continue
+            if priority_for(channel, is_final=True) >= my_priority:
+                continue
+            if measured >= max(0, settings.vad_silence_ms - segmenter.silence_run_ms):
+                return True
+        return False
 
     def _submit_partial_locked(self, utterance_id: int, audio: np.ndarray) -> None:
         if self._stopping:
@@ -677,6 +697,7 @@ class TranscriptionWorker:
         finally:
             if not is_final:
                 self._last_partial_inference_ms = (time.monotonic() - started) * 1000
+                self._scheduler.last_partial_ms = self._last_partial_inference_ms
                 self._finish_partial(utterance_id)
 
         completed = time.monotonic()

@@ -12,7 +12,7 @@ from app.sessions.schemas import TranscriptSource
 from app.stt.base import SttError, Transcript
 from app.stt.pipeline import AudioPipeline, TranscriptionWorker
 from app.stt.scheduler import InferenceScheduler
-from app.stt.vad import FRAME_MS
+from app.stt.vad import FRAME_MS, Segmenter
 from tests.fakes import (
     FakeAudioSource,
     FakeSttEngine,
@@ -843,3 +843,53 @@ async def test_a_partial_result_arriving_after_its_final_is_suppressed():
     await asyncio.sleep(0.05)
 
     assert recorder.calls == []
+
+
+async def test_a_second_channel_uses_the_shared_partial_measurement():
+    """Both channels share one model, so the first mic partial is no longer
+    unguarded just because the mic itself has not timed one yet."""
+    loop = asyncio.get_running_loop()
+    engine = FakeSttEngine()
+    mic = _worker(RecordingAudioSource(silence_frames(1), channel=AudioChannel.MIC),
+                  engine, ScriptedSpeechDetector([0.0]), loop)
+    mic._segmenter.in_speech = True
+    mic._scheduler.last_partial_ms = 2092.0  # measured on the loopback channel
+
+    assert mic._final_beats_partial() is True
+
+
+async def test_a_mic_partial_yields_to_an_imminent_interviewer_final():
+    """A partial cheap enough for its own channel must still not start when
+    the interviewer's final -- which outranks it -- is about to be submitted."""
+    loop = asyncio.get_running_loop()
+    engine = FakeSttEngine()
+    mic = _worker(RecordingAudioSource(silence_frames(1), channel=AudioChannel.MIC),
+                  engine, ScriptedSpeechDetector([0.0]), loop)
+    mic._segmenter.in_speech = True
+    mic._last_partial_inference_ms = 300.0  # < the mic's own 550ms budget
+
+    loopback = Segmenter()
+    mic._scheduler.register_channel(AudioChannel.LOOPBACK, loopback)
+    assert mic._final_beats_partial() is False, "interviewer silent: partial is fine"
+
+    loopback.in_speech = True
+    loopback._silence_run = 13  # 416ms into the trailing silence: final ~134ms away
+    assert mic._final_beats_partial() is True
+
+    mic._scheduler.unregister_channel(AudioChannel.LOOPBACK, loopback)
+    assert mic._final_beats_partial() is False
+
+
+async def test_a_loopback_partial_does_not_yield_to_a_lower_priority_mic_final(monkeypatch):
+    loop = asyncio.get_running_loop()
+    # Interviewer partials outrank candidate finals in this configuration.
+    monkeypatch.setattr(settings, "stt_priority_mic_final", 5)
+    worker = _worker(RecordingAudioSource(silence_frames(1)), FakeSttEngine(),
+                     ScriptedSpeechDetector([0.0]), loop)
+    worker._segmenter.in_speech = True
+    worker._last_partial_inference_ms = 300.0
+    mic = Segmenter()
+    mic.in_speech, mic._silence_run = True, 15
+    worker._scheduler.register_channel(AudioChannel.MIC, mic)
+
+    assert worker._final_beats_partial() is False

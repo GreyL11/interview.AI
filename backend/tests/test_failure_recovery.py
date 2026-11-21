@@ -419,3 +419,29 @@ async def test_a_failed_turn_reports_its_outcome(monkeypatch):
         assert outcomes == ["llm_timeout"], outcomes
     finally:
         h.dispose()
+
+
+@asyncio_test
+async def test_fixing_a_rejected_key_recovers_the_open_session(monkeypatch):
+    """Groq rejects the key; the user saves a new one in Settings. The open
+    interview must answer the next question without a restart."""
+    from app.api import settings_api
+    from app.core import deps
+    from app.realtime.manager import session_manager
+
+    h = harness(KindedLLM(LLMErrorKind.AUTH), monkeypatch)
+    await session_manager.register(h.live)
+    try:
+        await say(h, "What is a covering index?", now=100.0)
+        assert phases(h) == [EventType.ANSWER_ERROR]
+
+        fixed = SlowStreamingLLM(chunk_delay=0)
+        monkeypatch.setattr(deps, "build_client", lambda config: fixed)
+        settings_api._refresh_engine()
+        assert h.live._llm is fixed
+
+        await say(h, "What is a hash map?", now=200.0)
+        assert phases(h) == [EventType.ANSWER_ERROR, EventType.ANSWER_COMPLETED]
+    finally:
+        session_manager._sessions.pop(h.live.session_id, None)
+        h.dispose()

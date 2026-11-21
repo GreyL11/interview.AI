@@ -1,5 +1,7 @@
+import json
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -84,6 +86,26 @@ class FasterWhisperEngine(SttEngine):
                 else:
                     raise self._load_failure(device, exc) from exc
 
+            if device == "cuda":
+                # CTranslate2 loads cuBLAS/cuDNN on the first inference, not at
+                # construction, so a GPU with no CUDA runtime builds fine and
+                # only dies later ("cublas64_12.dll is not found"). Prove it
+                # with half a second of silence before reporting it ready.
+                self.active_device = device
+                try:
+                    self._run(self._model, np.zeros(SAMPLE_RATE // 2, dtype=np.float32), False)
+                except Exception as exc:
+                    self._model = None
+                    self.active_device = None
+                    if self._device != "auto":
+                        raise self._load_failure(device, exc) from exc
+                    self._demote_from_cuda("verification", exc)
+                    device, compute_type = "cpu", self._compute_type
+                    try:
+                        self._model = self._build(WhisperModel, device, compute_type)
+                    except Exception as cpu_exc:
+                        raise self._load_failure(device, cpu_exc) from cpu_exc
+
             self.active_device = device
             tracker.ready("stt", device=device)
             logger.info(
@@ -159,6 +181,15 @@ class FasterWhisperEngine(SttEngine):
         if self._device != "auto":
             return self._device, self._compute_type
 
+        remembered = self._remembered_cuda_failure()
+        if remembered:
+            logger.info(
+                "stt_accelerator_selected device=cpu reason=cuda failed on a previous "
+                "launch (%s); delete %s to retry the GPU", remembered, self._cuda_marker,
+            )
+            self._cuda_demoted = True
+            return "cpu", self._compute_type
+
         usable, reason = _cuda_usable()
         if usable:
             logger.info(
@@ -189,7 +220,13 @@ class FasterWhisperEngine(SttEngine):
             return
         started = time.monotonic()
         self._ensure_loaded()
-        self.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), is_final=False)
+        silence = np.zeros(SAMPLE_RATE // 2, dtype=np.float32)
+        self.transcribe(silence, is_final=False)
+        # Finals decode with a beam (and a temperature ladder) that the greedy
+        # partial pass never touches; warm that path too, or the first real
+        # final -- the one that triggers an answer -- pays for it.
+        if settings.stt_beam_size > 1:
+            self.transcribe(silence, is_final=True)
         self._warmed_up = True
         log_metric(
             "stt_warmup_completed",
@@ -264,6 +301,7 @@ class FasterWhisperEngine(SttEngine):
         #                                 help proper nouns ("Kubernetes",
         #                                 "idempotent") but risks biasing short
         #                                 utterances.
+        started = time.monotonic()
         segments, info = model.transcribe(
             audio,
             language=settings.stt_language or None,
@@ -280,7 +318,13 @@ class FasterWhisperEngine(SttEngine):
             ),
             without_timestamps=True,
         )
+        # Segments are lazy: decoding happens while this list is built.
+        segments = list(segments)
         text = " ".join(segment.text.strip() for segment in segments).strip()
+        try:
+            self._log_decode(segments, audio, is_final, started)
+        except Exception as exc:  # diagnostics must never cost a transcript
+            logger.warning("stt_decode_log_failed error=%s: %s", type(exc).__name__, exc)
 
         return Transcript(
             text=text,
@@ -288,6 +332,70 @@ class FasterWhisperEngine(SttEngine):
             language=getattr(info, "language", "en") or "en",
             duration_ms=int(len(audio) / SAMPLE_RATE * 1000),
         )
+
+    def _log_decode(self, segments, audio: np.ndarray, is_final: bool, started: float) -> None:
+        """One line per inference: what Whisper actually decoded and at what
+        cost. Diagnostic only -- it reads attributes the decode already
+        produced, and a missing one is logged as None rather than raised, so
+        it can never cost a transcript."""
+
+        def values(name: str) -> list:
+            return [v for s in segments if (v := getattr(s, name, None)) is not None]
+
+        logprobs, ratios = values("avg_logprob"), values("compression_ratio")
+        temps, no_speech = values("temperature"), values("no_speech_prob")
+        log_metric(
+            "stt_decode",
+            final=is_final,
+            device=self.active_device,
+            threads=resolved_stt_cpu_threads(),
+            beam=settings.stt_beam_size if is_final else 1,
+            audio_ms=int(len(audio) / SAMPLE_RATE * 1000),
+            inference_ms=elapsed_ms(started, time.monotonic()),
+            segments=len(segments),
+            tokens=sum(len(getattr(s, "tokens", None) or ()) for s in segments),
+            # >0 means the retry ladder ran; high ratio / low logprob is the
+            # repetition signature that triggers it.
+            max_temperature=max(temps, default=None),
+            min_avg_logprob=round(min(logprobs), 3) if logprobs else None,
+            max_compression_ratio=round(max(ratios), 2) if ratios else None,
+            max_no_speech_prob=round(max(no_speech), 3) if no_speech else None,
+        )
+
+    # A failed GPU attempt costs a GPU model build, the failing inference and a
+    # CPU rebuild on every launch. Remembered per CTranslate2 version and for
+    # a bounded time, so installing CUDA libraries or upgrading is retried.
+    # ponytail: a week's expiry, not driver/DLL fingerprinting; add that if a
+    # user installs cuBLAS and cannot wait or delete the marker.
+    _CUDA_MARKER_MAX_AGE_S = 7 * 24 * 3600
+
+    @property
+    def _cuda_marker(self) -> Path:
+        return Path(self._download_root) / "cuda_unusable.json"
+
+    def _remembered_cuda_failure(self) -> str | None:
+        try:
+            data = json.loads(self._cuda_marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if (
+            data.get("ctranslate2") != _ctranslate2_version()
+            or time.time() - float(data.get("at", 0)) > self._CUDA_MARKER_MAX_AGE_S
+        ):
+            return None
+        return str(data.get("error", "unknown"))
+
+    def _remember_cuda_failure(self, stage: str, exc: Exception) -> None:
+        try:
+            self._cuda_marker.parent.mkdir(parents=True, exist_ok=True)
+            self._cuda_marker.write_text(json.dumps({
+                "ctranslate2": _ctranslate2_version(),
+                "at": time.time(),
+                "stage": stage,
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            }), encoding="utf-8")
+        except OSError as write_exc:
+            logger.warning("stt_cuda_marker_write_failed error=%s", write_exc)
 
     def _demote_from_cuda(self, stage: str, exc: Exception) -> None:
         """Give up on the GPU for the rest of the process and go to the CPU.
@@ -301,6 +409,7 @@ class FasterWhisperEngine(SttEngine):
         self._cuda_demoted = True
         self._model = None
         self.active_device = None
+        self._remember_cuda_failure(stage, exc)
         logger.warning(
             "stt_cpu_fallback_activated compute=%s reason=cuda_%s_failed",
             self._compute_type, stage,
@@ -368,3 +477,11 @@ def reset_cuda_probe() -> None:
     """Forget the cached probe. Tests use this; nothing in the app does."""
     global _cuda_probe
     _cuda_probe = None
+
+
+def _ctranslate2_version() -> str:
+    try:
+        import ctranslate2
+    except Exception:  # pragma: no cover - packaging guard
+        return ""
+    return str(getattr(ctranslate2, "__version__", ""))

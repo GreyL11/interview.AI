@@ -207,6 +207,32 @@ class InferenceScheduler:
         #: transcript is still auditable afterwards.
         self.dropped_jobs = 0
         self._warned_dropping = False
+        #: Each live channel's segmenter, so one channel's partial can see that
+        #: another channel's final is about to arrive. Inference is not
+        #: preemptible: a mic partial started while the interviewer is
+        #: finishing a sentence holds the one model and the loopback final
+        #: queues behind it for the partial's whole run.
+        self._segmenters: dict = {}
+        #: Most recent partial inference cost on this (shared) model, from any
+        #: channel -- the guard needs a measurement before the first partial
+        #: on a second channel has been timed.
+        self.last_partial_ms = 0.0
+
+    def register_channel(self, channel: AudioChannel, segmenter) -> None:
+        with self._lock:
+            self._segmenters[channel] = segmenter
+
+    def unregister_channel(self, channel: AudioChannel, segmenter) -> None:
+        with self._lock:
+            if self._segmenters.get(channel) is segmenter:
+                del self._segmenters[channel]
+
+    def open_utterances(self) -> list[tuple]:
+        """(channel, segmenter) for every registered channel. Reads of another
+        thread's segmenter are racy by a frame at most, which only nudges a
+        display-only partial decision."""
+        with self._lock:
+            return list(self._segmenters.items())
 
     # ------------------------------------------------------------- lifecycle
 

@@ -22,6 +22,12 @@ class SessionManager:
             self._sessions[session.session_id] = session
         return session
 
+    def refresh_providers(self, *, llm, understander, summarizer) -> None:
+        for session in list(self._sessions.values()):
+            session.refresh_providers(
+                llm=llm, understander=understander, summarizer=summarizer
+            )
+
     def get(self, session_id: str) -> LiveSession | None:
         return self._sessions.get(session_id)
 

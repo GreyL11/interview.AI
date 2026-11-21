@@ -34,6 +34,9 @@ def test_explicit_cuda_configuration_is_passed_to_whisper_model(monkeypatch, tmp
         def __init__(self, *args, **kwargs):
             calls.append((args, kwargs))
 
+        def transcribe(self, audio, **kwargs):  # the load-time GPU check runs one
+            return [], SimpleNamespace(language="en")
+
     monkeypatch.setitem(
         sys.modules,
         "faster_whisper",
@@ -107,7 +110,7 @@ def test_warmup_runs_the_throwaway_inference_pass_only_once(monkeypatch, tmp_pat
             pass
 
         def transcribe(self, audio, **kwargs):
-            transcribe_calls.append(audio)
+            transcribe_calls.append(kwargs["beam_size"])
             return [], SimpleNamespace(language="en")
 
     monkeypatch.setitem(
@@ -125,7 +128,8 @@ def test_warmup_runs_the_throwaway_inference_pass_only_once(monkeypatch, tmp_pat
     engine.warmup()
     engine.warmup()
 
-    assert len(transcribe_calls) == 1
+    # One greedy (partial) pass and one beam (final) pass, the first time only.
+    assert transcribe_calls == [1, settings.stt_beam_size]
 
 
 # ------------------------------------------------- automatic hardware selection
@@ -418,3 +422,115 @@ def test_warmup_survives_a_gpu_that_dies_on_first_inference(monkeypatch, tmp_pat
     engine.warmup()
 
     assert engine.active_device == "cpu"
+
+
+def test_a_gpu_that_fails_its_check_is_never_reported_ready(monkeypatch, tmp_path, caplog):
+    """CUDA must prove itself with a real inference before "ready on cuda"."""
+    import logging
+
+    from app.stt import faster_whisper_engine as engine_module
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(engine_module, "_cuda_usable", lambda: (True, "cuda ready"))
+    _LazyCublasModel.built = []
+    _fake_faster_whisper(monkeypatch, _LazyCublasModel)
+
+    engine = FasterWhisperEngine(model_name="m", device="auto", download_root=str(tmp_path))
+    engine._ensure_loaded()
+
+    assert engine.active_device == "cpu"
+    assert "stt_cuda_init_failed stage=verification" in caplog.text
+    loaded = [r.getMessage() for r in caplog.records if "stt_model_loaded" in r.getMessage()]
+    assert loaded and all("device=cuda" not in m for m in loaded)
+
+
+def test_each_inference_logs_what_was_decoded(monkeypatch, tmp_path, caplog):
+    import logging
+
+    import numpy as np
+
+    caplog.set_level(logging.INFO)
+
+    class Decoded:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def transcribe(self, audio, **kwargs):
+            seg = SimpleNamespace(
+                text="hi", tokens=[1, 2, 3], avg_logprob=-1.234, compression_ratio=2.71,
+                temperature=0.4, no_speech_prob=0.1,
+            )
+            return iter([seg]), SimpleNamespace(language="en")
+
+    _fake_faster_whisper(monkeypatch, Decoded)
+    engine = FasterWhisperEngine(model_name="m", device="cpu", download_root=str(tmp_path))
+    assert engine.transcribe(np.zeros(16000, dtype=np.float32), is_final=True).text == "hi"
+
+    line = next(r.getMessage() for r in caplog.records if "stt_decode " in r.getMessage())
+    for part in ("final=True", "device=cpu", "audio_ms=1000", "tokens=3",
+                 "max_temperature=0.4", "min_avg_logprob=-1.2",
+                 "max_compression_ratio=2.7"):
+        assert part in line, part
+
+
+def test_a_cuda_failure_is_remembered_across_launches(monkeypatch, tmp_path):
+    """The next launch must not pay the failing GPU build + inference again."""
+    from app.stt import faster_whisper_engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_cuda_usable", lambda: (True, "cuda ready"))
+    _LazyCublasModel.built = []
+    _fake_faster_whisper(monkeypatch, _LazyCublasModel)
+
+    first = FasterWhisperEngine(model_name="m", device="auto", download_root=str(tmp_path))
+    first._ensure_loaded()
+    assert (tmp_path / "cuda_unusable.json").exists()
+
+    _LazyCublasModel.built = []
+    second = FasterWhisperEngine(model_name="m", device="auto", download_root=str(tmp_path))
+    second._ensure_loaded()
+    assert _LazyCublasModel.built == [("cpu", "int8")], "GPU not retried"
+    assert second.active_device == "cpu"
+
+
+def test_a_stale_or_foreign_cuda_marker_is_ignored(monkeypatch, tmp_path):
+    import json
+    import time
+
+    from app.stt import faster_whisper_engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_cuda_usable", lambda: (True, "cuda ready"))
+    built = []
+
+    class WorkingGpu:
+        def __init__(self, *args, **kwargs):
+            built.append(kwargs["device"])
+
+        def transcribe(self, audio, **kwargs):
+            return [], SimpleNamespace(language="en")
+
+    _fake_faster_whisper(monkeypatch, WorkingGpu)
+    marker = tmp_path / "cuda_unusable.json"
+
+    marker.write_text(json.dumps({"ctranslate2": "0.0-old", "at": time.time()}))
+    engine = FasterWhisperEngine(model_name="m", device="auto", download_root=str(tmp_path))
+    assert engine._resolve_device()[0] == "cuda", "upgraded CTranslate2 is retried"
+
+    marker.write_text(json.dumps({
+        "ctranslate2": engine_module._ctranslate2_version(), "at": time.time() - 30 * 86400,
+    }))
+    engine = FasterWhisperEngine(model_name="m", device="auto", download_root=str(tmp_path))
+    assert engine._resolve_device()[0] == "cuda", "expired marker is retried"
+
+
+def test_an_explicit_cuda_request_ignores_the_marker(monkeypatch, tmp_path):
+    import json
+    import time
+
+    from app.stt import faster_whisper_engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_cuda_usable", lambda: (True, "cuda ready"))
+    (tmp_path / "cuda_unusable.json").write_text(json.dumps({
+        "ctranslate2": engine_module._ctranslate2_version(), "at": time.time(),
+    }))
+    engine = FasterWhisperEngine(model_name="m", device="cuda", download_root=str(tmp_path))
+    assert engine._resolve_device()[0] == "cuda"
