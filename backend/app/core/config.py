@@ -233,6 +233,11 @@ class Settings(BaseSettings):
     #: `llm_timeout_seconds`: past this the fallback is faster than the
     #: classifier and the interviewer is waiting either way.
     question_understanding_timeout_ms: int = 1500
+    #: With no history and no attachments there is no relationship, context or
+    #: material for the classifier to judge, so its round trip only delays the
+    #: answer. Skipped by default; the deterministic reading is used instead
+    #: (loses only intent/verbosity hints on that first question).
+    question_understanding_skip_without_context: bool = True
     #: Each empty independently means "same as answer generation" -- see
     #: `app.core.deps._understanding_config`. Split only when it is worth the
     #: extra configuration surface: a smaller/faster model on the same

@@ -13,6 +13,11 @@ from app.core.secrets import InMemorySecretStore, set_secret_store
 _pristine = Settings(_env_file=None)
 for _name in type(_pristine).model_fields:
     setattr(_settings, _name, getattr(_pristine, _name))
+# One deliberate exception: most understanding tests drive a first question
+# with no history, which the production default answers without consulting
+# the classifier. They exist to exercise that classifier, so the suite keeps
+# it on; test_understanding_skip.py covers the production default.
+_settings.question_understanding_skip_without_context = False
 
 # The same rule, one layer down, and the one that was missed: the OS credential
 # store is developer state too.

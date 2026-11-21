@@ -196,6 +196,8 @@ class LiveSession:
         self._replay: deque[Event] = deque(maxlen=settings.ws_replay_buffer)
         # Tail of the transcript-persistence chain; see `_persist_transcript`.
         self._transcript_tail: asyncio.Task | None = None
+        # Tail of the cancelled-turn status writes; see `_cancel_current`.
+        self._cancel_write: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._audio = None
 
@@ -765,6 +767,34 @@ class LiveSession:
     async def cancel(self, reason: CancelReason = CancelReason.USER_STOP) -> None:
         async with self._lock:
             await self._cancel_current(reason)
+        # Outside the lock: callers of cancel() still see the turn's final
+        # status persisted on return, but a question asked meanwhile is not
+        # queued behind the write.
+        await self.flush_cancel_writes()
+
+    async def flush_cancel_writes(self) -> None:
+        if self._cancel_write is not None:
+            await asyncio.wait([self._cancel_write])
+
+    def _persist_cancel(self, write, *args) -> None:
+        """Off-lock, ordered status write for a cancelled turn. A superseding
+        ask holds `_lock` while it creates its own turn, so awaiting this
+        SQLite write there put a thread hop -- and any wait on the global
+        write lock, e.g. a document ingesting -- in front of the next answer.
+        Nothing on the answer path waits for it: history reads ANSWERED turns
+        only, and a cancelled turn is PENDING before and CANCELLED/INTERRUPTED
+        after this write -- excluded either way."""
+        prev = self._cancel_write
+
+        async def run() -> None:
+            if prev is not None:
+                await asyncio.wait([prev])
+            try:
+                await asyncio.to_thread(write, *args)
+            except Exception:
+                logger.exception("cancel_persist_failed session=%s", self.session_id)
+
+        self._cancel_write = asyncio.create_task(run())
 
     async def _cancel_current(self, reason: CancelReason) -> None:
         task, turn_id = self._task, self._current_turn_id
@@ -787,7 +817,7 @@ class LiveSession:
         # candidate may have been mid-read when the interviewer moved on.
         # One that produced nothing is just noise in the history.
         if partial.strip():
-            await asyncio.to_thread(self._sessions.interrupt_turn, turn_id, partial)
+            self._persist_cancel(self._sessions.interrupt_turn, turn_id, partial)
             log_metric(
                 "answer_interrupted_with_partial",
                 session_id=self.session_id,
@@ -796,7 +826,7 @@ class LiveSession:
                 answer_partial_chars=len(partial),
             )
         else:
-            await asyncio.to_thread(self._sessions.mark_turn, turn_id, TurnStatus.CANCELLED)
+            self._persist_cancel(self._sessions.mark_turn, turn_id, TurnStatus.CANCELLED)
             log_metric(
                 "answer_cancelled_before_content",
                 session_id=self.session_id,

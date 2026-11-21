@@ -46,3 +46,36 @@ async def test_transcript_write_failure_is_logged_not_raised(
     await live.on_transcript("hello", TranscriptSource.MIC, is_final=True)
     await live.flush_transcripts()
     assert "transcript_persist_failed" in caplog.text
+
+
+async def test_superseding_ask_does_not_wait_for_cancelled_turn_write(
+    sessions, session_id, retriever  # noqa: F811
+):
+    import asyncio
+
+    from tests.fakes import SlowStreamingLLM
+
+    gate = threading.Event()
+    for name in ("mark_turn", "interrupt_turn"):
+        real = getattr(sessions, name)
+
+        def slow(*args, _real=real):
+            gate.wait(2)  # a blocked status write must not hold the next question
+            return _real(*args)
+
+        setattr(sessions, name, slow)
+
+    live = build(sessions, session_id, retriever, SlowStreamingLLM(chunk_delay=0.05))
+    c = Collector()
+    live.subscribe(c)
+
+    first = await live.ask("Explain Docker")
+    await asyncio.sleep(0.01)
+    second = await asyncio.wait_for(live.ask("Explain Kubernetes"), timeout=1)
+    assert [e.turn_id for e in c.of(EventType.ANSWER_CANCELLED)] == [first]
+    assert [e.turn_id for e in c.of(EventType.QUESTION_DETECTED)] == [first, second]
+
+    gate.set()
+    await live.cancel()  # flushes the pending status writes
+    statuses = {t.turn_id: t.status.value for t in sessions.get_turns(session_id)}
+    assert statuses[first] in ("CANCELLED", "INTERRUPTED")

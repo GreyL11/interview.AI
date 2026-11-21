@@ -1,19 +1,27 @@
 """Per-stage latency benchmark for representative interview scenarios.
 
-Exercises the real question-detection, retrieval-routing and
-prompt-construction code with a fake, near-zero-delay LLM, so what it measures
-is application-controlled overhead ONLY. It does not and cannot represent real
-provider network or model latency -- do not read the "first_token_ms" column
-here as a production estimate. For that, run the app and read the
-`question_latency_trace` metric line from the log.
+Exercises the real question-detection, understanding, retrieval-routing,
+prompt-construction and event-emission code with a fake, zero-delay LLM, so
+what it measures is application-controlled overhead ONLY (including the
+detector's real stabilization holds). It does not and cannot represent STT,
+VAD, network or model latency. For those, run the app and read the
+`question_latency_trace` / `latency_percentiles` lines from the log.
+
+Each scenario runs --runs times on a fresh session; stage timings are reported
+as p50/p95/p99/avg/max with perf_counter resolution. Event-loop lag is the
+worst overshoot of a 1 ms heartbeat while the scenario runs.
 
 Usage:
-    venv/Scripts/python.exe scripts/benchmark_pipeline.py
+    venv/Scripts/python.exe scripts/benchmark_pipeline.py [--runs 30]
 """
 
+import argparse
 import asyncio
+import statistics
 import sys
+import tempfile
 import time
+import tracemalloc
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +32,7 @@ from app.core.metrics import LatencyTrace  # noqa: E402
 from app.documents.schemas import utcnow  # noqa: E402
 from app.llm.base import LLMClient  # noqa: E402
 from app.memory.session_memory import InMemorySessionMemory  # noqa: E402
+from app.realtime.events import EventType  # noqa: E402
 from app.realtime.session import LiveSession  # noqa: E402
 from app.retrieval.mock_retriever import MockRetriever  # noqa: E402
 from app.schemas.answer import Answer  # noqa: E402
@@ -62,16 +71,8 @@ SCENARIOS = [
         "Coding question",
         ["Write a program to count how many times each character appears in a string."],
     ),
-    Scenario(
-        "Follow-up",
-        ["Explain caching?", "Why?"],
-        gaps=[2.0],
-    ),
-    Scenario(
-        "Correction",
-        ["Explain Docker...", "No, explain Kubernetes."],
-        gaps=[0.05],
-    ),
+    Scenario("Follow-up", ["Explain caching?", "Why?"], gaps=[2.0]),
+    Scenario("Correction", ["Explain Docker...", "No, explain Kubernetes."], gaps=[0.05]),
     Scenario(
         "Setup + question",
         [
@@ -82,10 +83,25 @@ SCENARIOS = [
     ),
 ]
 
+#: column -> (start mark, end mark) over perf_counter timestamps of the LAST utterance.
+STAGES = {
+    "final->detected": ("final", "detected"),
+    "detected->1st delta": ("detected", "delta"),
+    "final->1st delta": ("final", "delta"),
+}
 
-async def run_scenario(scenario: Scenario) -> dict[str, float | None]:
-    db_path = Path(f"_bench_{uuid.uuid4().hex}.db")
+
+async def _loop_lag(stop: asyncio.Event, out: list[float]) -> None:
+    while not stop.is_set():
+        t = time.perf_counter()
+        await asyncio.sleep(0.001)
+        out.append((time.perf_counter() - t) * 1000 - 1.0)
+
+
+async def run_once(scenario: Scenario) -> dict[str, float]:
+    db_path = Path(tempfile.gettempdir()) / f"_bench_{uuid.uuid4().hex}.db"
     db = Database(db_path)
+    marks: dict[str, float] = {}
     try:
         sessions = SessionRepository(db)
         session_id = str(uuid.uuid4())
@@ -95,74 +111,79 @@ async def run_scenario(scenario: Scenario) -> dict[str, float | None]:
             llm=InstantLLM(), memory=InMemorySessionMemory(),
         )
 
-        traces: list[dict] = []
-        import app.core.metrics as metrics_module
-        original = metrics_module.log_metric
+        async def on_event(ev) -> None:
+            now = time.perf_counter()
+            if ev.type == EventType.QUESTION_DETECTED:
+                marks["detected"] = now
+            elif ev.type == EventType.ANSWER_DELTA and "delta" not in marks:
+                marks["delta"] = now
 
-        def capture(event, **fields):
-            if event == "question_latency_trace":
-                traces.append(fields)
-            return original(event, **fields)
-
-        metrics_module.log_metric = capture
-        try:
-            for i, text in enumerate(scenario.utterances):
-                now = time.monotonic()
-                # No real STT in this benchmark -- treat "final text is ready"
-                # as the STT-final moment, so question-detection time is still
-                # measured (the actual STT stage is not; see PERFORMANCE.md).
-                trace = LatencyTrace(speech_end_at=now, stt_final_at=now)
-                await live.on_transcript(text, TranscriptSource.LOOPBACK, is_final=True, trace=trace)
-                if live._pending_ask is not None:
-                    await live._pending_ask
-                if live._task is not None:
-                    await asyncio.gather(live._task, return_exceptions=True)
-                if i < len(scenario.gaps):
-                    await asyncio.sleep(scenario.gaps[i])
-        finally:
-            metrics_module.log_metric = original
-
-        if not traces:
-            return {"question_detection_ms": None, "retrieval_ms": None,
-                    "prompt_build_ms": None, "first_token_ms": None, "total_ms": None}
-
-        last = traces[-1]
-        return {
-            "question_detection_ms": last.get("stt_final_to_question_detected_ms"),
-            "retrieval_ms": last.get("retrieval_ms"),
-            "prompt_build_ms": last.get("prompt_build_ms"),
-            "first_token_ms": last.get("llm_request_to_first_text_token_ms"),
-            "total_ms": last.get("total_question_to_first_visible_token_ms"),
-        }
+        live.subscribe(on_event)
+        lag: list[float] = []
+        stop = asyncio.Event()
+        lag_task = asyncio.create_task(_loop_lag(stop, lag))
+        cpu0 = time.process_time()
+        for i, text in enumerate(scenario.utterances):
+            marks.clear()
+            now = time.monotonic()
+            trace = LatencyTrace(speech_end_at=now, stt_final_at=now)
+            marks["final"] = time.perf_counter()
+            await live.on_transcript(text, TranscriptSource.LOOPBACK, is_final=True, trace=trace)
+            if live._pending_ask is not None:
+                await asyncio.gather(live._pending_ask, return_exceptions=True)
+            if live._task is not None:
+                await asyncio.gather(live._task, return_exceptions=True)
+            if i < len(scenario.gaps):
+                await asyncio.sleep(scenario.gaps[i])
+        cpu = (time.process_time() - cpu0) * 1000
+        stop.set()
+        await lag_task
+        await live.close()
     finally:
         db.close()
-        db_path.unlink(missing_ok=True)
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+            except OSError:
+                pass  # ponytail: Windows may still hold a worker-thread handle; temp dir.
+    result = {
+        col: (marks[b] - marks[a]) * 1000
+        for col, (a, b) in STAGES.items() if a in marks and b in marks
+    }
+    result["cpu ms"] = cpu
+    result["loop lag max"] = max(lag, default=0.0)
+    return result
 
 
-def _fmt(value) -> str:
-    return "-" if value is None else f"{value}ms"
+def _summary(values: list[float]) -> str:
+    if not values:
+        return "-"
+    if len(values) < 2:
+        return f"{values[0]:.2f}"
+    q = statistics.quantiles(values, n=100, method="inclusive")
+    return (f"p50 {q[49]:7.2f}  p95 {q[94]:7.2f}  p99 {q[98]:7.2f}  "
+            f"avg {statistics.fmean(values):7.2f}  max {max(values):7.2f}")
 
 
-async def run_mocked_benchmark() -> None:
-    print(
-        "\nMOCKED benchmark -- application overhead only "
-        "(near-zero-delay fake LLM, no network). Not a provider latency estimate.\n"
-    )
-    header = f"{'Scenario':<24} {'Detection':>10} {'Retrieval':>10} {'Prompt':>8} {'1st Token':>10} {'Total':>8}"
-    print(header)
-    print("-" * len(header))
+async def main(runs: int) -> None:
+    print(f"\nMOCKED benchmark, {runs} runs/scenario -- application overhead only "
+          "(zero-delay fake LLM, no STT/network). Times in ms.\n")
     for scenario in SCENARIOS:
-        result = await run_scenario(scenario)
-        print(
-            f"{scenario.name:<24} {_fmt(result['question_detection_ms']):>10} "
-            f"{_fmt(result['retrieval_ms']):>10} {_fmt(result['prompt_build_ms']):>8} "
-            f"{_fmt(result['first_token_ms']):>10} {_fmt(result['total_ms']):>8}"
-        )
+        await run_once(scenario)  # warm-up: imports, regex compiles, sqlite
+        samples = [await run_once(scenario) for _ in range(runs)]
+        print(scenario.name)
+        for col in [*STAGES, "cpu ms", "loop lag max"]:
+            print(f"  {col:<20} {_summary([s[col] for s in samples if col in s])}")
 
-
-async def main() -> None:
-    await run_mocked_benchmark()
+    tracemalloc.start()
+    for scenario in SCENARIOS:
+        await run_once(scenario)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f"\nPeak Python heap across one pass of all scenarios: {peak / 1024:.0f} KiB")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runs", type=int, default=30)
+    asyncio.run(main(parser.parse_args().runs))

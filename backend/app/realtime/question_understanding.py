@@ -555,6 +555,23 @@ class QuestionUnderstander:
                 source=UnderstandingSource.DETERMINISTIC,
             )
 
+        if (
+            settings.question_understanding_skip_without_context
+            and not history
+            and not has_attachments
+        ):
+            # Nothing to relate the question to: a whole provider round trip
+            # sat in front of the answer to report "new question".
+            log_metric(
+                "question_understanding_skipped",
+                session_id=session_id, question_id=question_id,
+                reason="no_context",
+            )
+            return deterministic_fallback(
+                question, detail=detail, has_attachments=False,
+                source=UnderstandingSource.DETERMINISTIC,
+            )
+
         prompt = _build_prompt(question, history or [], attachment_summaries or [])
         started = time.monotonic()
         timeout = settings.question_understanding_timeout_ms / 1000
