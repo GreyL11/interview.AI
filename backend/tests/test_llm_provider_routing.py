@@ -32,7 +32,6 @@ _UNDERSTANDING_JSON = json.dumps({
     "task": "explain a fix",
     "constraints": [],
     "requested_output": [],
-    "entities": [],
     "needs_previous_context": False,
     "needs_previous_answer": False,
     "needs_previous_code": False,

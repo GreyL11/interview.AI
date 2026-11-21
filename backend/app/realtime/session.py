@@ -194,6 +194,8 @@ class LiveSession:
         self._background: set[asyncio.Task] = set()
         self._subscribers: set[Emitter] = set()
         self._replay: deque[Event] = deque(maxlen=settings.ws_replay_buffer)
+        # Tail of the transcript-persistence chain; see `_persist_transcript`.
+        self._transcript_tail: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._audio = None
 
@@ -243,14 +245,13 @@ class LiveSession:
         if source == TranscriptSource.LOOPBACK:
             self._speech_in_progress = False
 
-        # Every final transcript reaches here, both channels -- a synchronous
-        # SQLite write directly on the event loop would block every other
-        # coroutine (other sessions' events, the STT queue) for its duration.
-        await asyncio.to_thread(
-            self._sessions.add_transcript,
+        # Persisted off the critical path: nothing on the answer path reads
+        # transcripts back, so the SQLite write (and its writer-lock wait) must
+        # not sit between "final transcript" and question detection.
+        self._persist_transcript(
             TranscriptEntry(
                 session_id=self.session_id, source=source, is_final=True, text=text
-            ),
+            )
         )
         await self.emit(event(EventType.TRANSCRIPT_FINAL, text=text, source=source.value))
 
@@ -260,6 +261,26 @@ class LiveSession:
             return
 
         await self.consider(text, source, trace, now=now)
+
+    def _persist_transcript(self, entry: TranscriptEntry) -> None:
+        """Fire-and-forget write, chained so rows keep arrival order (rows are
+        read back ORDER BY id). Failures are logged, never raised into the
+        pipeline. `close` flushes the chain."""
+        prev = self._transcript_tail
+
+        async def run() -> None:
+            if prev is not None:
+                await asyncio.wait([prev])
+            try:
+                await asyncio.to_thread(self._sessions.add_transcript, entry)
+            except Exception:
+                logger.exception("transcript_persist_failed session=%s", self.session_id)
+
+        self._transcript_tail = asyncio.create_task(run())
+
+    async def flush_transcripts(self) -> None:
+        if self._transcript_tail is not None:
+            await asyncio.wait([self._transcript_tail])
 
     async def on_context_attached(
         self,
@@ -827,7 +848,17 @@ class LiveSession:
             # for "explain the code you wrote" -- so the last snippet this
             # session generated is fetched alongside it, and used only if the
             # understanding layer says the turn refers to it.
-            history, previous_code = await asyncio.to_thread(self._session_context)
+            # Retrieval needs only the route, so it starts now and overlaps
+            # the history read instead of waiting behind it.
+            retrieval_started = time.monotonic()
+            retrieval_task = asyncio.create_task(
+                self._retrieve(route, effective_question, turn_id)
+            )
+            try:
+                history, previous_code = await asyncio.to_thread(self._session_context)
+            except BaseException:
+                retrieval_task.cancel()
+                raise
             history_ms = elapsed_ms(history_started, time.monotonic())
 
             # Then the two genuinely slow, genuinely independent calls run
@@ -853,10 +884,9 @@ class LiveSession:
             # asked about attachments the turn already had, so it could never
             # report that a question refers to material the window excluded,
             # which is the one thing needed to recover it.
-            retrieval_started = time.monotonic()
-            understanding_started = retrieval_started
+            understanding_started = time.monotonic()
             chunks, understanding = await asyncio.gather(
-                self._retrieve(route, effective_question, turn_id),
+                retrieval_task,
                 self._understander.understand(
                     effective_question,
                     session_id=self.session_id,
@@ -1263,6 +1293,7 @@ class LiveSession:
         await self.cancel(CancelReason.SESSION_ENDED)
         for task in list(self._background):
             task.cancel()
+        await self.flush_transcripts()
         await asyncio.to_thread(self._sessions.end, self.session_id)
         turn_count = await asyncio.to_thread(self._sessions.get_turns, self.session_id)
         await self.emit(event(

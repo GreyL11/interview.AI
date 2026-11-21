@@ -38,10 +38,15 @@ class FakeCompleter:
         self.delay = delay
         self.error = error
         self.models: list[str] = []
+        self.schemas: list[dict | None] = []
 
-    async def complete_json(self, prompt: str, *, model: str, timeout_seconds: float) -> str:
+    async def complete_json(
+        self, prompt: str, *, model: str, timeout_seconds: float,
+        schema: dict | None = None,
+    ) -> str:
         self.prompts.append(prompt)
         self.models.append(model)
+        self.schemas.append(schema)
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error is not None:
@@ -64,8 +69,7 @@ def payload(**overrides) -> str:
         "task": "explain it",
         "constraints": [],
         "requested_output": ["explanation"],
-        "entities": [],
-        "needs_previous_context": False,
+            "needs_previous_context": False,
         "needs_previous_answer": False,
         "needs_previous_code": False,
         "needs_attachments": False,
@@ -126,17 +130,33 @@ async def test_every_request_shape_round_trips(question, intent):
 
 
 @asyncio_test
+async def test_the_classifier_is_constrained_to_the_closed_vocabularies():
+    """The enums are read off the StrEnums, so a new Intent cannot leave the
+    schema behind -- which is the whole reason it is derived rather than
+    typed out."""
+    completer = FakeCompleter(payload())
+    await run("How do I shard this?", completer)
+
+    sent = completer.schemas[0]
+    assert sent["properties"]["intent"]["enum"] == [i.value for i in Intent]
+    assert sent["properties"]["relationship"]["enum"] == [r.value for r in Relationship]
+    assert sent["additionalProperties"] is False
+    # Strict mode requires every property listed, not just the filled ones.
+    assert sent["required"] == list(sent["properties"])
+
+
+@asyncio_test
 async def test_a_topic_the_app_has_never_seen_still_classifies():
     """Generality check: nothing here matches on subject."""
     question = "How would you shard a Quaxolotl ledger across regions?"
     completer = FakeCompleter(
         payload(intent="system_design", topic="Quaxolotl ledger sharding",
-                domain="distributed systems", entities=["Quaxolotl"])
+                domain="distributed systems")
     )
     understanding = await run(question, completer)
 
     assert understanding.topic == "Quaxolotl ledger sharding"
-    assert understanding.entities == ["Quaxolotl"]
+    assert understanding.domain == "distributed systems"
     assert understanding.exact_question == question
 
 

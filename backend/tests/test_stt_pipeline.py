@@ -1,3 +1,4 @@
+from app.core.config import settings
 import asyncio
 import logging
 import threading
@@ -22,7 +23,7 @@ from tests.fakes import (
 
 pytestmark = pytest.mark.asyncio
 
-SILENCE_TO_END = 700 // FRAME_MS + 2
+SILENCE_TO_END = settings.vad_silence_ms // FRAME_MS + 2
 
 
 class Recorder:
@@ -332,6 +333,67 @@ async def test_final_publishes_with_speech_end_time_not_delivery_time():
     assert received_at - now >= delay / 2
 
 
+async def test_the_trace_reports_how_late_the_vad_noticed_speech_ended():
+    """`speech_end_at` is stamped when the segmenter *noticed* the utterance
+    closed, which is `vad_silence_ms` after the words actually stopped. Without
+    that delay recorded, every latency total this app reports is optimistic by
+    ~700ms and nothing in the log says so."""
+    frames = speech_frames(20) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.9] * 20 + [0.0] * SILENCE_TO_END
+
+    recorder, _ = await run_worker(probabilities, frames)
+
+    finals = [c for c in recorder.raw_calls if c[2]]
+    assert len(finals) == 1
+    trace = finals[0][3]
+    assert trace is not None
+    # The run closes on the first frame at or past the 700ms budget: 22 frames
+    # of 32ms. Asserted exactly, because an off-by-one here would silently
+    # misreport every latency figure downstream.
+    assert trace.vad_close_ms == -(-settings.vad_silence_ms // FRAME_MS) * FRAME_MS
+
+
+async def test_an_utterance_keeps_the_audio_that_preceded_its_detection():
+    """Speech onset ramps through the VAD threshold rather than crossing it
+    cleanly, and `vad_start_frames` more frames are consumed before
+    SPEECH_START is reported at all -- so the clip used to begin partway into
+    the first word, which is where Whisper's leading consonants were going."""
+    class CapturingEngine(FakeSttEngine):
+        def __init__(self):
+            super().__init__()
+            self.audio: list[tuple[np.ndarray, bool]] = []
+
+        def transcribe(self, audio, is_final):
+            self.audio.append((audio.copy(), is_final))
+            return super().transcribe(audio, is_final)
+
+    # Eight frames of real but sub-threshold onset, then full-volume speech.
+    onset = speech_frames(8, amplitude=0.02)
+    frames = onset + speech_frames(20) + silence_frames(SILENCE_TO_END)
+    probabilities = [0.1] * 8 + [0.9] * 20 + [0.0] * SILENCE_TO_END
+    engine = CapturingEngine()
+
+    _, worker = await run_worker(probabilities, frames, engine=engine)
+
+    clips = [audio for audio, is_final in engine.audio if is_final]
+    assert len(clips) == 1
+    clip = clips[0]
+
+    preroll = worker._preroll_frames()
+    assert preroll == 5  # 160ms / 32ms, above the 2-frame start floor
+
+    # SPEECH_START fires on the second loud frame, so without a pre-roll the
+    # clip would begin there. It now begins `preroll - 1` frames earlier.
+    frame_samples = len(frames[0])
+    assert len(clip) == (1 + 18 + -(-settings.vad_silence_ms // FRAME_MS) + (preroll - 1)) * frame_samples
+
+    # The decisive assertion: the recovered lead-in is real onset audio, not
+    # zero padding. Length alone would pass if the buffer were seeded with
+    # silence.
+    recovered = clip[: (preroll - 2) * frame_samples]
+    assert np.abs(recovered).max() > 0.0
+
+
 async def test_slow_partials_are_coalesced_and_final_is_executed():
     frames = speech_frames(100) + silence_frames(SILENCE_TO_END)
     probabilities = [0.9] * 100 + [0.0] * SILENCE_TO_END
@@ -636,9 +698,16 @@ async def test_a_partial_is_not_started_when_the_final_is_provably_closer():
     assert engine.calls == []
 
 
-async def test_a_partial_still_runs_while_speech_is_active():
-    """The guard must be inert during real speech, or live transcript
-    responsiveness is lost for no latency gain."""
+async def test_a_slow_partial_is_skipped_while_speech_is_still_active():
+    """The last unguarded path: a partial started on the final frames of
+    speech.
+
+    This case used to be exempt, on the reasoning that no final was imminent
+    while someone was still talking. But a partial costing more than the whole
+    silence budget is still running when SPEECH_END arrives `vad_silence_ms`
+    later, and the final then queues behind it -- which is the exact shape of
+    the measured 1608ms regression this guard exists to prevent. A partial that
+    slow could not have reached the screen before the final anyway."""
     loop = asyncio.get_running_loop()
     engine = FakeSttEngine()
     worker = _worker(RecordingAudioSource(silence_frames(1)), engine,
@@ -648,7 +717,36 @@ async def test_a_partial_still_runs_while_speech_is_active():
     try:
         worker._segmenter.in_speech = True
         worker._segmenter._silence_run = 0  # still talking
+        # Costs more than the full 700ms silence budget still owed.
         worker._last_partial_inference_ms = 2092.0
+
+        assert worker._final_beats_partial() is True
+        worker._schedule_partial(1, speech_frames(40), buffered_ms=1280)
+
+        assert worker.partials_skipped_near_final == 1
+        assert worker.partials_scheduled == 0
+        assert engine.calls == []
+    finally:
+        scheduler.release()
+
+
+async def test_a_fast_partial_still_runs_while_speech_is_active():
+    """Extending the guard into active speech must not cost a capable machine
+    its live transcript.
+
+    The rule is still a comparison against measured cost, not a ban: a model
+    that turns a partial around well inside the silence budget delays nothing,
+    so it keeps running exactly as before."""
+    loop = asyncio.get_running_loop()
+    engine = FakeSttEngine()
+    worker = _worker(RecordingAudioSource(silence_frames(1)), engine,
+                     ScriptedSpeechDetector([0.0]), loop)
+    scheduler = worker._scheduler
+    scheduler.acquire()
+    try:
+        worker._segmenter.in_speech = True
+        worker._segmenter._silence_run = 0  # still talking
+        worker._last_partial_inference_ms = 120.0  # well inside the 700ms budget
 
         assert worker._final_beats_partial() is False
         worker._schedule_partial(1, speech_frames(40), buffered_ms=1280)

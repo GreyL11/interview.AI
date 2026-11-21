@@ -256,7 +256,7 @@ async def test_a_question_superseded_during_understanding_never_answers(monkeypa
             self.prompts: list[str] = []
             self.cancelled = 0
 
-        async def complete_json(self, prompt, *, model, timeout_seconds):
+        async def complete_json(self, prompt, *, model, timeout_seconds, schema=None):
             self.prompts.append(prompt)
             entered.set()
             try:
@@ -299,7 +299,7 @@ async def test_closing_during_understanding_leaves_nothing_running(monkeypatch):
         def __init__(self) -> None:
             self.cancelled = 0
 
-        async def complete_json(self, prompt, *, model, timeout_seconds):
+        async def complete_json(self, prompt, *, model, timeout_seconds, schema=None):
             entered.set()
             try:
                 await asyncio.Event().wait()

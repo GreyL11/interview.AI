@@ -40,7 +40,10 @@ class CountingCompleter:
         self.delay = delay
         self.error = error
 
-    async def complete_json(self, prompt: str, *, model: str, timeout_seconds: float) -> str:
+    async def complete_json(
+        self, prompt: str, *, model: str, timeout_seconds: float,
+        schema: dict | None = None,
+    ) -> str:
         self.prompts.append(prompt)
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -64,8 +67,7 @@ def reply(**overrides) -> str:
         "task": "explain",
         "constraints": [],
         "requested_output": ["explanation"],
-        "entities": [],
-        "needs_previous_context": False,
+            "needs_previous_context": False,
         "needs_previous_answer": False,
         "needs_previous_code": False,
         "needs_attachments": False,
@@ -597,7 +599,7 @@ async def test_cancellation_is_not_reported_as_an_ordinary_fallback(monkeypatch)
     entered = asyncio.Event()
 
     class Blocking:
-        async def complete_json(self, prompt, *, model, timeout_seconds):
+        async def complete_json(self, prompt, *, model, timeout_seconds, schema=None):
             entered.set()
             await asyncio.Event().wait()   # never resolves; only cancellation ends it
             return reply()

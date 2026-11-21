@@ -27,7 +27,9 @@ import httpx
 
 from app.core.logging import get_logger
 from app.core.metrics import elapsed_ms, log_metric
-from app.llm.base import LLMClient, LLMError, LLMErrorKind
+from app.llm.base import (
+    LLMClient, LLMError, LLMErrorKind, answer_max_tokens, json_response_format, keepalive_limits,
+)
 from app.llm.messages import message_for, missing_endpoint_message
 from app.llm.registry import ProviderConfig, display_name
 from app.llm.streaming import parse_answer_payload
@@ -68,6 +70,10 @@ class OpenAICompatibleClient(LLMClient):
         #: from the provider and never anything key-derived -- just the kind.
         self.last_error_kind: LLMErrorKind | None = None
         self._client: httpx.AsyncClient | None = None
+        #: Set once this provider has rejected a schema-constrained request.
+        #: Strict mode is model-gated and the model is user-configured, so an
+        #: unsupported one must cost a single degraded call, not every call.
+        self._schema_rejected = False
 
     @property
     def model_name(self) -> str:
@@ -108,6 +114,7 @@ class OpenAICompatibleClient(LLMClient):
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(self._config.timeout_seconds),
+            limits=keepalive_limits(),
         )
         logger.info(
             "openai_compatible_client_initialised provider=%s model=%s base_url=%s",
@@ -209,14 +216,17 @@ class OpenAICompatibleClient(LLMClient):
 
     # ------------------------------------------------------------- requests
 
-    def _body(self, prompt: str, *, model: str, stream: bool, json_mode: bool, **extra) -> dict:
+    def _body(
+        self, prompt: str, *, model: str, stream: bool, json_mode: bool,
+        schema: dict | None = None, **extra,
+    ) -> dict:
         body: dict = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": stream,
         }
         if json_mode:
-            body["response_format"] = {"type": "json_object"}
+            body["response_format"] = json_response_format(schema)
         body.update(extra)
         return body
 
@@ -244,7 +254,8 @@ class OpenAICompatibleClient(LLMClient):
         try:
             content = await self._post(
                 client,
-                self._body(prompt, model=self.model_name, stream=False, json_mode=True),
+                self._body(prompt, model=self.model_name, stream=False, json_mode=True,
+                           **answer_max_tokens()),
                 timeout=self._config.timeout_seconds,
             )
         except asyncio.CancelledError:
@@ -260,17 +271,25 @@ class OpenAICompatibleClient(LLMClient):
         return self._to_answer(content)
 
     async def complete_json(
-        self, prompt: str, *, model: str = "", timeout_seconds: float = 5.0
+        self,
+        prompt: str,
+        *,
+        model: str = "",
+        timeout_seconds: float = 5.0,
+        schema: dict | None = None,
     ) -> str:
         """One short, non-streaming JSON completion, for the question-
         understanding layer (`StructuredCompleter`). Mirrors
         `GroqClient.complete_json` -- see that docstring for why this exists
-        as its own method rather than reusing `generate_answer`."""
+        as its own method rather than reusing `generate_answer`, and for how a
+        `schema` degrades on a model that cannot do constrained decoding."""
         client = self._ensure_client()
         chosen = model or self.model_name
         started = time.monotonic()
+        use_schema = schema is not None and not self._schema_rejected
         body = self._body(
             prompt, model=chosen, stream=False, json_mode=True,
+            schema=schema if use_schema else None,
             max_tokens=512, temperature=0,
         )
         try:
@@ -278,6 +297,18 @@ class OpenAICompatibleClient(LLMClient):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if (
+                use_schema
+                and isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code == 400
+            ):
+                # This model does not do constrained decoding. Stop asking for
+                # it: the caller degrades this turn to its fallback, and every
+                # later call goes out as plain JSON mode instead.
+                self._schema_rejected = True
+                log_metric(
+                    "llm_schema_unsupported", provider=self.provider_name, model=chosen,
+                )
             # Classified and logged like any other provider failure, but *not*
             # recorded in `last_error_kind`: the Settings screen reports the
             # health of answering, and a classifier blip is recovered from
@@ -306,7 +337,7 @@ class OpenAICompatibleClient(LLMClient):
         # the partial-summary rendering the UI depends on. The prompt already
         # demands raw JSON, and parse_answer_payload tolerates a stray
         # markdown fence.
-        body = self._body(prompt, model=self.model_name, stream=True, json_mode=False)
+        body = self._body(prompt, model=self.model_name, stream=True, json_mode=False, **answer_max_tokens())
 
         first_text_seen = False
         characters = 0

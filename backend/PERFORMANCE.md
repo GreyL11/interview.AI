@@ -73,6 +73,17 @@ transcript CPU time it needs. Policy, all in
   cancelled outright. A partial already running is left to finish — CTranslate2
   inference isn't interruptible — but it can never publish once a newer final
   has landed (`_published_final_utterance_id` guard, unchanged).
+- **Not started when the final is closer**: cancelling a queued partial does
+  nothing once a worker has claimed it — CTranslate2 inference is not
+  interruptible — so the only remaining lever is refusing to start it. A final
+  is at least `vad_silence_ms - silence_run_ms` away (the silence still owed
+  before the utterance can close); if the *last measured* partial cost more
+  than that, this one cannot finish first and would only push the final back.
+  It is then skipped and counted as `partials_skipped_near_final`. This applies
+  while speech is still active too, where the whole silence budget is still
+  owed: a partial started on the last frame of speech is exactly the one still
+  running when `SPEECH_END` arrives. Inert until one partial has been timed, so
+  a cold worker always produces its first.
 - **Disable switch** (`STT_ENABLE_PARTIALS=false`): for a CPU too weak to
   afford them at all; finals still run normally.
 - **Backlog warning**: if the shared queue ever exceeds 6 pending jobs, one
@@ -109,6 +120,7 @@ New in this change, all in [`app/core/config.py`](app/core/config.py) /
 | `STT_ENABLE_PARTIALS` | true | Kill switch for interim transcripts. |
 | `STT_PARTIAL_MIN_AUDIO_MS` | 500 | Floor below which a partial is skipped. |
 | `STT_MAX_PARTIALS_PER_UTTERANCE` | 4 | Cap on re-transcription per utterance. |
+| `VAD_PREROLL_MS` | 160 | Audio kept from *before* an utterance opened and prepended to its clip, so speech onset that ramped through the VAD threshold — and the `vad_start_frames` the detector consumed before reporting SPEECH_START — still reach Whisper. Floored at `vad_start_frames`. Costs no latency: faster-whisper pads every encoder window to 30s regardless of clip length. |
 | `STT_PRIORITY_LOOPBACK_FINAL/PARTIAL`, `STT_PRIORITY_MIC_FINAL/PARTIAL` | 0/1/2/3 | Queue priority bands. |
 
 Existing `STT_MODEL`, `STT_DEVICE`, `STT_COMPUTE_TYPE`, `STT_BEAM_SIZE`,
@@ -140,8 +152,23 @@ metric llm_response_completed session_id=... question_id=7 duration_ms=1150 char
 
 The number that matters most is `speech_end_to_transcript_ms` on the final —
 it is `queue_wait_ms + duration_ms` and is the number the priority scheduler
-is directly fighting to shrink. `llm_first_token_received.duration_ms` is the
-Gemini-side equivalent for time-to-first-token.
+is directly fighting to shrink.
+
+**It is not, however, the number the interviewer experiences.** Every "speech
+end" timestamp in this pipeline is stamped when the *segmenter noticed* the
+utterance had closed, which is `vad_silence_ms` (~700ms) after the words
+actually stopped — that silence is what the VAD has to observe before it can
+tell a finished question from a mid-sentence breath. So each of the figures
+above is optimistic by roughly that much.
+
+That delay is now recorded rather than assumed: `speech_end_detected` carries
+`vad_close_ms`, and `question_latency_trace` carries both `vad_close_ms` and a
+`true_speech_end_to_first_visible_token_ms` (or
+`true_speech_end_to_outcome_ms`) that includes it. When quoting an end-to-end
+latency to anyone, quote the `true_` one; the `speech_end_at`-based totals are
+kept alongside it because they are what the scheduler can actually act on, and
+because they stay comparable with every trace logged before these fields
+existed.
 
 `transcription_worker_metrics` (unchanged, logged on stop) still reports
 per-worker totals: `partials_scheduled`, `partials_coalesced`,

@@ -24,7 +24,9 @@ from collections.abc import AsyncIterator
 
 from app.core.logging import get_logger
 from app.core.metrics import elapsed_ms, log_metric
-from app.llm.base import LLMClient, LLMError, LLMErrorKind
+from app.llm.base import (
+    LLMClient, LLMError, LLMErrorKind, answer_max_tokens, json_response_format, keepalive_limits,
+)
 from app.llm.messages import message_for
 from app.llm.registry import ProviderConfig, validate_model
 from app.llm.streaming import parse_answer_payload
@@ -86,6 +88,10 @@ class GroqClient(LLMClient):
         #: Last classified failure, for the Settings screen. Never a message
         #: from the provider and never anything key-derived -- just the kind.
         self.last_error_kind: LLMErrorKind | None = None
+        #: Set once this provider has rejected a schema-constrained request.
+        #: Strict mode is model-gated and the model is user-configured, so an
+        #: unsupported one must cost a single degraded call, not every call.
+        self._schema_rejected = False
         # Fails fast and loudly on a misconfigured model rather than sending it
         # to Groq once per question.
         validate_model(config.model)
@@ -112,7 +118,7 @@ class GroqClient(LLMClient):
                 kind=LLMErrorKind.NOT_CONFIGURED,
             )
         try:
-            from groq import AsyncGroq
+            from groq import AsyncGroq, DefaultAsyncHttpxClient
         except ImportError as exc:  # pragma: no cover - packaging guard
             # A packaging failure, not a user error: say so plainly rather than
             # telling the user to install a Python package into a desktop app.
@@ -130,6 +136,8 @@ class GroqClient(LLMClient):
             # a deterministic 400/401/404. Set explicitly so that contract is
             # visible here rather than inherited from an SDK default.
             max_retries=self._config.max_retries,
+            # SDK default client, plus a long keep-alive (see base.py).
+            http_client=DefaultAsyncHttpxClient(limits=keepalive_limits()),
         )
         logger.info("groq_client_initialised model=%s", self.model_name)
         return self._client
@@ -266,6 +274,7 @@ class GroqClient(LLMClient):
                     model=self.model_name,
                     messages=self._messages(prompt),
                     response_format={"type": "json_object"},
+                    **answer_max_tokens(),
                 ),
                 timeout=self._config.timeout_seconds,
             )
@@ -284,7 +293,12 @@ class GroqClient(LLMClient):
         return self._to_answer(response.choices[0].message.content or "")
 
     async def complete_json(
-        self, prompt: str, *, model: str = "", timeout_seconds: float = 5.0
+        self,
+        prompt: str,
+        *,
+        model: str = "",
+        timeout_seconds: float = 5.0,
+        schema: dict | None = None,
     ) -> str:
         """One short, non-streaming JSON completion.
 
@@ -297,16 +311,23 @@ class GroqClient(LLMClient):
         this, so the provider buffering the whole object costs nothing.
         `model` falls back to the answer model when unset, so the setting can
         stay empty until there is a reason to split them.
+
+        A `schema` upgrades JSON mode to constrained decoding -- see
+        `app.llm.base.json_response_format` for what that does and does not
+        guarantee. A model that cannot do it answers 400, which degrades this
+        one call to the caller's fallback and every later one to plain JSON
+        mode.
         """
         client = self._ensure_client()
         started = time.monotonic()
         chosen = model or self.model_name
+        use_schema = schema is not None and not self._schema_rejected
         try:
             response = await asyncio.wait_for(
                 client.chat.completions.create(
                     model=chosen,
                     messages=self._messages(prompt),
-                    response_format={"type": "json_object"},
+                    response_format=json_response_format(schema if use_schema else None),
                     # A classifier that rambles has failed; this also bounds
                     # the worst-case latency contribution.
                     max_tokens=512,
@@ -317,6 +338,14 @@ class GroqClient(LLMClient):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if use_schema and self._status_code(exc) == 400:
+                # This model does not do constrained decoding. Stop asking for
+                # it: the caller degrades this turn to its fallback, and every
+                # later call goes out as plain JSON mode instead.
+                self._schema_rejected = True
+                log_metric(
+                    "llm_schema_unsupported", provider=self.provider_name, model=chosen,
+                )
             # Classified and logged like any other provider failure, but *not*
             # recorded in `last_error_kind`: the Settings screen reports the
             # health of answering, and a classifier blip is recovered from
@@ -361,6 +390,7 @@ class GroqClient(LLMClient):
                     # tolerates a stray markdown fence. JSON mode is still used
                     # in generate_answer above, where buffering costs nothing.
                     stream=True,
+                    **answer_max_tokens(),
                 ),
                 timeout=self._config.timeout_seconds,
             )

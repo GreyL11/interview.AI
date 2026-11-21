@@ -296,6 +296,80 @@ async def test_complete_json_falls_back_to_the_client_model_when_no_override_is_
     assert captured["body"]["model"] == "gpt-5.6-terra"
 
 
+# ------------------------------------------------------- constrained decoding
+
+
+@pytest.mark.asyncio
+async def test_a_schema_is_sent_as_strict_constrained_decoding():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _json_response(200, {"choices": [{"message": {"content": "{}"}}]})
+
+    schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    client = _client(handler)
+    await client.complete_json("classify this", timeout_seconds=1.0, schema=schema)
+
+    assert captured["body"]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "response", "strict": True, "schema": schema},
+    }
+
+
+@pytest.mark.asyncio
+async def test_without_a_schema_it_is_still_plain_json_mode():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _json_response(200, {"choices": [{"message": {"content": "{}"}}]})
+
+    client = _client(handler)
+    await client.complete_json("classify this", timeout_seconds=1.0)
+    assert captured["body"]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_rejects_a_schema_stops_being_asked_for_one():
+    """Strict mode is model-gated and the model is user-configured, so an
+    unsupported one must cost one degraded call rather than every call."""
+    formats = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        formats.append(body["response_format"]["type"])
+        if body["response_format"]["type"] == "json_schema":
+            return _json_response(400, {"error": {"message": "response_format not supported"}})
+        return _json_response(200, {"choices": [{"message": {"content": "{}"}}]})
+
+    schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    client = _client(handler)
+
+    with pytest.raises(Exception):
+        await client.complete_json("one", timeout_seconds=1.0, schema=schema)
+
+    # Second call: same schema asked for, but the client already knows better.
+    assert await client.complete_json("two", timeout_seconds=1.0, schema=schema) == "{}"
+    assert formats == ["json_schema", "json_object"]
+
+
+@pytest.mark.asyncio
+async def test_a_400_that_is_not_about_the_schema_does_not_disable_it():
+    """Only a schema-carrying request may turn constrained decoding off."""
+    formats = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        formats.append(json.loads(request.content)["response_format"]["type"])
+        return _json_response(400, {"error": {"message": "bad request"}})
+
+    client = _client(handler)
+    with pytest.raises(Exception):
+        await client.complete_json("no schema here", timeout_seconds=1.0)
+
+    assert client._schema_rejected is False
+
+
 # --------------------------------------------------------------------- streaming
 
 

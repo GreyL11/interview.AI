@@ -89,6 +89,11 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("llm_max_retries", "groq_max_retries"),
     )
 
+    #: Hard ceiling on one answer's completion tokens (reasoning models count
+    #: their hidden reasoning against it, hence the headroom over ~1500 of
+    #: visible text). 0 disables the cap.
+    llm_answer_max_tokens: int = 2000
+
     # Per-provider secrets. Any `<name>_api_key` field here is discovered
     # automatically by app.core.secrets and loaded from / saved to the OS
     # credential store -- adding a provider is adding a field, never a branch;
@@ -306,9 +311,25 @@ class Settings(BaseSettings):
     # Voice activity detection
     vad_threshold: float = 0.5
     vad_start_frames: int = 2        # ~64ms of speech to open an utterance
-    vad_silence_ms: int = 700        # sustained silence to close one
+    vad_silence_ms: int = 550        # sustained silence to close one (was 700; 500 risks answering half a complete-looking clause)
     vad_min_utterance_ms: int = 300  # below this it is a click, not speech
     vad_max_utterance_ms: int = 30_000
+    #: How much audio from *before* the utterance opened is prepended to the
+    #: clip sent to Whisper.
+    #:
+    #: Two separate losses to recover, and the second is the larger one.
+    #: `vad_start_frames` frames have already been consumed by the time
+    #: SPEECH_START fires, and only the last of them was ever kept -- so the
+    #: first ~32ms of every utterance was simply discarded. Beyond that, speech
+    #: onset ramps through the threshold rather than crossing it cleanly: the
+    #: frame or two before the detector is convinced still carries the leading
+    #: consonant, which is exactly the part Whisper needs to tell "can" from
+    #: "an".
+    #:
+    #: Free in latency terms. faster-whisper pads every encoder window to 30s
+    #: (`pad_or_trim` in its `transcribe.py`), so a clip a few frames longer
+    #: costs the encoder nothing at all.
+    vad_preroll_ms: int = 160
 
     # Speech to text
     stt_model: str = "distil-small.en"
@@ -320,6 +341,8 @@ class Settings(BaseSettings):
     stt_compute_type: str = "int8"          # CPU
     stt_cuda_compute_type: str = "float16"  # NVIDIA GPU
     stt_beam_size: int = 5
+    #: Final-pass temperature ladder, comma-separated. One retry at most.
+    stt_final_temperatures: str = "0.0,0.4"
     stt_language: str = "en"
     stt_partial_interval_ms: int = 1000
 

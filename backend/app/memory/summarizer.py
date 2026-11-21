@@ -1,9 +1,8 @@
 import json
 
-from app.core.config import settings
 from app.core.logging import get_logger
 from app.documents.schemas import utcnow
-from app.llm.base import LLMClient, LLMError
+from app.realtime.question_understanding import StructuredCompleter
 from app.sessions.schemas import SessionSummary
 from app.storage.session_repository import SessionRepository
 
@@ -24,6 +23,24 @@ Conversation:
 {conversation}
 """
 
+#: What the provider is constrained to produce. The prompt above says the same
+#: thing in words, and still has to: the schema only reaches a model that
+#: supports constrained decoding (see `app.llm.base.json_response_format`).
+_RESPONSE_SCHEMA: dict = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary": {"type": "string"},
+        "topics": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "topics"],
+}
+
+#: Generous on purpose. Summarising runs off the answer path, so it is never
+#: the thing an interviewer waits on -- the only cost of a slow call is a
+#: later summary.
+_TIMEOUT_SECONDS = 20.0
+
 
 class SessionSummarizer:
     """Compresses turns that have aged out of the verbatim window.
@@ -33,7 +50,7 @@ class SessionSummarizer:
     breaking the session.
     """
 
-    def __init__(self, sessions: SessionRepository, llm: LLMClient) -> None:
+    def __init__(self, sessions: SessionRepository, llm: StructuredCompleter) -> None:
         self._sessions = sessions
         self._llm = llm
 
@@ -58,14 +75,25 @@ class SessionSummarizer:
             lines.append(f"Q: {turn.question}\nA: {answer}")
 
         try:
-            answer = await self._llm.generate_answer(
-                _PROMPT.format(conversation="\n\n".join(lines))
+            payload = json.loads(
+                await self._llm.complete_json(
+                    _PROMPT.format(conversation="\n\n".join(lines)),
+                    model="",
+                    timeout_seconds=_TIMEOUT_SECONDS,
+                    schema=_RESPONSE_SCHEMA,
+                )
             )
-            payload = _extract(answer.summary, answer.detailed_answer)
-        except LLMError as exc:
-            # Fallback: the verbatim window has already dropped these turns, so
-            # losing the summary costs context, not correctness.
+        except Exception as exc:
+            # Any provider failure, and any response a model on the
+            # unconstrained path mangled. The verbatim window has already
+            # dropped these turns, so losing the summary costs context, not
+            # correctness. CancelledError is a BaseException and still
+            # propagates.
             logger.warning("session_summary_failed session=%s error=%s", session_id, exc)
+            return None
+
+        if not isinstance(payload, dict):
+            logger.warning("session_summary_not_an_object session=%s", session_id)
             return None
 
         summary = SessionSummary(
@@ -81,18 +109,3 @@ class SessionSummarizer:
             session_id, through_seq, len(summary.topics),
         )
         return summary
-
-
-def _extract(*candidates: str) -> dict:
-    """The summariser reuses the standard Answer-shaped LLM call, so the JSON we
-    want may land in either field. Try both before giving up."""
-    for text in candidates:
-        if not text:
-            continue
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
-    return {"summary": candidates[0] if candidates else "", "topics": []}

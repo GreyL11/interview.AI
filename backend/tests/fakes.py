@@ -140,6 +140,28 @@ class FakeLLM(LLMClient):
         return self.answer
 
 
+class FakeCompleter:
+    """A `StructuredCompleter` double, for the summariser.
+
+    Separate from `FakeLLM` on purpose: that one is deliberately answer-only,
+    and several understanding tests assert the deterministic path precisely
+    because it has no `complete_json` to find.
+    """
+
+    def __init__(self, payload: str = '{"summary": "s", "topics": []}') -> None:
+        self.payload = payload
+        self.prompts: list[str] = []
+        self.schemas: list[dict | None] = []
+
+    async def complete_json(
+        self, prompt: str, *, model: str = "", timeout_seconds: float = 5.0,
+        schema: dict | None = None,
+    ) -> str:
+        self.prompts.append(prompt)
+        self.schemas.append(schema)
+        return self.payload
+
+
 class SlowStreamingLLM(LLMClient):
     """Streams an answer in small chunks with a controllable delay.
 

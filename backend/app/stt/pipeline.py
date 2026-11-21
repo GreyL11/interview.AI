@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from collections import deque
 from concurrent.futures import CancelledError, Future
 
 import numpy as np
@@ -105,6 +106,10 @@ class TranscriptionWorker:
         self._last_partial_text = ""
         self._last_partial_utterance_id = 0
         self._speech_end_at: dict[int, float] = {}
+        #: Per utterance, the trailing silence that closed it. Kept alongside
+        #: `_speech_end_at` and cleared with it, so the trace can say how long
+        #: before that timestamp the interviewer actually stopped talking.
+        self._vad_close_ms: dict[int, int] = {}
         self._stopping = False
         self._loopback_frame_count = 0
         self.frames_consumed = 0
@@ -141,6 +146,7 @@ class TranscriptionWorker:
         self._partial_job = None
         self._outstanding.clear()
         self._speech_end_at.clear()
+        self._vad_close_ms.clear()
         self._source.start()
         self._scheduler.acquire()
         self._acquired = True
@@ -338,6 +344,11 @@ class TranscriptionWorker:
         # capture the two are the same, but this keeps the behaviour identical
         # when frames arrive faster than real time (tests, replayed recordings).
         last_partial_ms = 0
+        # Every frame the VAD has looked at recently, speech or not, so that an
+        # utterance can be opened with the audio that *preceded* the detector
+        # being convinced. Never shorter than `start_frames`, or the frames
+        # that opened the utterance would themselves still be missing.
+        preroll: deque[np.ndarray] = deque(maxlen=self._preroll_frames())
 
         try:
             if self._source.channel == AudioChannel.LOOPBACK:
@@ -347,6 +358,9 @@ class TranscriptionWorker:
                     break
 
                 self.frames_consumed += 1
+                # Before the VAD sees it, so the window is already populated on
+                # the frame that opens an utterance.
+                preroll.append(frame)
 
                 is_loopback = self._source.channel == AudioChannel.LOOPBACK
                 self._loopback_frame_count += int(is_loopback)
@@ -397,7 +411,10 @@ class TranscriptionWorker:
 
                 if event == SegmentEvent.SPEECH_START:
                     self._utterance_id += 1
-                    buffer = [frame]
+                    # `preroll` already ends with this frame, so seeding from it
+                    # keeps the opening frames *and* the onset that ramped
+                    # through the threshold before the detector was convinced.
+                    buffer = list(preroll)
                     last_partial_ms = 0
                     self._partials_this_utterance = 0
                     log_metric(
@@ -428,14 +445,19 @@ class TranscriptionWorker:
                     continue
 
                 if event == SegmentEvent.SPEECH_END:
+                    # Read before `_detector.reset()` below, and before the next
+                    # frame can open a new utterance over it.
+                    closing_silence_ms = self._segmenter.closing_silence_ms
                     log_metric(
                         "speech_end_detected",
                         session_id=self._session_id,
                         channel=self._source.channel.value,
                         utterance_id=self._utterance_id,
                         audio_duration_ms=len(buffer) * FRAME_MS,
+                        # How long before this line the words actually stopped.
+                        vad_close_ms=closing_silence_ms,
                     )
-                    self._schedule_final(self._utterance_id, buffer)
+                    self._schedule_final(self._utterance_id, buffer, closing_silence_ms)
                     buffer = []
                     self._detector.reset()
 
@@ -450,6 +472,17 @@ class TranscriptionWorker:
         """Adaptive cadence: the configured interval, or the time the last
         partial actually took, whichever is longer."""
         return max(self._partial_interval_ms, self._last_partial_inference_ms)
+
+    def _preroll_frames(self) -> int:
+        """How many frames of lead-in to keep ahead of every utterance.
+
+        Floored at `vad_start_frames` because those frames are consumed by the
+        detector before it reports SPEECH_START: a shorter window would still
+        drop the very beginning of the utterance, which is the bug this exists
+        to fix.
+        """
+        configured = settings.vad_preroll_ms // FRAME_MS
+        return max(settings.vad_start_frames, configured, 1)
 
     def _schedule_partial(
         self, utterance_id: int, buffer: list[np.ndarray], buffered_ms: int
@@ -489,17 +522,26 @@ class TranscriptionWorker:
         """True when starting a partial now would only delay the final.
 
         Inference is not preemptible, so a partial started here runs to
-        completion and the final queues behind it. Once the speaker has gone
-        quiet the final is at most `vad_silence_ms - silence_run_ms` away; if
-        the last partial measurably took longer than that, this one cannot
-        finish first and its only effect is to push the final back by the
-        difference. Measured on this machine: a partial started 220ms into the
-        silence run cost the final 1608ms of queue wait.
+        completion and the final queues behind it. The final is at least
+        `vad_silence_ms - silence_run_ms` away -- the silence still owed before
+        the utterance can close -- so a partial that measurably costs more than
+        that cannot finish first, and its only effect is to push the final back
+        by the difference. Measured on this machine: a partial started 220ms
+        into the silence run cost the final 1608ms of queue wait.
 
-        Deliberately inert while speech is active (`silence_run_ms == 0`
-        makes the comparison use the full silence budget) and until a partial
-        has actually been timed, so live-transcript responsiveness during real
-        speech is unchanged.
+        This deliberately applies while speech is still active too, where
+        `silence_run_ms` is 0 and the whole silence budget is still owed. That
+        case used to be exempt, on the reasoning that no final was imminent --
+        but a partial started on the last frame of speech is precisely the one
+        that is still running when SPEECH_END arrives, and it was the only
+        unguarded path left. The comparison there is conservative, since real
+        speech continuing pushes the final further away than this assumes; the
+        cost of that is a suppressed partial on a machine where partials take
+        longer than `vad_silence_ms`, and such a partial could never have
+        beaten the final to the screen anyway.
+
+        Still inert until a partial has actually been timed -- one unguarded
+        partial per session is the price of having something to measure.
         """
         measured = self._last_partial_inference_ms
         # A partial that runs in less than one audio frame cannot meaningfully
@@ -509,10 +551,7 @@ class TranscriptionWorker:
         # otherwise win the comparison.
         if measured < FRAME_MS:
             return False  # nothing measured yet, or too cheap to matter
-        silence_run = self._segmenter.silence_run_ms
-        if silence_run <= 0:
-            return False  # still speaking; no evidence a final is close
-        remaining = max(0, settings.vad_silence_ms - silence_run)
+        remaining = max(0, settings.vad_silence_ms - self._segmenter.silence_run_ms)
         return measured >= remaining
 
     def _submit_partial_locked(self, utterance_id: int, audio: np.ndarray) -> None:
@@ -540,13 +579,16 @@ class TranscriptionWorker:
             self._scheduler.depth,
         )
 
-    def _schedule_final(self, utterance_id: int, buffer: list[np.ndarray]) -> None:
+    def _schedule_final(
+        self, utterance_id: int, buffer: list[np.ndarray], closing_silence_ms: int = 0
+    ) -> None:
         if not buffer:
             return
         audio = np.concatenate(buffer)
         with self._schedule_lock:
             self._final_utterance_id = max(self._final_utterance_id, utterance_id)
             self._speech_end_at[utterance_id] = time.monotonic()
+            self._vad_close_ms[utterance_id] = closing_silence_ms
             if self._pending_partial is not None and self._pending_partial[0] <= utterance_id:
                 self._pending_partial = None
             # Anything still queued for this utterance is now dead weight in
@@ -669,6 +711,7 @@ class TranscriptionWorker:
                     self._published_final_utterance_id, utterance_id
                 )
                 self._speech_end_at.pop(utterance_id, None)
+                vad_close_ms = self._vad_close_ms.pop(utterance_id, 0)
             if self._last_partial_utterance_id == utterance_id and self._last_partial_text:
                 overlap = _word_overlap(self._last_partial_text, transcript.text)
                 if overlap < _DIVERGENCE_WARN_THRESHOLD:
@@ -687,6 +730,7 @@ class TranscriptionWorker:
                     speech_end_at=speech_end_at,
                     session_id=self._session_id,
                     utterance_id=utterance_id,
+                    vad_close_ms=vad_close_ms,
                     stt_queue_wait_ms=elapsed_ms(speech_end_at, started),
                     stt_inference_ms=elapsed_ms(started, completed),
                     stt_final_at=completed,

@@ -6,7 +6,9 @@ grep alone. Deliberately not a metrics framework: this is a desktop app with
 one user, and a log line is the thing a support bundle already carries.
 """
 
+import statistics
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +34,26 @@ def log_metric(event: str, **fields: Any) -> None:
     logger.info("metric %s %s", event, rendered)
 
 
+_STAGE_SAMPLES: dict[str, deque[int]] = defaultdict(lambda: deque(maxlen=200))
+_SUMMARY_EVERY = 20
+_recorded = 0
+
+
+def record_stage(stage: str, ms: int | None) -> None:
+    """Keep the last 200 samples per stage; log a p50/p95 line every 20 answers."""
+    if ms is not None:
+        _STAGE_SAMPLES[stage].append(ms)
+
+
+def stage_percentiles() -> dict[str, dict[str, int]]:
+    out = {}
+    for stage, vals in _STAGE_SAMPLES.items():
+        if len(vals) >= 2:
+            q = statistics.quantiles(vals, n=20)  # q[9]=p50, q[18]=p95
+            out[stage] = {"p50": round(q[9]), "p95": round(q[18]), "n": len(vals)}
+    return out
+
+
 def elapsed_ms(started: float, now: float) -> int:
     """Monotonic-clock delta in whole milliseconds."""
     return int((now - started) * 1000)
@@ -50,12 +72,27 @@ class LatencyTrace:
     from one recorded later on the event loop.
     """
 
+    #: When the VAD *reported* the utterance closed -- which is `vad_close_ms`
+    #: after the interviewer actually stopped talking. Every duration below is
+    #: measured from here, because here is the first moment this process knows
+    #: anything happened.
     speech_end_at: float
     #: Which session/utterance produced this trace, so a log line is joinable
     #: back to the STT-side `stt_job_*`/`speech_*_detected` events (those carry
     #: `utterance_id` but not `question_id`, and vice versa on the answer side).
     session_id: str | None = None
     utterance_id: int | None = None
+    #: The trailing silence the segmenter had to observe before it could call
+    #: the utterance closed (`vad_silence_ms`, ~700ms by default).
+    #:
+    #: Recorded because leaving it out made every latency figure this app
+    #: reports optimistic by that much, in a way no amount of reading the logs
+    #: would reveal: `speech_end_at` is stamped when the segmenter *noticed*,
+    #: so a "900ms" speech-to-transcript was really 1.6s to the person who
+    #: asked the question. It is not a cost that can be scheduled away -- it
+    #: buys not cutting a question in half at every mid-sentence breath -- but
+    #: it is a cost, and the totals below now say so.
+    vad_close_ms: int | None = None
     stt_queue_wait_ms: int | None = None
     stt_inference_ms: int | None = None
     stt_final_at: float | None = None
@@ -88,6 +125,19 @@ class LatencyTrace:
             return None
         return elapsed_ms(start, end)
 
+    def _true_total_ms(self, end: float | None) -> int | None:
+        """The same total, from when the words actually stopped.
+
+        This is the number the person asking the question experienced. Reported
+        alongside the `speech_end_at`-based total rather than replacing it, so
+        the scheduler-facing figures stay comparable with every trace logged
+        before this field existed.
+        """
+        measured = self._ms(self.speech_end_at, end)
+        if measured is None or self.vad_close_ms is None:
+            return None
+        return measured + self.vad_close_ms
+
     def emit_terminal(self, question_id: int, outcome: str) -> None:
         """Write the trace for a turn that never reached a visible token.
 
@@ -105,6 +155,7 @@ class LatencyTrace:
             session_id=self.session_id,
             utterance_id=self.utterance_id,
             outcome=outcome,
+            vad_close_ms=self.vad_close_ms,
             speech_end_to_stt_final_ms=self._ms(self.speech_end_at, self.stt_final_at),
             stt_queue_wait_ms=self.stt_queue_wait_ms,
             stt_inference_ms=self.stt_inference_ms,
@@ -125,6 +176,7 @@ class LatencyTrace:
                 self.llm_request_at, self.llm_first_response_at
             ),
             total_question_to_outcome_ms=self._ms(self.speech_end_at, time.monotonic()),
+            true_speech_end_to_outcome_ms=self._true_total_ms(time.monotonic()),
         )
 
     def emit_first_token(self, question_id: int) -> None:
@@ -135,12 +187,21 @@ class LatencyTrace:
         to stream past (see `llm_first_text_token_at`)."""
         now = time.monotonic()
         self.reported = True
+        global _recorded
+        record_stage("stt_final_to_detected", self._ms(self.stt_final_at, self.question_detected_at))
+        record_stage("detected_to_first_token", self._ms(self.question_detected_at, now))
+        record_stage("first_token_to_ws", self._ms(self.llm_first_text_token_at, now))
+        record_stage("stt_final_to_first_token", self._ms(self.stt_final_at, now))
+        _recorded += 1
+        if _recorded % _SUMMARY_EVERY == 0:
+            log_metric("latency_percentiles", **{f"{k}_{m}": v for k, d in stage_percentiles().items() for m, v in d.items()})
         log_metric(
             "question_latency_trace",
             question_id=question_id,
             session_id=self.session_id,
             utterance_id=self.utterance_id,
             outcome="first_token",
+            vad_close_ms=self.vad_close_ms,
             speech_end_to_stt_final_ms=self._ms(self.speech_end_at, self.stt_final_at),
             stt_queue_wait_ms=self.stt_queue_wait_ms,
             stt_inference_ms=self.stt_inference_ms,
@@ -161,4 +222,5 @@ class LatencyTrace:
             ),
             first_token_to_websocket_send_ms=self._ms(self.llm_first_text_token_at, now),
             total_question_to_first_visible_token_ms=self._ms(self.speech_end_at, now),
+            true_speech_end_to_first_visible_token_ms=self._true_total_ms(now),
         )

@@ -39,6 +39,9 @@ _MAX_CONTEXT_CHARS = 220
 
 _WORD = re.compile(r"[A-Za-z']+")
 
+#: Last words that close a referent-less fragment ("What is this", "What about that").
+_DEICTIC_TAIL = frozenset({"this", "that", "these", "those", "it", "then"})
+
 #: Words that are essentially never how a *complete* thought ends -- trailing
 #: subordinators, conjunctions, prepositions, articles, copulas, and bare
 #: interrogatives. A one-word follow-up ("Why?", "How?") never reaches this
@@ -342,9 +345,13 @@ class QuestionDetector:
         # it is a fragment the existing accumulation mechanism already holds
         # for its continuation, and rejecting it here instead would drop it
         # on the floor rather than let it accumulate.
+        # Whisper often drops the "?" on a deictic fragment ("What is this"),
+        # which then sailed through as an interrogative with no referent. So a
+        # closed utterance is also one that ends on a bare deictic word.
+        last_word = (_WORD.findall(text) or [""])[-1].lower()
         referential = (
             not short
-            and text.rstrip()[-1:] in ".!?"
+            and (text.rstrip()[-1:] in ".!?" or last_word in _DEICTIC_TAIL)
             and is_referentially_empty(text)
         )
         needs_context = short or referential

@@ -356,6 +356,7 @@ async def test_mic_transcript_is_recorded_but_never_answered(sessions, session_i
 
     assert EventType.TRANSCRIPT_FINAL in collector.types()
     assert EventType.ANSWER_STARTED not in collector.types()
+    await live.flush_transcripts()
     assert sessions.get_transcript(session_id)[0].source == TranscriptSource.MIC
 
 

@@ -9,7 +9,7 @@ from app.memory.summarizer import SessionSummarizer
 from app.schemas.answer import Answer
 from app.sessions.schemas import Session, Turn
 from app.storage.session_repository import SessionRepository
-from tests.fakes import FakeLLM
+from tests.fakes import FakeCompleter
 
 
 @pytest.fixture
@@ -115,7 +115,7 @@ async def test_summarizer_persists_summary_and_topics(sessions, session_id):
     for i in range(4):
         add_answered_turn(sessions, session_id, i, f"q{i}", f"a{i}")
 
-    llm = FakeLLM(Answer(summary='{"summary": "Talked about Kafka.", "topics": ["kafka", "etl"]}'))
+    llm = FakeCompleter('{"summary": "Talked about Kafka.", "topics": ["kafka", "etl"]}')
     result = await SessionSummarizer(sessions, llm).summarize(session_id, through_seq=3)
 
     assert result.summary == "Talked about Kafka."
@@ -130,21 +130,52 @@ async def test_summarizer_survives_llm_failure(sessions, session_id):
 
     add_answered_turn(sessions, session_id, 0, "q", "a")
 
-    class BrokenLLM(FakeLLM):
-        async def generate_answer(self, prompt):
+    class BrokenCompleter(FakeCompleter):
+        async def complete_json(self, prompt, **kwargs):
             raise LLMError("provider down")
 
     # Degrades context quality; must never break the session.
-    assert await SessionSummarizer(sessions, BrokenLLM()).summarize(session_id, 1) is None
+    assert await SessionSummarizer(sessions, BrokenCompleter()).summarize(session_id, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_summarizer_survives_unparseable_response(sessions, session_id):
+    """Constrained decoding makes this impossible on a model that supports it,
+    and the degraded path is exactly where it does not."""
+    add_answered_turn(sessions, session_id, 0, "q", "a")
+
+    assert await SessionSummarizer(
+        sessions, FakeCompleter("not json at all")
+    ).summarize(session_id, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_summarizer_asks_for_a_constrained_object(sessions, session_id):
+    add_answered_turn(sessions, session_id, 0, "q", "a")
+    llm = FakeCompleter()
+
+    await SessionSummarizer(sessions, llm).summarize(session_id, 1)
+
+    assert llm.schemas == [
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "topics": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["summary", "topics"],
+        }
+    ]
 
 
 @pytest.mark.asyncio
 async def test_summarizer_noop_without_turns(sessions, session_id):
-    assert await SessionSummarizer(sessions, FakeLLM()).summarize(session_id, 5) is None
+    assert await SessionSummarizer(sessions, FakeCompleter()).summarize(session_id, 5) is None
 
 
 def test_needs_summary_only_past_what_is_covered(sessions, session_id):
-    summarizer = SessionSummarizer(sessions, FakeLLM())
+    summarizer = SessionSummarizer(sessions, FakeCompleter())
     assert summarizer.needs_summary(session_id, 0) is False
     assert summarizer.needs_summary(session_id, 3) is True
 
@@ -152,8 +183,7 @@ def test_needs_summary_only_past_what_is_covered(sessions, session_id):
 @pytest.mark.asyncio
 async def test_needs_summary_false_once_covered(sessions, session_id):
     add_answered_turn(sessions, session_id, 0, "q", "a")
-    llm = FakeLLM(Answer(summary='{"summary": "s", "topics": []}'))
-    summarizer = SessionSummarizer(sessions, llm)
+    summarizer = SessionSummarizer(sessions, FakeCompleter())
 
     await summarizer.summarize(session_id, through_seq=3)
     assert summarizer.needs_summary(session_id, 3) is False

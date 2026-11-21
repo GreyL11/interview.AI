@@ -270,6 +270,15 @@ class FasterWhisperEngine(SttEngine):
             beam_size=settings.stt_beam_size if is_final else 1,
             vad_filter=False,  # segmentation already happened upstream
             condition_on_previous_text=False,
+            # Interims are display-only and queue ahead of nothing but delay
+            # finals: skip the 6x temperature-fallback re-decode and the
+            # unused timestamp tokens. Finals get a short ladder (one retry)
+            # and no timestamps (only segment.text is read downstream).
+            temperature=(
+                tuple(float(t) for t in settings.stt_final_temperatures.split(",") if t.strip())
+                if is_final else 0.0
+            ),
+            without_timestamps=True,
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
 

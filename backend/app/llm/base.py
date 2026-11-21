@@ -43,6 +43,26 @@ class LLMClient(ABC):
         yield answer.model_dump_json()
 
 
+def json_response_format(schema: dict | None) -> dict:
+    """The `response_format` for one non-streaming JSON completion.
+
+    With a schema this asks for constrained decoding: the provider masks
+    tokens as it generates, so a malformed object or an unknown enum value
+    becomes impossible rather than merely unlikely. Without one it is plain
+    JSON mode, which promises valid JSON and nothing whatever about its shape.
+
+    Callers must keep validating either way. Strict mode is model-gated at
+    every provider, and a constrained response is well-shaped, not
+    necessarily right -- the model can still pick the wrong enum member.
+    """
+    if schema is None:
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "response", "strict": True, "schema": schema},
+    }
+
+
 class LLMErrorKind(StrEnum):
     """Why a provider call failed.
 
@@ -102,3 +122,26 @@ class LLMError(Exception):
     def is_deterministic(self) -> bool:
         """True when retrying this exact request cannot help."""
         return self.kind in DETERMINISTIC_ERROR_KINDS
+
+
+# httpx drops idle pooled connections after 5s. Interview questions arrive
+# tens of seconds apart, so by default every answer re-pays TCP+TLS setup
+# (typically a few round trips) before the first token. Keep them warm.
+KEEPALIVE_EXPIRY_SECONDS = 120.0
+
+
+def answer_max_tokens() -> dict:
+    """`{"max_tokens": N}` for an answer request, or `{}` when disabled."""
+    from app.core.config import settings
+
+    n = settings.llm_answer_max_tokens
+    return {"max_tokens": n} if n > 0 else {}
+
+
+def keepalive_limits():
+    import httpx
+
+    return httpx.Limits(
+        max_connections=20, max_keepalive_connections=10,
+        keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS,
+    )

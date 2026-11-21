@@ -61,6 +61,13 @@ class Segmenter:
     _speech_run: int = 0
     _silence_run: int = 0
     _duration_ms: int = 0
+    #: The trailing-silence run, in ms, that closed the most recent utterance.
+    #: Captured just before `reset()` wipes it, because by the time the worker
+    #: sees SPEECH_END the run is already gone -- and this is the only number
+    #: that says how far in the past the speech actually stopped. Survives
+    #: `reset()` on purpose: it describes the utterance that just closed, not
+    #: the one about to open.
+    _closing_silence_ms: int = 0
 
     def reset(self) -> None:
         self.in_speech = False
@@ -83,6 +90,19 @@ class Segmenter:
         """
         return self._silence_run * FRAME_MS if self.in_speech else 0
 
+    @property
+    def closing_silence_ms(self) -> int:
+        """How long ago the speech in the just-closed utterance actually
+        stopped.
+
+        SPEECH_END is reported `silence_ms` after the fact -- that delay is the
+        price of not cutting a question in half at every mid-sentence breath,
+        and it is not avoidable. What *was* avoidable is it being invisible:
+        every latency figure this pipeline reports starts its clock when the
+        segmenter noticed, so all of them were optimistic by this much.
+        """
+        return self._closing_silence_ms
+
     def push(self, probability: float) -> SegmentEvent:
         is_speech = probability >= self.threshold
 
@@ -102,6 +122,7 @@ class Segmenter:
 
         if self._silence_run * FRAME_MS >= self.silence_ms:
             too_short = self._duration_ms < self.min_utterance_ms
+            self._closing_silence_ms = self._silence_run * FRAME_MS
             self.reset()
             # A blip that cleared the start threshold but carries no real speech
             # is discarded rather than sent to the model.
@@ -109,6 +130,10 @@ class Segmenter:
 
         if self._duration_ms >= self.max_utterance_ms:
             logger.info("vad_max_duration_reached ms=%d", self._duration_ms)
+            # The cap fired rather than a silence close, so whatever trailing
+            # silence had accumulated is the whole lag -- usually near zero,
+            # since a speaker who never paused is what got us here.
+            self._closing_silence_ms = self._silence_run * FRAME_MS
             self.reset()
             return SegmentEvent.SPEECH_END
 
